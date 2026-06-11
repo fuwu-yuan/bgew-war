@@ -70,21 +70,31 @@ async function openPage(tag) {
 const host = await openPage("HOST");
 const guest = await openPage("GUEST");
 
-// Host: MULTIJOUEUR → CREER UNE PARTIE
+// Host: MULTIJOUEUR → CREER UNE PARTIE → waiting room (salon)
 await host.page.mouse.click(...host.at(320, 599));
 await host.page.waitForTimeout(900);
 await host.page.mouse.click(...host.at(320, 308));
-await host.page.waitForTimeout(900);
-await host.page.screenshot({ path: "/tmp/bgew-war-mp-1-host-waiting.png" });
+await host.page.waitForTimeout(1200);
+await host.page.screenshot({ path: "/tmp/bgew-war-mp-1-host-salon.png" });
+const hostStep = await host.page.evaluate(() => window.__bgewwar.board.step.name);
+if (hostStep !== "salon") errors.push(`FLOW: host should be in the salon, got "${hostStep}"`);
 
-// Guest: MULTIJOUEUR → list shows the room → join it
+// Guest: MULTIJOUEUR → list shows the room → join it → salon too
 await guest.page.mouse.click(...guest.at(320, 599));
 await guest.page.waitForTimeout(900);
 await guest.page.mouse.click(...guest.at(320, 380)); // ACTUALISER
 await guest.page.waitForTimeout(700);
 await guest.page.screenshot({ path: "/tmp/bgew-war-mp-2-guest-list.png" });
 await guest.page.mouse.click(...guest.at(320, 464)); // first room button
-await guest.page.waitForTimeout(1800); // join + start + fade into game
+await guest.page.waitForTimeout(1500);
+await guest.page.screenshot({ path: "/tmp/bgew-war-mp-2b-guest-salon.png" });
+const guestStep = await guest.page.evaluate(() => window.__bgewwar.board.step.name);
+if (guestStep !== "salon") errors.push(`FLOW: guest should be in the salon, got "${guestStep}"`);
+await host.page.screenshot({ path: "/tmp/bgew-war-mp-2c-host-salon-full.png" });
+
+// Host launches the war from the salon
+await host.page.mouse.click(...host.at(320, 520)); // LANCER LA PARTIE
+await host.page.waitForTimeout(1800);
 
 await host.page.screenshot({ path: "/tmp/bgew-war-mp-3-host-game.png" });
 await guest.page.screenshot({ path: "/tmp/bgew-war-mp-4-guest-game.png" });

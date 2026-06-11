@@ -5,6 +5,7 @@ import { installNetwork } from "./network";
 import { MenuStep } from "./steps/menu.step";
 import { PlayStep } from "./steps/game.step";
 import { LobbyStep } from "./steps/lobby.step";
+import { SalonStep } from "./steps/salon.step";
 import { EndStep } from "./steps/end.step";
 
 const board = new Board(
@@ -101,12 +102,13 @@ installNetwork(board);
 const menu = new MenuStep(board);
 const play = new PlayStep(board);
 const lobby = new LobbyStep(board);
+const salon = new SalonStep(board);
 const end = new EndStep(board);
-board.addSteps([menu, play, lobby, end]);
+board.addSteps([menu, play, lobby, salon, end]);
 board.step = menu;
 
 /* Test hook for the headless smoke test (harmless in production) */
-(window as unknown as Record<string, unknown>).__bgewwar = { board, steps: { menu, play, lobby, end } };
+(window as unknown as Record<string, unknown>).__bgewwar = { board, steps: { menu, play, lobby, salon, end } };
 
 board.canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 

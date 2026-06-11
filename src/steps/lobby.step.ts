@@ -95,25 +95,9 @@ export class LobbyStep extends GameStep {
    * Network events (engine routes them to the active step)
    * ------------------------------------------------------------ */
 
-  onPlayerJoin(): void {
-    // Host side: an opponent walked in — lock the room and go to war
-    if (this.state !== "waiting") return;
-    this.state = "starting";
-    this.art.status = "Adversaire trouve ! Lancement…";
-    this.art.statusColor = "#7fd1ff";
-    this.board.playSound("coin", false, 0.5);
-    const nm = this.board.networkManager as Network.NetworkManager;
-    nm.closeRoom(nm.roomuid, true).catch(() => undefined);
-    this.board.networkManager.sendMessage({ type: "start" }).catch(() => undefined);
-    this.board.addEntity(
-      new Fader(0, 1, 450, "#08111f", () => {
-        this.board.moveToStep("game", { multi: { role: "host" } });
-      })
-    );
-  }
-
   onNetworkMessage(msg: Network.SocketMessage): void {
-    // Guest side: the host says go
+    // Race shield: the host can launch while we are still fading toward the
+    // salon — catch the "start" here and go straight to war
     if (msg.data?.type === "start" && this.state === "joining") {
       this.state = "starting";
       this.board.addEntity(
@@ -142,12 +126,17 @@ export class LobbyStep extends GameStep {
     this.state = "creating";
     this.board.playSound("click", false, 0.4);
     this.setStatus("Creation du salon…");
+    const roomName = `Guerre #${randInt(100, 999)}`;
     this.board.networkManager
-      .createRoom(`Guerre #${randInt(100, 999)}`, 2, {}, true)
+      .createRoom(roomName, 2, {}, true)
       .then((res) => {
         if (res.status === "success") {
-          this.state = "waiting";
-          this.setStatus("En attente d'un adversaire…");
+          this.state = "starting";
+          this.board.addEntity(
+            new Fader(0, 1, 350, "#08111f", () => {
+              this.board.moveToStep("salon", { role: "host", roomName });
+            })
+          );
         } else {
           this.state = "idle";
           this.setStatus(`Erreur : ${res.code}`, true);
@@ -197,7 +186,13 @@ export class LobbyStep extends GameStep {
       .joinRoom(room.uid)
       .then((res) => {
         if (res.status === "success") {
-          this.setStatus("Connecte ! En attente du lancement…");
+          // Still "joining": the start-race shield above stays armed
+          this.board.addEntity(
+            new Fader(0, 1, 350, "#08111f", () => {
+              if (this.state !== "joining") return; // already gone to war
+              this.board.moveToStep("salon", { role: "guest", roomName: room.name });
+            })
+          );
         } else {
           this.state = "idle";
           this.setStatus(res.code === "room_full" ? "Cette partie est deja pleine" : `Erreur : ${res.code}`, true);
