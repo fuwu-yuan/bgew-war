@@ -1,5 +1,6 @@
 import { Board, Entities, Entity, GameStep, Network } from "@fuwu-yuan/bgew";
 import { COLORS, FONT, VIEW_H, VIEW_W } from "../globals";
+import { serverLabel } from "../network";
 import { randInt } from "../utils";
 import { TileMap } from "../entities/tilemap";
 import { Fader } from "../entities/effects";
@@ -34,6 +35,9 @@ class LobbyArt extends Entity {
     ctx.font = `14px ${FONT}`;
     ctx.fillStyle = "#9fc3e4";
     ctx.fillText("1 contre 1 — l'hote joue les BLEUS, l'invite les ROUGES", VIEW_W / 2, 172);
+    ctx.font = `11px ${FONT}`;
+    ctx.fillStyle = "rgba(159, 195, 228, 0.7)";
+    ctx.fillText(`Serveur : ${serverLabel()}`, VIEW_W / 2, 196);
 
     if (this.status) {
       ctx.font = `16px ${FONT}`;
@@ -151,7 +155,7 @@ export class LobbyStep extends GameStep {
       })
       .catch(() => {
         this.state = "idle";
-        this.setStatus("Serveur injoignable (voir README, option ?server=)", true);
+        this.setStatus("Serveur injoignable — ajoutez ?server=<hote> a l'URL", true);
       });
   }
 
@@ -179,7 +183,7 @@ export class LobbyStep extends GameStep {
       })
       .catch(() => {
         if (this.state === "idle") {
-          this.setStatus("Serveur injoignable (voir README, option ?server=)", true);
+          this.setStatus("Serveur injoignable — ajoutez ?server=<hote> a l'URL", true);
         }
       });
   }

@@ -4,14 +4,36 @@ import { Board, Network } from "@fuwu-yuan/bgew";
  * Server override: by default the game talks to the official BGEW server
  * (bgew.stevecohen.fr). Add `?server=host:port` to the URL to use a
  * self-hosted `tools/server.mjs` instead (same protocol) — handy while the
- * official server is down, for LAN/ngrok play or for the headless tests.
+ * official server is down, for LAN/tunnel play or for the headless tests.
  * `?server=` (empty) or `?server=same` means "the host serving this page"
- * — tools/server.mjs also serves the game, so one ngrok tunnel covers all.
+ * — tools/server.mjs also serves the game, so one tunnel covers all.
+ * The override is REMEMBERED (localStorage): open the game once with the
+ * full link and the bare URL keeps working afterwards. `?server=off`
+ * forgets it and returns to the official server.
  * Protocols follow the page (https page → https API + wss socket).
  */
+const STORAGE_KEY = "bgew-war.server";
 const RAW = new URLSearchParams(window.location.search).get("server");
-const OVERRIDE = RAW === "" || RAW === "same" ? window.location.host : RAW;
+const fromParam = RAW === "" || RAW === "same" ? window.location.host : RAW;
+let OVERRIDE: string | null = null;
+try {
+  if (fromParam === "off") {
+    localStorage.removeItem(STORAGE_KEY);
+  } else if (fromParam) {
+    localStorage.setItem(STORAGE_KEY, fromParam);
+    OVERRIDE = fromParam;
+  } else {
+    OVERRIDE = localStorage.getItem(STORAGE_KEY);
+  }
+} catch {
+  OVERRIDE = fromParam === "off" ? null : fromParam;
+}
 const SECURE = window.location.protocol === "https:";
+
+/** Shown in the lobby so players know which backend they are on. */
+export function serverLabel(): string {
+  return OVERRIDE ?? "bgew.stevecohen.fr (officiel)";
+}
 
 export class WarNetworkManager extends Network.NetworkManager {
   get apiUrl(): string {
