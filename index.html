@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#0a1428" />
+  <title>BGEW WAR — un jeu BGEW</title>
+  <style>
+    @font-face {
+      font-family: 'Black Ops One';
+      src: url('./assets/fonts/blackops.woff2') format('woff2');
+      font-weight: 400;
+      font-style: normal;
+      font-display: swap;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      background: #0a1428;
+      background-image: radial-gradient(ellipse at 50% 0%, rgba(30, 80, 140, 0.35), transparent 65%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      font-family: 'Black Ops One', sans-serif;
+      /* no pull-to-refresh / overscroll bounce while playing */
+      overscroll-behavior: none;
+      position: fixed;
+      inset: 0;
+    }
+    #game { line-height: 0; }
+    #game canvas {
+      /* the game handles every gesture itself: no scroll, no double-tap zoom */
+      touch-action: none;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+      -webkit-user-select: none;
+      image-rendering: pixelated;
+    }
+  </style>
+</head>
+<body>
+  <div id="game"></div>
+  <script type="module" src="./dist/bundle.js"></script>
+</body>
+</html>
