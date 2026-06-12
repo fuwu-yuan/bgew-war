@@ -1,6 +1,6 @@
 import { Board, Entities, Entity, GameStep, Network } from "@fuwu-yuan/bgew";
 import { COLORS, FONT, VIEW_H, VIEW_W } from "../globals";
-import { serverLabel } from "../network";
+import { gameData, serverLabel } from "../network";
 import { randInt } from "../utils";
 import { TileMap } from "../entities/tilemap";
 import { Fader } from "../entities/effects";
@@ -98,7 +98,7 @@ export class LobbyStep extends GameStep {
   onNetworkMessage(msg: Network.SocketMessage): void {
     // Race shield: the host can launch while we are still fading toward the
     // salon — catch the "start" here and go straight to war
-    if (msg.data?.type === "start" && this.state === "joining") {
+    if (gameData(msg)?.type === "start" && this.state === "joining") {
       this.state = "starting";
       this.board.addEntity(
         new Fader(0, 1, 450, "#08111f", () => {

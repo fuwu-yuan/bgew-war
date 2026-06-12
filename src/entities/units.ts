@@ -179,7 +179,7 @@ export class Soldier extends Unit {
   constructor(game: GameAPI, faction: Faction, cx: number, cy: number, level = 1) {
     super(game, faction, cx, cy, {
       radius: 7,
-      hp: 3 + (level - 1),
+      hp: 6 + 2 * (level - 1),
       dmg: 1 + 0.5 * (level - 1),
       range: 90 + 5 * (level - 1),
       firePeriod: 1 * Math.pow(0.95, level - 1),
@@ -197,7 +197,7 @@ export class Tank extends Unit {
   constructor(game: GameAPI, faction: Faction, cx: number, cy: number) {
     super(game, faction, cx, cy, {
       radius: 12,
-      hp: 16,
+      hp: 32,
       dmg: 4,
       range: 120,
       firePeriod: 1.3,

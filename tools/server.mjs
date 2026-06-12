@@ -184,6 +184,11 @@ wss.on("connection", (ws, req) => {
     }
   }
 
+  ws.isAlive = true;
+  ws.on("pong", () => {
+    ws.isAlive = true;
+  });
+
   ws.on("message", (raw) => {
     let packet;
     try {
@@ -191,12 +196,16 @@ wss.on("connection", (ws, req) => {
     } catch {
       return;
     }
+    ws.isAlive = true;
     // Ack so the engine resolves its sendMessage promise…
-    send(ws, { sender: "server", to: clientUid, code: "msg_sent", data: { msg: { id: packet.id } } });
-    // …and relay the payload to everyone else in the room
+    send(ws, { sender: "server", to: clientUid, code: "msg_sent", data: { msg: packet } });
+    // Keepalives stop here: traffic for the proxies, silence for the players
+    if (packet.msg && packet.msg.type === "ka") return;
+    // …and relay to everyone else — same shape as the official BGEW server:
+    // `data` carries the WHOLE client packet ({id, msg})
     for (const [otherUid, other] of room.clients) {
       if (otherUid !== clientUid) {
-        send(other, { sender: clientUid, to: otherUid, code: "broadcast", data: packet.msg });
+        send(other, { sender: clientUid, to: otherUid, code: "broadcast", data: packet });
       }
     }
   });
@@ -219,6 +228,20 @@ wss.on("connection", (ws, req) => {
     }
   });
 });
+
+/* Protocol-level pings: keeps idle sockets alive through proxies
+ * (Cloudflare kills quiet websockets in ~90 s) and reaps dead clients so
+ * the other player gets a real player_leave instead of a ghost. */
+setInterval(() => {
+  for (const client of wss.clients) {
+    if (client.isAlive === false) {
+      client.terminate();
+      continue;
+    }
+    client.isAlive = false;
+    client.ping();
+  }
+}, 25_000);
 
 server.listen(PORT, () => {
   console.log(`BGEW WAR server ready on http://localhost:${PORT}  (game + REST /api + WS /<roomUid>)`);

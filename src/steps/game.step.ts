@@ -28,7 +28,7 @@ import { Fader, Particle, ScorePopup, Shockwave, StrikeMarker, Tracer } from "..
 import { BuildMode, Hud, HudState } from "../entities/hud";
 import { GameObject } from "../entities/gameobject";
 import { RemoteWorld } from "../entities/remote";
-import { CmdMsg, EndMsg, GameMsg, InitMsg, MultiData, SnapMsg } from "../network";
+import { CmdMsg, EndMsg, GameMsg, gameData, InitMsg, MultiData, SnapMsg } from "../network";
 
 const BRAIN_EVERY = 3; // s — red AI thinks (solo only)
 const INCOME_EVERY = 1; // s
@@ -211,7 +211,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   onNetworkMessage(msg: Network.SocketMessage): void {
-    const data = msg.data as GameMsg & { type: string };
+    const data = gameData(msg);
     if (!data || this.role === "solo") return;
 
     if (this.role === "host") {

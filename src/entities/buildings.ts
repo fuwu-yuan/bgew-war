@@ -30,10 +30,10 @@ interface BuildingStats {
 const STATS: Record<BuildingType, BuildingStats> = {
   // The HQ is a fortress: lots of HP and it shoots back — rushing it
   // without grinding the front first must fail.
-  hq: { hp: 150, size: 58, range: 160, dmg: 2, firePeriod: 0.7 },
+  hq: { hp: 150, size: 58, range: 160, dmg: 4, firePeriod: 0.7 },
   barracks: { hp: 16, size: 38, spawnEvery: 2.5 },
   factory: { hp: 20, size: 38, spawnEvery: 9 },
-  turret: { hp: 14, size: 38, range: 150, dmg: 1, firePeriod: 0.55 },
+  turret: { hp: 14, size: 38, range: 150, dmg: 2, firePeriod: 0.55 },
 };
 
 const SPRITES = BUILDING_SPRITE;

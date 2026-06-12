@@ -35,7 +35,33 @@ export function serverLabel(): string {
   return OVERRIDE ?? "bgew.stevecohen.fr (officiel)";
 }
 
+/**
+ * Extract the game payload from a broadcast SocketMessage.
+ * The official server relays the WHOLE client packet ({id, msg}) in
+ * `data`, so the payload lives in `data.msg`; tools/server.mjs and other
+ * implementations may unwrap it into `data` directly. Accept both.
+ */
+export function gameData(msg: Network.SocketMessage): (GameMsg & { type: string }) | null {
+  const d = msg?.data;
+  if (!d || typeof d !== "object") return null;
+  if (typeof d.type === "string") return d as GameMsg & { type: string };
+  if (d.msg && typeof d.msg === "object" && typeof d.msg.type === "string") {
+    return d.msg as GameMsg & { type: string };
+  }
+  return null;
+}
+
 export class WarNetworkManager extends Network.NetworkManager {
+  /**
+   * Engine quirk: NetworkManager.joinRoom only stores the room uid when it
+   * is still empty, so joining a second room in the same session leaves
+   * every REST call (room data, close…) pointed at the FIRST room.
+   */
+  joinRoom(uid: string): Promise<Network.Response> {
+    this.roomuid = uid;
+    return super.joinRoom(uid);
+  }
+
   get apiUrl(): string {
     return OVERRIDE ? `${SECURE ? "https" : "http"}://${OVERRIDE}/api` : "https://bgew.stevecohen.fr/api";
   }
@@ -46,7 +72,21 @@ export class WarNetworkManager extends Network.NetworkManager {
 }
 
 export function installNetwork(board: Board): void {
-  board.networkManager = new WarNetworkManager(board);
+  const nm = new WarNetworkManager(board);
+  board.networkManager = nm;
+
+  // Application-level keepalive: the BGEW protocol is silent while players
+  // wait in a salon, and proxies (Cloudflare tunnels…) kill idle websockets
+  // in ~90 s. The server acks "ka" without relaying it to the other player.
+  setInterval(() => {
+    const subject = (nm as unknown as { webSocketSubject: { closed?: boolean } | null }).webSocketSubject;
+    if (!subject || subject.closed) return;
+    try {
+      nm.sendMessage({ type: "ka" }).catch(() => undefined);
+    } catch {
+      /* socket already gone */
+    }
+  }, 20_000);
 }
 
 /* ------------------------------------------------------------------ *

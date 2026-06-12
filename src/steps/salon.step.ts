@@ -1,6 +1,6 @@
 import { Board, Entities, Entity, GameStep, Network } from "@fuwu-yuan/bgew";
 import { FONT, VIEW_H, VIEW_W } from "../globals";
-import { serverLabel } from "../network";
+import { gameData, serverLabel } from "../network";
 import { TileMap } from "../entities/tilemap";
 import { Fader } from "../entities/effects";
 import { drawSprite, SPR } from "../sprites";
@@ -102,6 +102,7 @@ export class SalonStep extends GameStep {
   private role: "host" | "guest" = "host";
   private launchBtn: Entities.Button | null = null;
   private leaving = false;
+  private pollTimer: ReturnType<GameStep["addTimer"]> | null = null;
 
   constructor(board: Board) {
     super(board);
@@ -137,6 +138,21 @@ export class SalonStep extends GameStep {
       this.art.opponentIn = true; // guest sees both slots filled
       this.art.status = "En attente du lancement par l'hote…";
       this.launchBtn = null;
+      // Safety net: if the "start" broadcast gets lost (proxy hiccup…),
+      // the room data flag set by the host still gets us into the war.
+      const nm = this.board.networkManager as Network.NetworkManager;
+      this.pollTimer = this.addTimer(
+        2500,
+        () => {
+          if (this.leaving || this.board.step !== this) return;
+          nm.getRoomData()
+            .then((res) => {
+              if (res.status === "success" && res.data?.started) this.startAsGuest();
+            })
+            .catch(() => undefined);
+        },
+        true
+      );
     }
 
     const quit = this.makeButton(VIEW_W / 2 - 150, VIEW_H - 130, "QUITTER LE SALON", "rgba(190, 215, 240, 0.6)");
@@ -147,6 +163,10 @@ export class SalonStep extends GameStep {
 
   onLeave(): void {
     this.launchBtn = null;
+    if (this.pollTimer) {
+      this.removeTimer(this.pollTimer);
+      this.pollTimer = null;
+    }
   }
 
   /* ------------------------------------------------------------ *
@@ -179,15 +199,20 @@ export class SalonStep extends GameStep {
   }
 
   onNetworkMessage(msg: Network.SocketMessage): void {
-    if (this.role === "guest" && msg.data?.type === "start" && !this.leaving) {
-      this.leaving = true;
-      this.board.playSound("click", false, 0.5);
-      this.board.addEntity(
-        new Fader(0, 1, 450, "#08111f", () => {
-          this.board.moveToStep("game", { multi: { role: "guest" } });
-        })
-      );
+    if (this.role === "guest" && gameData(msg)?.type === "start") {
+      this.startAsGuest();
     }
+  }
+
+  private startAsGuest(): void {
+    if (this.leaving) return;
+    this.leaving = true;
+    this.board.playSound("click", false, 0.5);
+    this.board.addEntity(
+      new Fader(0, 1, 450, "#08111f", () => {
+        this.board.moveToStep("game", { multi: { role: "guest" } });
+      })
+    );
   }
 
   // Arrow property: the engine passes this handler UNBOUND to rxjs as the
@@ -207,6 +232,9 @@ export class SalonStep extends GameStep {
     this.board.playSound("click", false, 0.5);
     const nm = this.board.networkManager as Network.NetworkManager;
     nm.closeRoom(nm.roomuid, true).catch(() => undefined);
+    // Flag in room data first: the guest polls it as a fallback in case
+    // the broadcast below never reaches them
+    nm.setRoomData({ started: true }, true).catch(() => undefined);
     this.board.networkManager.sendMessage({ type: "start" }).catch(() => undefined);
     this.board.addEntity(
       new Fader(0, 1, 450, "#08111f", () => {

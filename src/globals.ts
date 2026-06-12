@@ -46,7 +46,7 @@ export const COST = { barracks: 50, turret: 75, factory: 120, strike: 100 } as c
 
 /** Airstrike: radius and damage (hits BOTH sides — aim carefully) */
 export const STRIKE_RADIUS = 75;
-export const STRIKE_DMG_UNIT = 6;
+export const STRIKE_DMG_UNIT = 12;
 export const STRIKE_DMG_BUILDING = 10;
 export const STRIKE_DELAY = 0.9; // s between the warning marker and the blast
 
