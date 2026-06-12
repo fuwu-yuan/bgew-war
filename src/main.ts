@@ -23,18 +23,40 @@ const board = new Board(
 board.config.game.FPS = 60;
 
 /* ------------------------------------------------------------------ *
- * Responsive scale — desktop & mobile.
- * board.scale drives the canvas buffer size, the engine applies it in
- * Entity.draw (ctx.scale) and reverses it in mouse coordinates, so the
- * whole game keeps thinking in 640×1024.
+ * Responsive scale + HiDPI (Retina) — desktop & mobile.
+ * board.scale reste le scale LOGIQUE : le moteur s'en sert pour la
+ * conversion souris et le ctx.scale de chaque entité, le jeu continue
+ * de penser en 640×1024.
+ * La netteté Retina ne peut PAS venir du enableHIDPI du moteur : la
+ * gameloop refait `canvas.width = W * scale` à chaque tick et écrase
+ * son dimensionnement. À la place, on surdimensionne le buffer
+ * (scale × devicePixelRatio) au début de chaque frame dans clear() —
+ * appelé en tête de chaque step.draw(), juste après le resize du tick —
+ * avec une pré-transformation ctx.scale(dpr) que les save/restore par
+ * entité préservent. Le CSS ramène l'affichage à la taille logique,
+ * et la souris reste juste (rect CSS = W×scale, divisé par scale).
  * ------------------------------------------------------------------ */
+let dpr = 1;
 function fitToScreen(): void {
   const s = Math.min(window.innerWidth / VIEW_W, window.innerHeight / VIEW_H);
   board.scale = Math.max(0.25, Math.min(s, 2));
+  dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
+  board.canvas.style.width = `${VIEW_W * board.scale}px`;
+  board.canvas.style.height = `${VIEW_H * board.scale}px`;
 }
 fitToScreen();
 window.addEventListener("resize", fitToScreen);
 window.addEventListener("orientationchange", () => setTimeout(fitToScreen, 120));
+
+const engineClear = board.clear.bind(board);
+board.clear = () => {
+  if (dpr !== 1) {
+    board.canvas.width = Math.round(VIEW_W * board.scale * dpr);
+    board.canvas.height = Math.round(VIEW_H * board.scale * dpr);
+    board.ctx.scale(dpr, dpr);
+  }
+  engineClear();
+};
 
 /* ------------------------------------------------------------------ *
  * Touch bridge — the engine only listens to mouse events. Taps become

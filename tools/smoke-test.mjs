@@ -220,12 +220,25 @@ const errors = [];
   await page.waitForTimeout(1400);
   await page.screenshot({ path: "/tmp/bgew-war-m2-game.png" });
 
-  // Tap TOURELLE then a southern blue tile
+  // Tap TOURELLE then a southern blue tile — also proves touch coords
+  // survive the HiDPI buffer (deviceScaleFactor 3 on this viewport)
   await page.touchscreen.tap(...at(153, 992));
   await page.waitForTimeout(250);
   await page.touchscreen.tap(...at(280, 760));
   await page.waitForTimeout(5000);
   await page.screenshot({ path: "/tmp/bgew-war-m3-combat.png" });
+  const turrets = await page.evaluate(() => {
+    const play = window.__bgewwar.steps.play;
+    return play.buildings.filter((b) => b.type === "turret" && b.faction === 2 && !b.dead).length;
+  });
+  // 2 starting turrets + the tapped one
+  if (turrets < 3) errors.push(`MOBILE: turret tap did not land, ${turrets} turret(s) (HiDPI input regression?)`);
+  const buf = await page.evaluate(() => {
+    const c = document.querySelector("#game canvas");
+    return { w: c.width, cssW: Math.round(c.getBoundingClientRect().width), dpr: window.devicePixelRatio };
+  });
+  console.log(`mobile canvas: buffer ${buf.w}px for ${buf.cssW}px CSS (dpr ${buf.dpr})`);
+  if (buf.w < buf.cssW * 2) errors.push(`HIDPI: buffer not upscaled (${JSON.stringify(buf)})`);
   await page.close();
 }
 
