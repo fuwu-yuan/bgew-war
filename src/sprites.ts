@@ -18,6 +18,7 @@ export const SPR = {
   // blue faction
   B_SOLDIER: 142,
   B_TANK: 134,
+  B_HELI: 137,
   B_HQ: 50,
   B_BARRACKS: 46,
   B_FACTORY: 47,
@@ -26,6 +27,7 @@ export const SPR = {
   // red faction
   R_SOLDIER: 160,
   R_TANK: 152,
+  R_HELI: 155,
   R_HQ: 68,
   R_BARRACKS: 64,
   R_FACTORY: 65,

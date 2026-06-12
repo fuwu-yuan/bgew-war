@@ -1,9 +1,10 @@
 import type { TileMap } from "./entities/tilemap";
 import type { Unit } from "./entities/units";
 import type { Building } from "./entities/buildings";
+import type { Helicopter } from "./entities/helicopter";
 import type { Faction } from "./globals";
 
-export type Target = Unit | Building;
+export type Target = Unit | Building | Helicopter;
 
 /** What units, bullets and buildings are allowed to ask the game step. */
 export interface GameAPI {
@@ -12,6 +13,8 @@ export interface GameAPI {
   axisX(f: Faction): number;
   /** Closest living enemy unit or building within `range` px. */
   nearestEnemy(x: number, y: number, f: Faction, range: number): Target | null;
+  /** Closest living enemy helicopter within `range` px (anti-air : tourelles/QG). */
+  nearestAirEnemy(x: number, y: number, f: Faction, range: number): Target | null;
   fireBullet(x: number, y: number, target: Target, dmg: number, f: Faction, big: boolean): void;
   spawnSoldier(f: Faction, x: number, y: number, level?: number): void;
   spawnTank(f: Faction, x: number, y: number): void;

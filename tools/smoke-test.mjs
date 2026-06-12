@@ -78,14 +78,14 @@ const errors = [];
 
   // Let the front move, then build a barracks bottom middle
   await page.waitForTimeout(4000);
-  await page.mouse.click(...at(108, 992)); // CASERNE button
+  await page.mouse.click(...at(65, 992)); // CASERNE button
   await page.waitForTimeout(300);
   await page.screenshot({ path: "/tmp/bgew-war-4-build-mode.png" });
   await page.mouse.click(...at(320, 700)); // blue tile mid-south
   await page.waitForTimeout(400);
 
   // Attack axis on column 3
-  await page.mouse.click(...at(588, 992)); // AXE button
+  await page.mouse.click(...at(593, 992)); // AXE button
   await page.waitForTimeout(200);
   await page.mouse.click(...at(140, 480));
   await page.waitForTimeout(3000);
@@ -93,17 +93,32 @@ const errors = [];
 
   // Soldier upgrade once the gold is there
   await page.waitForTimeout(8000);
-  await page.mouse.click(...at(396, 992)); // SOLDATS+ button
+  await page.mouse.click(...at(329, 992)); // SOLDATS+ button
   await page.waitForTimeout(500);
   await page.screenshot({ path: "/tmp/bgew-war-5b-upgrade.png" });
 
   // Airstrike on the middle of the front
   await page.waitForTimeout(6000);
-  await page.mouse.click(...at(492, 992)); // FRAPPE button
+  await page.mouse.click(...at(505, 992)); // FRAPPE button
   await page.waitForTimeout(250);
   await page.mouse.click(...at(320, 440));
   await page.waitForTimeout(1300);
   await page.screenshot({ path: "/tmp/bgew-war-5c-strike.png" });
+
+  // Helicopter sortie along a column (gold topped up to guarantee the buy)
+  await page.evaluate(() => {
+    window.__bgewwar.steps.play.gold[2] += 120;
+  });
+  await page.mouse.click(...at(417, 992)); // HELICO button
+  await page.waitForTimeout(250);
+  await page.mouse.click(...at(200, 500)); // flight lane
+  await page.waitForTimeout(2500);
+  await page.screenshot({ path: "/tmp/bgew-war-5d-helico.png" });
+  const heli = await page.evaluate(() => {
+    const play = window.__bgewwar.steps.play;
+    return play.helis.filter((h) => !h.dead).length;
+  });
+  if (heli < 1) errors.push("HELICO: no helicopter in flight 2.5s after the order");
 
   // Long-run stability: 12 more seconds of war
   await page.waitForTimeout(12000);
@@ -166,10 +181,11 @@ const errors = [];
   console.log(`desktop rAF fps ≈ ${fps}`);
 
   // Force the red HQ down to trigger the victory flow, then replay
+  // (skip the kill if the war already ended on its own)
   await page.evaluate(() => {
     const play = window.__bgewwar.steps.play;
-    const hq = play.buildings.find((b) => b.type === "hq" && b.faction === 1);
-    play.notifyKill(hq, 2);
+    const hq = play.buildings.find((b) => b.type === "hq" && b.faction === 1 && !b.dead);
+    if (hq && !play.ended) play.notifyKill(hq, 2);
   });
   await page.waitForTimeout(3600);
   await page.screenshot({ path: "/tmp/bgew-war-7-victory.png" });
@@ -205,7 +221,7 @@ const errors = [];
   await page.screenshot({ path: "/tmp/bgew-war-m2-game.png" });
 
   // Tap TOURELLE then a southern blue tile
-  await page.touchscreen.tap(...at(204, 992));
+  await page.touchscreen.tap(...at(153, 992));
   await page.waitForTimeout(250);
   await page.touchscreen.tap(...at(280, 760));
   await page.waitForTimeout(5000);

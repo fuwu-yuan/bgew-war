@@ -3,7 +3,7 @@ import { BLUE, COLORS, COST, Faction, FONT, MAP_H, VIEW_H, VIEW_W } from "../glo
 import { clamp } from "../utils";
 import { drawSprite, SPR } from "../sprites";
 
-export type BuildMode = "barracks" | "turret" | "factory" | "axis" | "strike" | null;
+export type BuildMode = "barracks" | "turret" | "factory" | "axis" | "strike" | "helico" | null;
 export type HudButton = Exclude<BuildMode, null> | "upgrade";
 
 /** What the HUD needs to read from the game step. */
@@ -44,14 +44,15 @@ export class Hud extends Entity {
     super(0, 0, VIEW_W, VIEW_H);
     this.disabled = true;
     this.state = state;
-    const w = 92;
-    const gap = 4;
-    const x0 = VIEW_W - (w + gap) * 6 - 2;
+    const w = 86;
+    const gap = 2;
+    const x0 = VIEW_W - (w + gap) * 7 - 2;
     const defs: [HudButton, string, number, number][] = [
       ["barracks", "CASERNE", SPR.R_BARRACKS, SPR.B_BARRACKS],
       ["turret", "TOURELLE", SPR.R_TURRET, SPR.B_TURRET],
       ["factory", "USINE", SPR.R_FACTORY, SPR.B_FACTORY],
       ["upgrade", "SOLDATS+", SPR.R_SOLDIER, SPR.B_SOLDIER],
+      ["helico", "HELICO", SPR.R_HELI, SPR.B_HELI],
       ["strike", "FRAPPE", SPR.HEDGEHOG, SPR.HEDGEHOG],
       ["axis", "AXE", SPR.RETICLE, SPR.RETICLE],
     ];
@@ -97,7 +98,9 @@ export class Hud extends Entity {
           ? "Touchez une colonne : vos troupes convergeront dessus"
           : s.mode === "strike"
             ? "Touchez la zone a bombarder (degats pour TOUS)"
-            : `Touchez une case ${myColor} libre pour construire`;
+            : s.mode === "helico"
+              ? "Touchez une colonne : sortie d'helico sur cette ligne"
+              : `Touchez une case ${myColor} libre pour construire`;
       ctx.fillStyle = "rgba(8, 20, 38, 0.85)";
       ctx.fillRect(0, 26, VIEW_W, 30);
       ctx.fillStyle = "#ffe27a";
@@ -107,19 +110,19 @@ export class Hud extends Entity {
       ctx.textAlign = "left";
     }
 
-    /* Territory bar (top) — blue on the left, red on the right */
-    const share = clamp(s.blueShare, 0, 1);
-    ctx.fillStyle = COLORS.redUnit;
+    /* Territory bar (top) — MY side on the left on every screen */
+    const myShare = clamp(mine === BLUE ? s.blueShare : 1 - s.blueShare, 0, 1);
+    ctx.fillStyle = mine === BLUE ? COLORS.redUnit : COLORS.blueUnit;
     ctx.fillRect(0, 0, VIEW_W, 14);
-    ctx.fillStyle = COLORS.blueUnit;
-    ctx.fillRect(0, 0, VIEW_W * share, 14);
+    ctx.fillStyle = mine === BLUE ? COLORS.blueUnit : COLORS.redUnit;
+    ctx.fillRect(0, 0, VIEW_W * myShare, 14);
     ctx.fillStyle = "#ffffff";
-    ctx.fillRect(VIEW_W * share - 1, 0, 2, 14);
+    ctx.fillRect(VIEW_W * myShare - 1, 0, 2, 14);
     ctx.font = `10px ${FONT}`;
     ctx.fillStyle = "#ffffff";
-    ctx.fillText(`${Math.round(share * 100)}%`, 6, 11);
+    ctx.fillText(`${Math.round(myShare * 100)}%`, 6, 11);
     ctx.textAlign = "right";
-    ctx.fillText(`${Math.round((1 - share) * 100)}%`, VIEW_W - 6, 11);
+    ctx.fillText(`${Math.round((1 - myShare) * 100)}%`, VIEW_W - 6, 11);
     ctx.textAlign = "left";
 
     /* Bottom panel */

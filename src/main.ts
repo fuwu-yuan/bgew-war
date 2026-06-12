@@ -91,6 +91,7 @@ sfx("coin", "wav", false, 0.5);
 sfx("build", "wav", false, 0.5);
 sfx("click", "wav", false, 0.4);
 sfx("error", "wav", false, 0.4);
+sfx("helico", "wav", true, 0.22);
 sfx("victory", "m4a", false, 0.6);
 sfx("defeat", "m4a", false, 0.6);
 sfx("music_battle", "m4a", true, 0.3);

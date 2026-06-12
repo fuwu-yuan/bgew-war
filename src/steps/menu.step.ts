@@ -59,10 +59,10 @@ class MenuArt extends Entity {
 
     if (this.showHelp) {
       ctx.fillStyle = COLORS.uiPanel;
-      ctx.fillRect(50, 490, VIEW_W - 100, 320);
+      ctx.fillRect(50, 490, VIEW_W - 100, 342);
       ctx.strokeStyle = "rgba(140, 190, 235, 0.7)";
       ctx.lineWidth = 2;
-      ctx.strokeRect(50, 490, VIEW_W - 100, 320);
+      ctx.strokeRect(50, 490, VIEW_W - 100, 342);
       ctx.fillStyle = "#ffe27a";
       ctx.font = `20px ${FONT}`;
       ctx.fillText("COMMENT JOUER", VIEW_W / 2, 528);
@@ -77,6 +77,7 @@ class MenuArt extends Entity {
         "Construisez CASERNES, TOURELLES, USINES.",
         "SOLDATS+ : ameliorez vos troupes (niv 5).",
         "FRAPPE : bombardez une zone (pour tous !).",
+        "HELICO : raid aerien (anti-air : tourelles).",
         "AXE : concentrez l'attaque sur une colonne.",
         "",
         "Detruisez le QG ennemi pour gagner —",

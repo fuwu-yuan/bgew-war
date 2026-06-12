@@ -8,6 +8,7 @@ import {
   GRID_H,
   GRID_W,
   MAP_H,
+  MAX_HELIS,
   MAX_SOLDIERS,
   MAX_TANKS,
   RED,
@@ -24,6 +25,7 @@ import { clamp, pick, rand, randInt, TAU } from "../utils";
 import { flipMapData, flipTileIndex, TileMap } from "../entities/tilemap";
 import { Bullet, Soldier, Tank, Unit } from "../entities/units";
 import { Building, BUILDING_CODE, BuildingType } from "../entities/buildings";
+import { Helicopter } from "../entities/helicopter";
 import { Fader, Particle, ScorePopup, Shockwave, StrikeMarker, Tracer } from "../entities/effects";
 import { BuildMode, Hud, HudState } from "../entities/hud";
 import { GameObject } from "../entities/gameobject";
@@ -49,6 +51,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private units: Unit[] = [];
   private bullets: Bullet[] = [];
   private buildings: Building[] = [];
+  private helis: Helicopter[] = [];
+  private heliLoopOn = false;
   private effects: GameObject[] = [];
   private buildingAt = new Map<number, Building>();
   private topEntities: Entity[] = [];
@@ -121,6 +125,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.units = [];
     this.bullets = [];
     this.buildings = [];
+    this.helis = [];
+    this.heliLoopOn = false;
     this.effects = [];
     this.buildingAt.clear();
     this.remote = null;
@@ -197,6 +203,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
   onLeave(): void {
     this.board.stopSound("music_battle", true, 600);
+    this.updateHeliLoop(false);
   }
 
   /* ---------------------------------------------------------------- *
@@ -302,6 +309,13 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
       return;
     }
+    if (cmd.cmd === "helico" && typeof cmd.x === "number") {
+      if (this.gold[RED] >= COST.helico) {
+        this.gold[RED] -= COST.helico;
+        this.spawnHeli(RED, clamp(cmd.x, 0, VIEW_W));
+      }
+      return;
+    }
     if (cmd.cmd === "build" && cmd.kind && typeof cmd.c === "number" && typeof cmd.r === "number") {
       const cost = COST[cmd.kind];
       const i = this.map.idx(cmd.c, cmd.r);
@@ -325,18 +339,23 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private sendSnapshot(): void {
     const snap: SnapMsg = {
       type: "snap",
-      units: this.units
-        .filter((u) => !u.dead)
-        .map((u) => [
-          u.nid,
-          u instanceof Tank ? 1 : 0,
-          u.faction,
-          Math.round(u.cx),
-          Math.round(u.cy),
-          Math.ceil(u.hp),
-          u.maxHp,
-          u.level,
-        ]),
+      units: [
+        ...this.units
+          .filter((u) => !u.dead)
+          .map((u) => [
+            u.nid,
+            u instanceof Tank ? 1 : 0,
+            u.faction,
+            Math.round(u.cx),
+            Math.round(u.cy),
+            Math.ceil(u.hp),
+            u.maxHp,
+            u.level,
+          ]),
+        ...this.helis
+          .filter((h) => !h.dead)
+          .map((h) => [h.nid, 2, h.faction, Math.round(h.cx), Math.round(h.cy), Math.ceil(h.hp), h.maxHp, 1]),
+      ],
       buildings: this.buildings
         .filter((b) => !b.dead)
         .map((b) => [
@@ -395,6 +414,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.levels[RED] = snap.lvl.red;
     this.levels[BLUE] = snap.lvl.blue;
     this.blueShare = snap.share;
+    this.updateHeliLoop(snap.units.some((u) => u[1] === 2));
   }
 
   /* ---------------------------------------------------------------- *
@@ -432,6 +452,23 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
       this.gold[mine] -= COST.strike;
       this.scheduleStrike(x, y, mine);
+      return;
+    }
+
+    if (this.mode === "helico") {
+      if (this.myGold < COST.helico) {
+        this.board.playSound("error", false, 0.4);
+        return;
+      }
+      this.mode = null;
+      if (this.role === "guest") {
+        // x n'a pas besoin de conversion : le miroir invité n'inverse que y
+        this.sendNet({ type: "cmd", cmd: "helico", x: Math.round(x) });
+        this.board.playSound("click", false, 0.5);
+        return;
+      }
+      this.gold[mine] -= COST.helico;
+      this.spawnHeli(mine, x);
       return;
     }
 
@@ -567,6 +604,34 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.board.addEntity(u);
   }
 
+  /** Sortie d'hélico : décolle de la ligne arrière sur la colonne choisie. */
+  spawnHeli(f: Faction, x: number): void {
+    if (this.helis.filter((h) => !h.dead && h.faction === f).length >= MAX_HELIS) return;
+    const hq = this.buildings.find((b) => !b.dead && b.type === "hq" && b.faction === f);
+    const y = hq ? hq.cy : f === RED ? 80 : MAP_H - 80;
+    const h = new Helicopter(this, f, clamp(x, 24, VIEW_W - 24), y);
+    h.nid = this.nextNid++;
+    this.helis.push(h);
+    this.board.addEntity(h);
+    this.popup(h.cx, h.cy - 40, "HELICO !", f === this.myFaction ? 0 : 1);
+    this.sfx("build", 0.4);
+  }
+
+  nearestAirEnemy(x: number, y: number, f: Faction, range: number): Target | null {
+    const seek = enemyOf(f);
+    let best: Target | null = null;
+    let bestD = Infinity;
+    for (const h of this.helis) {
+      if (h.dead || h.faction !== seek) continue;
+      const d = Math.hypot(h.cx - x, h.cy - y) - h.radius;
+      if (d <= range && d < bestD) {
+        bestD = d;
+        best = h;
+      }
+    }
+    return best;
+  }
+
   tryConvert(x: number, y: number, f: Faction): void {
     const res = this.map.convertAtPx(x, y, f);
     if (!res) return;
@@ -595,6 +660,13 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   notifyKill(victim: Target, killer: Faction): void {
     if (victim.dead) return;
     victim.dead = true;
+
+    if (victim instanceof Helicopter) {
+      this.explosion(victim.cx, victim.cy, true);
+      this.gold[killer] += 15;
+      this.killsBy[killer]++;
+      return;
+    }
 
     if (victim instanceof Unit) {
       const tank = victim instanceof Tank;
@@ -706,6 +778,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         }
 
         this.blueShare = this.map.share(BLUE);
+        this.updateHeliLoop(this.helis.some((h) => !h.dead));
       }
 
       if (this.role === "host") {
@@ -833,6 +906,13 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
     }
 
+    // Une sortie d'hélico quand le trésor le permet : harcèle la ligne
+    // arrière bleue, et punit surtout un joueur sans tourelles défensives
+    if (this.gold[RED] >= COST.helico + GARRISON_COST + 60 && Math.random() < 0.4) {
+      this.gold[RED] -= COST.helico;
+      this.spawnHeli(RED, rand(60, VIEW_W - 60));
+    }
+
     // Soldier upgrades when comfortable
     const upCost = upgradeCost(this.levels[RED]);
     if (upCost !== null && this.gold[RED] >= upCost + 60) {
@@ -955,7 +1035,16 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.sweep(this.units);
     this.sweep(this.bullets);
     this.sweep(this.buildings);
+    this.sweep(this.helis);
     this.sweep(this.effects);
+  }
+
+  /** Boucle sonore du rotor tant qu'au moins un hélico est en vol. */
+  private updateHeliLoop(active: boolean): void {
+    if (active === this.heliLoopOn) return;
+    this.heliLoopOn = active;
+    if (active) this.board.playSound("helico", true, 0.22);
+    else this.board.stopSound("helico", true, 400);
   }
 
   private sweep<T extends GameObject>(arr: T[]): void {
@@ -1005,6 +1094,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.ended = true;
     this.mode = null;
     this.axisMarker = null;
+    this.updateHeliLoop(false);
     const win = winner === this.myFaction;
     this.board.stopSound("music_battle", true, 800);
     this.board.playSound(win ? "victory" : "defeat", false, 0.6);

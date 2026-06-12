@@ -102,12 +102,12 @@ await guest.page.screenshot({ path: "/tmp/bgew-war-mp-4-guest-game.png" });
 // Let the war breathe, then the guest (RED) acts: barracks on a northern
 // red tile, then the attack axis on column 12
 await guest.page.waitForTimeout(4000);
-await guest.page.mouse.click(...guest.at(108, 992)); // CASERNE
+await guest.page.mouse.click(...guest.at(65, 992)); // CASERNE
 await guest.page.waitForTimeout(300);
 // The guest's view is mirrored: their red territory is at the BOTTOM
 await guest.page.mouse.click(...guest.at(280, 700));
 await guest.page.waitForTimeout(800);
-await guest.page.mouse.click(...guest.at(588, 992)); // AXE
+await guest.page.mouse.click(...guest.at(593, 992)); // AXE
 await guest.page.waitForTimeout(300);
 await guest.page.mouse.click(...guest.at(500, 420));
 await guest.page.waitForTimeout(6000);

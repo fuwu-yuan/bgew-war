@@ -42,7 +42,16 @@ export const COLORS = {
 export const FONT = "'Black Ops One', sans-serif";
 
 /** Costs (gold) */
-export const COST = { barracks: 50, turret: 75, factory: 120, strike: 100 } as const;
+export const COST = { barracks: 50, turret: 75, factory: 120, strike: 100, helico: 90 } as const;
+
+/** Sortie d'hélico : traverse la carte, mitraille, revient. Ne convertit
+ * pas les tuiles ; seuls TOURELLES et QG peuvent le toucher (anti-air). */
+export const HELI_HP = 10;
+export const HELI_DMG = 2;
+export const HELI_RANGE = 110;
+export const HELI_FIRE_PERIOD = 0.35;
+export const HELI_SPEED = 100; // px/s
+export const MAX_HELIS = 3; // sorties simultanées par faction
 
 /** Airstrike: radius and damage (hits BOTH sides — aim carefully) */
 export const STRIKE_RADIUS = 75;

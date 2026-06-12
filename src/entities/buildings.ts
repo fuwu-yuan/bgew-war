@@ -212,7 +212,10 @@ export class Building extends GameObject {
 
     if (this.stats.range) {
       this.cd -= dt;
-      const target = this.game.nearestEnemy(this.cx, this.cy, this.faction, this.stats.range);
+      // Anti-air d'abord : tourelles et QG sont la seule défense contre les hélicos
+      const target =
+        this.game.nearestAirEnemy(this.cx, this.cy, this.faction, this.stats.range) ??
+        this.game.nearestEnemy(this.cx, this.cy, this.faction, this.stats.range);
       if (target) {
         this.aim.x = target.cx - this.cx;
         this.aim.y = target.cy - this.cy;

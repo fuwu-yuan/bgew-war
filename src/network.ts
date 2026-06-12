@@ -112,7 +112,7 @@ export interface InitMsg {
 /** Host → guest, ~10 Hz */
 export interface SnapMsg {
   type: "snap";
-  /** [nid, kind(0 soldier/1 tank), faction, x, y, hp, maxHp, level] */
+  /** [nid, kind(0 soldier/1 tank/2 helico), faction, x, y, hp, maxHp, level] */
   units: number[][];
   /** [nid, typeCode, faction, col, row, hp, maxHp, buildPct(0-100)] */
   buildings: number[][];
@@ -143,7 +143,7 @@ export interface EndMsg {
 /** Guest → host: an order for the red side */
 export interface CmdMsg {
   type: "cmd";
-  cmd: "build" | "axis" | "upgrade" | "strike";
+  cmd: "build" | "axis" | "upgrade" | "strike" | "helico";
   kind?: "barracks" | "turret" | "factory";
   c?: number;
   r?: number;

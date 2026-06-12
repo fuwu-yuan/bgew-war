@@ -4,9 +4,10 @@ import { clamp, TAU } from "../utils";
 import { drawSprite, SPR } from "../sprites";
 import { drawLevelPips } from "./units";
 import { BUILDING_SIZE, BUILDING_TYPES, BuildingType, drawBuildingBody } from "./buildings";
+import { drawHeli } from "./helicopter";
 
 interface RUnit {
-  kind: number; // 0 soldier, 1 tank
+  kind: number; // 0 soldier, 1 tank, 2 helico
   faction: number;
   x: number;
   y: number;
@@ -129,7 +130,7 @@ export class RemoteWorld extends Entity {
     for (const u of this.units.values()) {
       u.x = u.fromX + (u.toX - u.fromX) * this.lerpT;
       u.y = u.fromY + (u.toY - u.fromY) * this.lerpT;
-      if (u.moving) u.walkP += dt * 11;
+      if (u.moving || u.kind === 2) u.walkP += dt * 11; // l'hélico anime toujours son rotor
     }
     for (const b of this.buildings.values()) {
       if (b.prog < 1) b.t += dt;
@@ -152,6 +153,17 @@ export class RemoteWorld extends Entity {
     }
 
     for (const u of this.units.values()) {
+      if (u.kind === 2) {
+        drawHeli(ctx, u.faction, u.x, u.y, u.walkP / 11);
+        if (u.hp < u.maxHp) {
+          const w = 26;
+          ctx.fillStyle = "rgba(0,0,0,0.5)";
+          ctx.fillRect(u.x - w / 2, u.y - 26, w, 3);
+          ctx.fillStyle = u.faction === BLUE ? "#5dde6a" : "#ffb13d";
+          ctx.fillRect(u.x - w / 2, u.y - 26, w * clamp(u.hp / u.maxHp, 0, 1), 3);
+        }
+        continue;
+      }
       const size = u.kind === 1 ? 36 : 26;
       ctx.fillStyle = "rgba(0,0,0,0.22)";
       ctx.beginPath();
