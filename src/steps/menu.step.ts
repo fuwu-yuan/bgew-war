@@ -1,6 +1,6 @@
 import { Board, Entities, Entity, GameStep } from "@fuwu-yuan/bgew";
 import { BLUE, COLORS, FONT, GAME_VERSION, loadBest, RED, VIEW_H, VIEW_W } from "../globals";
-import { formatTime, TAU } from "../utils";
+import { clamp, formatTime, TAU } from "../utils";
 import { TileMap } from "../entities/tilemap";
 import { Fader } from "../entities/effects";
 import { drawSprite, SPR } from "../sprites";
@@ -18,9 +18,82 @@ import {
 } from "../firebase";
 import { track, trackScreen } from "../analytics";
 
+/* ------------------------------------------------------------------ *
+ * "Comment jouer" modal — a scrollable help panel with a close cross.
+ * Geometry lives here so MenuArt (draw) and MenuStep (input) agree.
+ * ------------------------------------------------------------------ */
+const HELP_X = 44;
+const HELP_Y = 108;
+const HELP_W = VIEW_W - 88; // 552
+const HELP_H = 752; // bottom = 860, clears the auth buttons row
+const HELP_TITLE = 54; // title-bar height
+const HELP_CX = HELP_X + 24; // content left
+const HELP_CY = HELP_Y + HELP_TITLE; // content top
+const HELP_CH = HELP_H - HELP_TITLE - 18; // visible content height
+const HELP_CLOSE = 30; // close-cross hit size
+const HEAD_ADV = 34;
+const BODY_ADV = 21;
+const SPACER_ADV = 10;
+
+type HelpLine = ["h" | "b" | "s", string];
+const HELP_LINES: HelpLine[] = [
+  ["h", "LE PRINCIPE"],
+  ["b", "Vos soldats avancent seuls et"],
+  ["b", "convertissent les cases : le front"],
+  ["b", "bouge sans arret. Detruisez le QG"],
+  ["b", "ennemi pour gagner la guerre."],
+  ["s", ""],
+  ["h", "L'OR"],
+  ["b", "Gagne avec les cases prises, les"],
+  ["b", "coffres et les ennemis abattus."],
+  ["b", "Sert a tout produire et ameliorer."],
+  ["s", ""],
+  ["h", "LES BATIMENTS"],
+  ["b", "CASERNE (C) : produit des soldats."],
+  ["b", "TOURELLE (T) : defense + anti-air."],
+  ["b", "USINE (U) : produit des tanks."],
+  ["b", "Construisez sur vos cases libres."],
+  ["s", ""],
+  ["h", "LES AMELIORATIONS"],
+  ["b", "SOLDATS (S), TOURELLES (R) et"],
+  ["b", "TANKS (K) : montez les niveaux,"],
+  ["b", "sans limite, pour des unites plus"],
+  ["b", "solides et plus puissantes."],
+  ["s", ""],
+  ["h", "LES POUVOIRS"],
+  ["b", "FRAPPE (F) : bombarde une zone."],
+  ["b", "Touche TOUT, vos troupes comprises"],
+  ["b", "— visez bien !"],
+  ["b", "HELICO (H) : raid aerien. Seules"],
+  ["b", "les tourelles et le QG l'abattent."],
+  ["b", "AXE (A) : concentre l'attaque sur"],
+  ["b", "une colonne de votre choix."],
+  ["s", ""],
+  ["h", "CONSEILS"],
+  ["b", "Le QG est une forteresse : usez le"],
+  ["b", "front ennemi avant de l'assaillir."],
+  ["b", "Gardez des tourelles pres du QG."],
+  ["b", "Echap annule le mode en cours."],
+  ["b", "Les raccourcis clavier sont notes"],
+  ["b", "sur chaque bouton du jeu."],
+  ["s", ""],
+  ["h", "MULTIJOUEUR"],
+  ["b", "Connectez-vous avec Google pour"],
+  ["b", "cumuler vos victoires et grimper"],
+  ["b", "au classement en ligne."],
+];
+const HELP_TOTAL = HELP_LINES.reduce(
+  (h, [k]) => h + (k === "h" ? HEAD_ADV : k === "s" ? SPACER_ADV : BODY_ADV),
+  0
+);
+const HELP_MAX_SCROLL = Math.max(0, HELP_TOTAL - HELP_CH);
+const closeX = HELP_X + HELP_W - HELP_CLOSE - 12;
+const closeY = HELP_Y + 12;
+
 /** Title art drawn above the live island background. */
 class MenuArt extends Entity {
   public showHelp = false;
+  public helpScroll = 0;
   public leaderboard: LeaderboardEntry[] = [];
   public authName = "";
   public authError = "";
@@ -77,33 +150,12 @@ class MenuArt extends Entity {
     ctx.fillStyle = "#bfd9f2";
     ctx.fillText("LA GUERRE DU TERRITOIRE", VIEW_W / 2, 470);
 
+    // The help modal owns the screen while open — draw it and stop, so the
+    // leaderboard and the solo/multi stats can't bleed through.
     if (this.showHelp) {
-      ctx.fillStyle = COLORS.uiPanel;
-      ctx.fillRect(50, 490, VIEW_W - 100, 342);
-      ctx.strokeStyle = "rgba(140, 190, 235, 0.7)";
-      ctx.lineWidth = 2;
-      ctx.strokeRect(50, 490, VIEW_W - 100, 342);
-      ctx.fillStyle = "#ffe27a";
-      ctx.font = `20px ${FONT}`;
-      ctx.fillText("COMMENT JOUER", VIEW_W / 2, 528);
-      ctx.fillStyle = "#e8f2fc";
-      ctx.font = `15px ${FONT}`;
-      const lines = [
-        "Vos soldats avancent tout seuls et",
-        "convertissent les cases : le front bouge.",
-        "L'or vient des cases prises, des coffres",
-        "et des ennemis abattus.",
-        "",
-        "Construisez CASERNES, TOURELLES, USINES.",
-        "SOLDATS+ : ameliorez vos troupes (niv 5).",
-        "FRAPPE : bombardez une zone (pour tous !).",
-        "HELICO : raid aerien (anti-air : tourelles).",
-        "AXE : concentrez l'attaque sur une colonne.",
-        "",
-        "Detruisez le QG ennemi pour gagner —",
-        "c'est une forteresse : usez le front d'abord.",
-      ];
-      lines.forEach((l, k) => ctx.fillText(l, VIEW_W / 2, 560 + k * 22));
+      this.drawHelp(ctx);
+      ctx.textAlign = "left";
+      return;
     }
 
     ctx.textAlign = "left";
@@ -160,6 +212,113 @@ class MenuArt extends Entity {
     ctx.fillText(stats, VIEW_W / 2, 940);
     ctx.textAlign = "left";
   }
+
+  /** Scrollable "Comment jouer" modal with a close cross. */
+  private drawHelp(ctx: CanvasRenderingContext2D): void {
+    // Dim the whole scene behind the modal
+    ctx.fillStyle = "rgba(6, 16, 32, 0.55)";
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+    // Panel
+    ctx.fillStyle = COLORS.uiPanel;
+    ctx.fillRect(HELP_X, HELP_Y, HELP_W, HELP_H);
+    ctx.strokeStyle = "rgba(140, 190, 235, 0.7)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(HELP_X, HELP_Y, HELP_W, HELP_H);
+
+    // Title + divider
+    ctx.textAlign = "center";
+    ctx.font = `22px ${FONT}`;
+    ctx.fillStyle = "#ffe27a";
+    ctx.fillText("COMMENT JOUER", VIEW_W / 2, HELP_Y + 38);
+    ctx.strokeStyle = "rgba(140, 190, 235, 0.3)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(HELP_X + 16, HELP_Y + HELP_TITLE - 6);
+    ctx.lineTo(HELP_X + HELP_W - 16, HELP_Y + HELP_TITLE - 6);
+    ctx.stroke();
+
+    // Close cross (top-right)
+    const cc = closeX + HELP_CLOSE / 2;
+    const cm = closeY + HELP_CLOSE / 2;
+    ctx.beginPath();
+    ctx.arc(cc, cm, HELP_CLOSE / 2, 0, TAU);
+    ctx.fillStyle = "rgba(255, 100, 90, 0.28)";
+    ctx.fill();
+    ctx.strokeStyle = "#ff8b7a";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(cc - 6, cm - 6);
+    ctx.lineTo(cc + 6, cm + 6);
+    ctx.moveTo(cc + 6, cm - 6);
+    ctx.lineTo(cc - 6, cm + 6);
+    ctx.stroke();
+
+    // Scrollable content (clipped)
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(HELP_X + 8, HELP_CY - 10, HELP_W - 16, HELP_CH + 16);
+    ctx.clip();
+    ctx.textAlign = "left";
+    let y = HELP_CY - this.helpScroll;
+    for (const [kind, text] of HELP_LINES) {
+      if (kind === "h") {
+        y += 12;
+        ctx.font = `15px ${FONT}`;
+        ctx.fillStyle = COLORS.gold;
+        ctx.fillText(text, HELP_CX, y);
+        y += HEAD_ADV - 12;
+      } else if (kind === "s") {
+        y += SPACER_ADV;
+      } else {
+        ctx.font = `14px ${FONT}`;
+        ctx.fillStyle = "#e8f2fc";
+        ctx.fillText(text, HELP_CX, y);
+        y += BODY_ADV;
+      }
+    }
+    ctx.restore();
+
+    // Scrollbar
+    if (HELP_MAX_SCROLL > 0) {
+      const trackX = HELP_X + HELP_W - 12;
+      const trackY = HELP_CY - 4;
+      const trackH = HELP_CH + 4;
+      ctx.fillStyle = "rgba(255, 255, 255, 0.08)";
+      ctx.fillRect(trackX, trackY, 4, trackH);
+      const thumbH = Math.max(30, trackH * (HELP_CH / HELP_TOTAL));
+      const thumbY = trackY + (trackH - thumbH) * (this.helpScroll / HELP_MAX_SCROLL);
+      ctx.fillStyle = "rgba(140, 190, 235, 0.7)";
+      ctx.fillRect(trackX, thumbY, 4, thumbH);
+    }
+
+    // "scroll for more" chevron
+    if (this.helpScroll < HELP_MAX_SCROLL - 1) {
+      const ay = HELP_Y + HELP_H - 14;
+      ctx.strokeStyle = "#ffe27a";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(VIEW_W / 2 - 8, ay - 4);
+      ctx.lineTo(VIEW_W / 2, ay + 2);
+      ctx.lineTo(VIEW_W / 2 + 8, ay - 4);
+      ctx.stroke();
+    }
+  }
+
+  scrollHelp(dy: number): void {
+    this.helpScroll = clamp(this.helpScroll + dy, 0, HELP_MAX_SCROLL);
+  }
+
+  isOnClose(x: number, y: number): boolean {
+    return x >= closeX - 6 && x <= closeX + HELP_CLOSE + 6 && y >= closeY - 6 && y <= closeY + HELP_CLOSE + 6;
+  }
+
+  isInsidePanel(x: number, y: number): boolean {
+    return x >= HELP_X && x <= HELP_X + HELP_W && y >= HELP_Y && y <= HELP_Y + HELP_H;
+  }
 }
 
 export class MenuStep extends GameStep {
@@ -170,20 +329,97 @@ export class MenuStep extends GameStep {
   private unsubAuth: (() => void) | null = null;
   private logoutBtn: Entities.Button | null = null;
 
+  /* Help modal — buttons hidden while open, drag/wheel to scroll */
+  private menuButtons: Entities.Button[] = [];
+  private openingHelp = false;
+  private helpDragging = false;
+  private helpLastY = 0;
+  private helpDragged = false;
+
   constructor(board: Board) {
     super(board);
-    board.onMouseEvent("click", () => {
+    board.onMouseEvent("click", (_e: MouseEvent, x: number, y: number) => {
       if (board.step !== this) return;
       if (this.soundHint) this.soundHint.visible = false;
+      if (!this.art?.showHelp || this.openingHelp) return;
+      // X or a tap on the dark backdrop closes; a drag never does
+      if (this.art.isOnClose(x, y)) this.closeHelp();
+      else if (!this.art.isInsidePanel(x, y) && !this.helpDragged) this.closeHelp();
+      this.helpDragged = false;
     });
+    board.onMouseEvent("mousedown", (_e: MouseEvent, x: number, y: number) => {
+      if (board.step !== this || !this.art?.showHelp) return;
+      if (this.art.isInsidePanel(x, y)) {
+        this.helpDragging = true;
+        this.helpLastY = y;
+        this.helpDragged = false;
+      }
+    });
+    board.onMouseEvent("mousemove", (_e: MouseEvent, _x: number, y: number) => {
+      if (board.step !== this || !this.helpDragging || !this.art) return;
+      const dy = y - this.helpLastY;
+      this.helpLastY = y;
+      if (Math.abs(dy) > 1) this.helpDragged = true;
+      this.art.scrollHelp(-dy);
+    });
+    board.onMouseEvent("mouseup", () => {
+      this.helpDragging = false;
+    });
+    window.addEventListener(
+      "wheel",
+      (e: WheelEvent) => {
+        if (board.step !== this || !this.art?.showHelp) return;
+        e.preventDefault();
+        this.art.scrollHelp(e.deltaY);
+      },
+      { passive: false }
+    );
     board.onKeyboardEvent("keydown", (e: KeyboardEvent) => {
-      if (board.step !== this || this.starting) return;
+      if (board.step !== this) return;
+      if (this.art?.showHelp) {
+        if (e.code === "Escape") this.closeHelp();
+        else if (e.code === "ArrowDown") this.art.scrollHelp(40);
+        else if (e.code === "ArrowUp") this.art.scrollHelp(-40);
+        return;
+      }
+      if (this.starting) return;
       if (e.code === "Enter" || e.code === "NumpadEnter" || e.code === "Space") this.startGame();
     });
   }
 
+  private openHelp(): void {
+    this.board.playSound("click", false, 0.4);
+    track("help_opened");
+    this.art.showHelp = true;
+    this.art.helpScroll = 0;
+    for (const b of this.menuButtons) b.visible = false;
+    if (this.logoutBtn) this.logoutBtn.visible = false;
+    this.openingHelp = true;
+    setTimeout(() => (this.openingHelp = false), 0);
+  }
+
+  private closeHelp(): void {
+    this.art.showHelp = false;
+    this.helpDragging = false;
+    this.helpDragged = false;
+    this.board.playSound("click", false, 0.4);
+    // The board click handler runs BEFORE the entity pass in the same tap
+    // (engine dispatch order). Re-showing the buttons now would let this very
+    // tap — a tap "beside" the modal lands on CONNEXION GOOGLE, just under the
+    // panel — leak onto a freshly revealed button. Defer the reveal one tick.
+    setTimeout(() => {
+      if (this.board.step !== this || this.art.showHelp) return;
+      for (const b of this.menuButtons) b.visible = true;
+      this.refreshAccount(); // restores the LOGOUT button only when logged in
+    }, 0);
+  }
+
   onEnter(): void {
     this.starting = false;
+    this.openingHelp = false;
+    this.helpDragging = false;
+    this.helpDragged = false;
+    this.menuButtons = [];
     this.camera.x = 0;
     this.camera.y = 0;
     trackScreen("menu");
@@ -206,32 +442,15 @@ export class MenuStep extends GameStep {
     multiBtn.onMouseEvent("click", () => this.goLobby());
 
     const helpBtn = this.makeButton(VIEW_W / 2 - 140, 636, 280, 44, "COMMENT JOUER", "rgba(190, 215, 240, 0.9)", 15);
-    let openingClick = false;
-    helpBtn.onMouseEvent("click", () => {
-      this.board.playSound("click", false, 0.4);
-      track("help_opened");
-      this.art.showHelp = true;
-      playBtn.visible = false;
-      multiBtn.visible = false;
-      helpBtn.visible = false;
-      openingClick = true;
-      setTimeout(() => (openingClick = false), 0);
-    });
-    // Any tap closes the help panel (the guard keeps the opening tap out)
-    this.board.onMouseEvent("click", () => {
-      if (this.board.step !== this || !this.art.showHelp || openingClick) return;
-      this.art.showHelp = false;
-      playBtn.visible = true;
-      multiBtn.visible = true;
-      helpBtn.visible = true;
-      this.board.playSound("click", false, 0.4);
-    });
+    helpBtn.onMouseEvent("click", () => this.openHelp());
 
     const googleBtn = this.makeButton(VIEW_W / 2 - 140, 884, 280, 34, "CONNEXION GOOGLE", "#7fd1ff", 10);
     googleBtn.onMouseEvent("click", () => {
       track("login", { method: "google" });
       this.authAction(() => this.signInGoogleWithPseudo());
     });
+    this.menuButtons = [playBtn, multiBtn, helpBtn, googleBtn];
+
     this.logoutBtn = this.makeButton(VIEW_W / 2 + 152, 884, 118, 34, "LOGOUT", "rgba(190, 215, 240, 0.9)", 11);
     this.logoutBtn.onMouseEvent("click", () => {
       track("logout");
@@ -258,6 +477,7 @@ export class MenuStep extends GameStep {
 
   onLeave(): void {
     this.soundHint = null;
+    this.helpDragging = false;
     this.unsubAuth?.();
     this.unsubAuth = null;
   }
@@ -270,7 +490,7 @@ export class MenuStep extends GameStep {
       this.art.multiWins = null;
       this.art.myRank = null;
     }
-    if (this.logoutBtn) this.logoutBtn.visible = !!user && !user.isAnonymous;
+    if (this.logoutBtn) this.logoutBtn.visible = !!user && !user.isAnonymous && !this.art.showHelp;
   }
 
   private refreshLeaderboard(): void {

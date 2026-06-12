@@ -156,6 +156,18 @@ export class TileMap extends Entity {
     return this.chests.has(i) || this.decors.some((d) => d.i === i);
   }
 
+  /** A gold chest sits here — loot to grab, so it still blocks building. */
+  hasChest(i: number): boolean {
+    return this.chests.has(i);
+  }
+
+  /** Remove the tree/rock decor on a tile (e.g. when building over it). */
+  clearDecor(i: number): void {
+    if (this.decors.some((d) => d.i === i)) {
+      this.decors = this.decors.filter((d) => d.i !== i);
+    }
+  }
+
   /** Territory share of `f` among owned land tiles (0..1). */
   share(f: Faction): number {
     let mine = 0;

@@ -29,6 +29,7 @@ interface Btn {
   y: number;
   w: number;
   label: string;
+  key: string; // keyboard shortcut (single uppercase letter)
   sprRed: number;
   sprBlue: number;
 }
@@ -54,23 +55,26 @@ export class Hud extends Entity {
     const commandY = MAP_H + 88;
     const upgradeY = MAP_H + 32;
     const x0 = 112;
-    const defs: [HudButton, string, number, number][] = [
-      ["barracks", "CASERNE", SPR.R_BARRACKS, SPR.B_BARRACKS],
-      ["turret", "TOURELLE", SPR.R_TURRET, SPR.B_TURRET],
-      ["factory", "USINE", SPR.R_FACTORY, SPR.B_FACTORY],
-      ["helico", "HELICO", SPR.R_HELI, SPR.B_HELI],
-      ["strike", "FRAPPE", SPR.HEDGEHOG, SPR.HEDGEHOG],
-      ["axis", "AXE", SPR.RETICLE, SPR.RETICLE],
-      ["upgradeSoldier", "SOLDATS", SPR.R_SOLDIER, SPR.B_SOLDIER],
-      ["upgradeTurret", "TOUREL.", SPR.R_TURRET, SPR.B_TURRET],
-      ["upgradeTank", "TANKS", SPR.R_TANK, SPR.B_TANK],
+    // Build/mode keys mirror the French label initials; the three upgrades
+    // get S / R / K (Soldats / touRelle / tanK) to avoid clashing with them.
+    const defs: [HudButton, string, string, number, number][] = [
+      ["barracks", "CASERNE", "C", SPR.R_BARRACKS, SPR.B_BARRACKS],
+      ["turret", "TOURELLE", "T", SPR.R_TURRET, SPR.B_TURRET],
+      ["factory", "USINE", "U", SPR.R_FACTORY, SPR.B_FACTORY],
+      ["helico", "HELICO", "H", SPR.R_HELI, SPR.B_HELI],
+      ["strike", "FRAPPE", "F", SPR.HEDGEHOG, SPR.HEDGEHOG],
+      ["axis", "AXE", "A", SPR.RETICLE, SPR.RETICLE],
+      ["upgradeSoldier", "SOLDATS", "S", SPR.R_SOLDIER, SPR.B_SOLDIER],
+      ["upgradeTurret", "TOUREL.", "R", SPR.R_TURRET, SPR.B_TURRET],
+      ["upgradeTank", "TANKS", "K", SPR.R_TANK, SPR.B_TANK],
     ];
-    this.buttons = defs.map(([id, label, sprRed, sprBlue], k) => {
+    this.buttons = defs.map(([id, label, key, sprRed, sprBlue], k) => {
       const upgrade = id === "upgradeSoldier" || id === "upgradeTank" || id === "upgradeTurret";
       const rowK = upgrade ? k - 6 : k;
       return {
         id,
         label,
+        key,
         sprRed,
         sprBlue,
         x: x0 + (w + BTN_GAP) * rowK,
@@ -86,6 +90,12 @@ export class Hud extends Entity {
       if (y >= b.y && y <= b.y + BTN_H && x >= b.x && x <= b.x + b.w) return b.id;
     }
     return null;
+  }
+
+  /** Button bound to a keyboard key (case-insensitive) — or null. */
+  buttonForKey(key: string): HudButton | null {
+    const k = key.toUpperCase();
+    return this.buttons.find((b) => b.key === k)?.id ?? null;
   }
 
   update(delta: number): void {
@@ -193,7 +203,18 @@ export class Hud extends Entity {
         ctx.fillStyle = "#bfe1ff";
         ctx.fillText("attaque", b.x + 25, b.y + 35);
       }
+
+      // Keyboard shortcut badge (bottom-right corner — clear of the label at
+      // the top and the cost at bottom-left), full opacity even when dimmed.
       ctx.globalAlpha = 1;
+      ctx.fillStyle = "rgba(8, 20, 38, 0.72)";
+      this.roundRect(ctx, b.x + b.w - 17, b.y + BTN_H - 17, 13, 13, 3);
+      ctx.fill();
+      ctx.fillStyle = selected ? "#ffffff" : "#ffe27a";
+      ctx.font = `9px ${FONT}`;
+      ctx.textAlign = "center";
+      ctx.fillText(b.key, b.x + b.w - 10.5, b.y + BTN_H - 7.5);
+      ctx.textAlign = "left";
     }
   }
 

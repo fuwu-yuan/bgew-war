@@ -165,6 +165,30 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       if (board.step !== this || this.ended) return;
       this.handleTap(x, y);
     });
+    board.onKeyboardEvent("keydown", (e: KeyboardEvent) => {
+      if (board.step !== this || this.ended) return;
+      this.handleKey(e);
+    });
+  }
+
+  /** Keyboard shortcuts for the command HUD (desktop). Mirrors a button tap. */
+  private handleKey(e: KeyboardEvent): void {
+    if (!this.hud || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === "Escape") {
+      if (this.mode) {
+        this.mode = null;
+        this.board.playSound("click", false, 0.3);
+      }
+      return;
+    }
+    const id = this.hud.buttonForKey(e.key);
+    if (!id) return;
+    if (id === "upgradeSoldier" || id === "upgradeTank" || id === "upgradeTurret") {
+      this.requestUpgrade(id === "upgradeTank" ? "tank" : id === "upgradeTurret" ? "turret" : "soldier");
+      return;
+    }
+    this.board.playSound("click", false, 0.4);
+    this.mode = this.mode === id ? null : (id as BuildMode);
   }
 
   /* ---------------------------------------------------------------- *
@@ -390,7 +414,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         this.map.isLand(cmd.c, cmd.r) &&
         this.map.owner[i] === RED &&
         !this.buildingAt.has(i) &&
-        !this.map.hasDecor(i)
+        !this.map.hasChest(i)
       ) {
         this.gold[RED] -= cost;
         this.placeBuilding(RED, cmd.kind, cmd.c, cmd.r);
@@ -464,6 +488,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       snap.units.map(([nid, kind, f, x, y, hp, maxHp, level]) => [nid, kind, f, x, this.viewY(y), hp, maxHp, level]),
       snap.buildings.map(([nid, t, f, c, r, hp, maxHp, prog]) => [nid, t, f, c, this.viewRow(r), hp, maxHp, prog])
     );
+    // Buildings may stand where the host cleared a tree/rock — mirror that
+    // here so decor doesn't peek out from under a remote building.
+    for (const [, , , c, r] of snap.buildings) this.map.clearDecor(this.map.idx(c, this.viewRow(r)));
     for (const [i, owner] of snap.own) {
       this.map.setOwner(this.viewIdx(i), owner);
     }
@@ -569,7 +596,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     const cost = COST[kind];
     const i = this.map.idx(c, r);
     const occupied = this.role === "guest" ? this.remote?.buildingAtTile(c, r) ?? false : this.buildingAt.has(i);
-    const buildable = this.map.isLand(c, r) && this.map.owner[i] === mine && !occupied && !this.map.hasDecor(i);
+    const buildable = this.map.isLand(c, r) && this.map.owner[i] === mine && !occupied && !this.map.hasChest(i);
     if (!buildable) {
       this.board.playSound("error", false, 0.4);
       this.spawnEffect(new ScorePopup(x, y, "CASE INVALIDE", "#ff8b7a", 14));
@@ -1026,7 +1053,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         const c = clamp(hq.col + randInt(-2, 2), 0, GRID_W - 1);
         const r = clamp(hq.row + randInt(0, 2), 1, GRID_H - 2);
         const i = this.map.idx(c, r);
-        if (this.map.isLand(c, r) && this.map.owner[i] === RED && !this.buildingAt.has(i) && !this.map.hasDecor(i)) {
+        if (this.map.isLand(c, r) && this.map.owner[i] === RED && !this.buildingAt.has(i) && !this.map.hasChest(i)) {
           this.gold[RED] -= COST.turret;
           this.placeBuilding(RED, "turret", c, r);
           break;
@@ -1238,7 +1265,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
   private canRedBuildAt(c: number, r: number): boolean {
     const i = this.map.idx(c, r);
-    return this.map.isLand(c, r) && this.map.owner[i] === RED && !this.buildingAt.has(i) && !this.map.hasDecor(i);
+    return this.map.isLand(c, r) && this.map.owner[i] === RED && !this.buildingAt.has(i) && !this.map.hasChest(i);
   }
 
   private columnCenter(c: number): number {
@@ -1288,6 +1315,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     b.turretLevel = this.turretLevels[f];
     this.buildings.push(b);
     this.buildingAt.set(this.map.idx(c, r), b);
+    this.map.clearDecor(this.map.idx(c, r)); // a tree/rock no longer blocks — clear it under the building
     this.board.addEntity(b);
   }
 
