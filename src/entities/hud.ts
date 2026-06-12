@@ -4,7 +4,8 @@ import { clamp } from "../utils";
 import { drawSprite, SPR } from "../sprites";
 
 export type BuildMode = "barracks" | "turret" | "factory" | "axis" | "strike" | "helico" | null;
-export type HudButton = Exclude<BuildMode, null> | "upgrade";
+export type UpgradeButton = "upgradeSoldier" | "upgradeTank" | "upgradeTurret";
+export type HudButton = Exclude<BuildMode, null> | UpgradeButton;
 
 /** What the HUD needs to read from the game step. */
 export interface HudState {
@@ -15,20 +16,25 @@ export interface HudState {
   blueShare: number; // 0..1
   axisMarker: { x: number; y: number } | null;
   soldierLevel: number; // my faction's level
-  soldierUpgradeCost: number | null; // null at max
+  soldierUpgradeCost: number;
+  tankLevel: number;
+  tankUpgradeCost: number;
+  turretLevel: number;
+  turretUpgradeCost: number;
 }
 
 interface Btn {
   id: HudButton;
   x: number;
+  y: number;
   w: number;
   label: string;
   sprRed: number;
   sprBlue: number;
 }
 
-const BTN_Y = MAP_H + 7;
-const BTN_H = 50;
+const BTN_H = 46;
+const BTN_GAP = 4;
 
 /**
  * Command panel (bottom strip) + territory bar (top) + attack-axis marker.
@@ -44,33 +50,40 @@ export class Hud extends Entity {
     super(0, 0, VIEW_W, VIEW_H);
     this.disabled = true;
     this.state = state;
-    const w = 86;
-    const gap = 2;
-    const x0 = VIEW_W - (w + gap) * 7 - 2;
+    const w = 84;
+    const commandY = MAP_H + 88;
+    const upgradeY = MAP_H + 32;
+    const x0 = 112;
     const defs: [HudButton, string, number, number][] = [
       ["barracks", "CASERNE", SPR.R_BARRACKS, SPR.B_BARRACKS],
       ["turret", "TOURELLE", SPR.R_TURRET, SPR.B_TURRET],
       ["factory", "USINE", SPR.R_FACTORY, SPR.B_FACTORY],
-      ["upgrade", "SOLDATS+", SPR.R_SOLDIER, SPR.B_SOLDIER],
       ["helico", "HELICO", SPR.R_HELI, SPR.B_HELI],
       ["strike", "FRAPPE", SPR.HEDGEHOG, SPR.HEDGEHOG],
       ["axis", "AXE", SPR.RETICLE, SPR.RETICLE],
+      ["upgradeSoldier", "SOLDATS", SPR.R_SOLDIER, SPR.B_SOLDIER],
+      ["upgradeTurret", "TOUREL.", SPR.R_TURRET, SPR.B_TURRET],
+      ["upgradeTank", "TANKS", SPR.R_TANK, SPR.B_TANK],
     ];
-    this.buttons = defs.map(([id, label, sprRed, sprBlue], k) => ({
-      id,
-      label,
-      sprRed,
-      sprBlue,
-      x: x0 + (w + gap) * k,
-      w,
-    }));
+    this.buttons = defs.map(([id, label, sprRed, sprBlue], k) => {
+      const upgrade = id === "upgradeSoldier" || id === "upgradeTank" || id === "upgradeTurret";
+      const rowK = upgrade ? k - 6 : k;
+      return {
+        id,
+        label,
+        sprRed,
+        sprBlue,
+        x: x0 + (w + BTN_GAP) * rowK,
+        y: upgrade ? upgradeY : commandY,
+        w,
+      };
+    });
   }
 
   /** Button under (x, y) — game coords — or null. */
   hitButton(x: number, y: number): HudButton | null {
-    if (y < BTN_Y || y > BTN_Y + BTN_H) return null;
     for (const b of this.buttons) {
-      if (x >= b.x && x <= b.x + b.w) return b.id;
+      if (y >= b.y && y <= b.y + BTN_H && x >= b.x && x <= b.x + b.w) return b.id;
     }
     return null;
   }
@@ -132,51 +145,53 @@ export class Hud extends Entity {
     ctx.fillRect(0, MAP_H, VIEW_W, 2);
 
     // Gold (capped display so 4+ digits never bleed into the buttons)
-    drawSprite(ctx, SPR.GOLD, 14, MAP_H + 26, 22);
+    drawSprite(ctx, SPR.GOLD, 18, MAP_H + 44, 24);
     ctx.font = `13px ${FONT}`;
     ctx.fillStyle = COLORS.gold;
     const g = Math.floor(s.myGold);
-    ctx.fillText(g > 999 ? "999+" : `${g}`, 27, MAP_H + 31);
+    ctx.fillText(g > 999 ? "999+" : `${g}`, 33, MAP_H + 49);
     // My flag under the gold
-    drawSprite(ctx, mine === BLUE ? SPR.B_FLAG : SPR.R_FLAG, 14, MAP_H + 49, 18);
+    drawSprite(ctx, mine === BLUE ? SPR.B_FLAG : SPR.R_FLAG, 18, MAP_H + 74, 18);
     ctx.font = `9px ${FONT}`;
     ctx.fillStyle = "#9fc3e4";
-    ctx.fillText(mine === BLUE ? "BLEU" : "ROUGE", 26, MAP_H + 53);
+    ctx.fillText(mine === BLUE ? "BLEU" : "ROUGE", 32, MAP_H + 78);
 
     // Buttons
     for (const b of this.buttons) {
-      const cost =
-        b.id === "upgrade" ? s.soldierUpgradeCost : b.id === "axis" ? 0 : COST[b.id];
-      const isUpgrade = b.id === "upgrade";
-      const maxed = isUpgrade && cost === null;
-      const afford = maxed || cost === 0 || cost === null || s.myGold >= cost;
-      const selected = s.mode === b.id;
+      const isUpgrade = b.id === "upgradeSoldier" || b.id === "upgradeTank" || b.id === "upgradeTurret";
+      let cost = 0;
+      if (b.id === "upgradeTank") cost = s.tankUpgradeCost;
+      else if (b.id === "upgradeTurret") cost = s.turretUpgradeCost;
+      else if (b.id === "upgradeSoldier") cost = s.soldierUpgradeCost;
+      else if (b.id !== "axis") cost = COST[b.id];
+      const afford = cost === 0 || s.myGold >= cost;
+      const selected = !isUpgrade && s.mode === b.id;
       ctx.fillStyle = selected ? "rgba(90, 160, 230, 0.45)" : "rgba(255, 255, 255, 0.07)";
       ctx.strokeStyle = selected
         ? "#ffe27a"
-        : afford && !maxed
+        : afford
           ? "rgba(140, 190, 235, 0.7)"
           : "rgba(120, 140, 160, 0.35)";
       ctx.lineWidth = selected ? 2.5 : 1.5;
-      this.roundRect(ctx, b.x, BTN_Y, b.w, BTN_H, 8);
+      this.roundRect(ctx, b.x, b.y, b.w, BTN_H, 7);
       ctx.fill();
       ctx.stroke();
 
-      ctx.globalAlpha = afford && !maxed ? 1 : 0.45;
-      drawSprite(ctx, mine === BLUE ? b.sprBlue : b.sprRed, b.x + 15, BTN_Y + BTN_H / 2, 24);
+      ctx.globalAlpha = afford ? 1 : 0.45;
+      drawSprite(ctx, mine === BLUE ? b.sprBlue : b.sprRed, b.x + 13, b.y + BTN_H / 2, 22);
       ctx.fillStyle = "#ffffff";
-      ctx.font = `10px ${FONT}`;
-      const label = isUpgrade ? `${b.label}${s.soldierLevel}` : b.label;
-      ctx.fillText(label, b.x + 28, BTN_Y + 20);
-      if (maxed) {
-        ctx.fillStyle = "#9fc3e4";
-        ctx.fillText("MAX", b.x + 28, BTN_Y + 38);
-      } else if (cost && cost > 0) {
+      ctx.font = `8px ${FONT}`;
+      const level =
+        b.id === "upgradeTank" ? s.tankLevel : b.id === "upgradeTurret" ? s.turretLevel : s.soldierLevel;
+      const label = isUpgrade ? `${b.label} ${level}` : b.label;
+      ctx.fillText(label, b.x + 25, b.y + 18);
+      if (cost && cost > 0) {
         ctx.fillStyle = COLORS.gold;
-        ctx.fillText(`${cost} or`, b.x + 28, BTN_Y + 38);
+        ctx.font = `8px ${FONT}`;
+        ctx.fillText(`${cost} or`, b.x + 25, b.y + 35);
       } else {
         ctx.fillStyle = "#bfe1ff";
-        ctx.fillText("attaque", b.x + 28, BTN_Y + 38);
+        ctx.fillText("attaque", b.x + 25, b.y + 35);
       }
       ctx.globalAlpha = 1;
     }

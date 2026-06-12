@@ -1,8 +1,10 @@
 import { Board, Entities, Entity, GameStep } from "@fuwu-yuan/bgew";
-import { BLUE, COLORS, FONT, loadBest, saveBest, VIEW_H, VIEW_W } from "../globals";
+import { BLUE, COLORS, FONT, loadBest, RED, saveBest, VIEW_H, VIEW_W } from "../globals";
 import { formatTime } from "../utils";
 import { Fader } from "../entities/effects";
 import { drawSprite, SPR } from "../sprites";
+import { currentUser, recordMultiResult, signInGoogle } from "../firebase";
+import { track, trackScreen } from "../analytics";
 
 interface EndData {
   win: boolean;
@@ -18,6 +20,8 @@ interface EndData {
 /** Result screen art (background + banner + stats). */
 class EndArt extends Entity {
   private data: EndData;
+  public accountMsg = "";
+  public accountError = "";
   private t = 0;
 
   constructor(data: EndData) {
@@ -84,12 +88,29 @@ class EndArt extends Entity {
       ctx.fillText(v, VIEW_W - 145, y);
     });
     ctx.textAlign = "left";
+
+    if (d.multi) {
+      ctx.fillStyle = "rgba(10, 25, 45, 0.78)";
+      ctx.fillRect(100, 620, VIEW_W - 200, 70);
+      ctx.strokeStyle = "rgba(140, 190, 235, 0.45)";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(100, 620, VIEW_W - 200, 70);
+      ctx.textAlign = "center";
+      ctx.font = `12px ${FONT}`;
+      ctx.fillStyle = this.accountError ? "#ff8b7a" : "#9fc3e4";
+      ctx.fillText(this.accountError || this.accountMsg, VIEW_W / 2, 648);
+      ctx.fillStyle = "#e8f2fc";
+      ctx.fillText("Connectez Google pour cumuler victoires et stats multi.", VIEW_W / 2, 672);
+      ctx.textAlign = "left";
+    }
   }
 }
 
 export class EndStep extends GameStep {
   name = "end";
   private leaving = false;
+  private art!: EndArt;
+  private pendingData: EndData | null = null;
 
   constructor(board: Board) {
     super(board);
@@ -99,6 +120,20 @@ export class EndStep extends GameStep {
     this.leaving = false;
     this.camera.x = 0;
     this.camera.y = 0;
+
+    trackScreen("end");
+    const mode = data.multi ? (data.faction === RED ? "guest" : "host") : "solo";
+    track("game_end", {
+      mode,
+      result: data.win ? "win" : "loss",
+      faction: data.faction === RED ? "red" : "blue",
+      duration: Math.round(data.time),
+      share: Math.round(data.share * 100),
+      kills: data.kills,
+      losses: data.losses,
+    });
+    // GA4 leaderboard convention: only ranked multiplayer wins post a score.
+    if (data.multi && data.win) track("post_score", { score: Math.round(data.time), level: "multi" });
 
     // Multiplayer: the room is over, hang up cleanly
     if (data.multi) this.board.networkManager.leaveRoom();
@@ -110,24 +145,72 @@ export class EndStep extends GameStep {
         bestTime: Math.min(best.bestTime ?? Infinity, data.time),
       });
     }
+    this.pendingData = data.multi ? data : null;
 
-    this.board.addEntity(new EndArt(data));
+    this.art = new EndArt(data);
+    this.board.addEntity(this.art);
+
+    const user = currentUser();
+    if (data.multi && user) {
+      this.art.accountMsg = "Stats multi enregistrees.";
+      this.saveMultiResult(data);
+    } else if (data.multi) {
+      this.art.accountMsg = "Invite : connectez Google pour garder vos stats.";
+    }
 
     if (data.multi) {
       // The opponent is gone with the room: back to the lobby or the menu
-      const lobby = this.makeButton(VIEW_W / 2 - 140, 660, "RETOUR AU LOBBY", "#7fd1ff");
+      const login = this.makeButton(VIEW_W / 2 - 140, 704, "CONNECTER GOOGLE", "#ffe27a");
+      login.onMouseEvent("click", () => this.connectGoogle());
+      const lobby = this.makeButton(VIEW_W / 2 - 140, 766, "RETOUR AU LOBBY", "#7fd1ff");
       lobby.onMouseEvent("click", () => this.goTo("lobby"));
     } else {
       const replay = this.makeButton(VIEW_W / 2 - 140, 660, "REJOUER", "#ffe27a");
-      replay.onMouseEvent("click", () => this.goTo("game"));
+      replay.onMouseEvent("click", () => {
+        track("replay");
+        this.goTo("game");
+      });
     }
-    const menu = this.makeButton(VIEW_W / 2 - 140, 736, "MENU", "rgba(190, 215, 240, 0.9)");
+    const menu = this.makeButton(VIEW_W / 2 - 140, data.multi ? 828 : 736, "MENU", "rgba(190, 215, 240, 0.9)");
     menu.onMouseEvent("click", () => this.goTo("menu"));
 
     this.board.addEntity(new Fader(1, 0, 600));
   }
 
   onLeave(): void {}
+
+  private saveMultiResult(data: EndData): void {
+    recordMultiResult({
+      win: data.win,
+      time: data.time,
+      share: data.share,
+      kills: data.kills,
+      losses: data.losses,
+      faction: data.faction ?? BLUE,
+    })
+      .then(() => {
+        if (this.art) this.art.accountMsg = "Stats multi enregistrees.";
+      })
+      .catch((err) => {
+        console.warn("leaderboard update failed", err);
+        if (this.art) this.art.accountError = "Impossible d'enregistrer les stats.";
+      });
+  }
+
+  private connectGoogle(): void {
+    if (!this.pendingData) return;
+    track("login", { method: "google" });
+    this.board.playSound("click", false, 0.5);
+    this.art.accountError = "";
+    this.art.accountMsg = "Connexion Google...";
+    signInGoogle()
+      .then(() => {
+        if (this.pendingData) this.saveMultiResult(this.pendingData);
+      })
+      .catch((err) => {
+        this.art.accountError = String(err?.code || err?.message || "connexion impossible").slice(0, 54);
+      });
+  }
 
   private goTo(step: string): void {
     if (this.leaving) return;

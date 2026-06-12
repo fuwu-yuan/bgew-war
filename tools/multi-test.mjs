@@ -51,7 +51,7 @@ const executablePath =
 
 const browser = await chromium.launch({ executablePath, args: ["--autoplay-policy=no-user-gesture-required"] });
 const errors = [];
-const GAME_URL = `http://localhost:${PORT}/?server=localhost:${NET_PORT}`;
+const GAME_URL = `http://localhost:${PORT}/?server=localhost:${NET_PORT}&firebase=off`;
 
 async function openPage(tag) {
   const page = await browser.newPage({ viewport: { width: 700, height: 1080 } });
@@ -102,12 +102,12 @@ await guest.page.screenshot({ path: "/tmp/bgew-war-mp-4-guest-game.png" });
 // Let the war breathe, then the guest (RED) acts: barracks on a northern
 // red tile, then the attack axis on column 12
 await guest.page.waitForTimeout(4000);
-await guest.page.mouse.click(...guest.at(65, 992)); // CASERNE
+await guest.page.mouse.click(...guest.at(157, 992)); // CASERNE
 await guest.page.waitForTimeout(300);
 // The guest's view is mirrored: their red territory is at the BOTTOM
 await guest.page.mouse.click(...guest.at(280, 700));
 await guest.page.waitForTimeout(800);
-await guest.page.mouse.click(...guest.at(593, 992)); // AXE
+await guest.page.mouse.click(...guest.at(587, 992)); // AXE
 await guest.page.waitForTimeout(300);
 await guest.page.mouse.click(...guest.at(500, 420));
 await guest.page.waitForTimeout(6000);
@@ -136,8 +136,10 @@ const hostHqRow = await host.page.evaluate(
 const guestHqRow = await guest.page.evaluate(
   () => [...window.__bgewwar.steps.play.remote.buildings.values()].find((b) => b.type === "hq" && b.faction === 1)?.row
 );
-console.log(`red HQ row: host=${hostHqRow} guest=${guestHqRow} (mirror of ${hostHqRow} is ${23 - hostHqRow})`);
-if (guestHqRow !== 23 - hostHqRow) {
+const gridH = await host.page.evaluate(() => window.__bgewwar.steps.play.map.owner.length / 16);
+const mirrorRow = gridH - 1 - hostHqRow;
+console.log(`red HQ row: host=${hostHqRow} guest=${guestHqRow} (mirror of ${hostHqRow} is ${mirrorRow})`);
+if (guestHqRow !== mirrorRow) {
   errors.push(`FLIP: red HQ should be mirrored (host row ${hostHqRow}, guest row ${guestHqRow})`);
 }
 

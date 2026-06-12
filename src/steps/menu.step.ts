@@ -4,10 +4,30 @@ import { formatTime, TAU } from "../utils";
 import { TileMap } from "../entities/tilemap";
 import { Fader } from "../entities/effects";
 import { drawSprite, SPR } from "../sprites";
+import {
+  currentUser,
+  displayName,
+  loadLeaderboard,
+  loadMyRank,
+  logout,
+  needsPseudo,
+  onUserChange,
+  setPseudo,
+  signInGoogle,
+  type LeaderboardEntry,
+} from "../firebase";
+import { track, trackScreen } from "../analytics";
 
 /** Title art drawn above the live island background. */
 class MenuArt extends Entity {
   public showHelp = false;
+  public leaderboard: LeaderboardEntry[] = [];
+  public authName = "";
+  public authError = "";
+  public soloWins = 0;
+  public multiWins: number | null = null;
+  public myRank: number | null = null;
+  public myUid = "";
   private t = 0;
 
   constructor() {
@@ -85,6 +105,59 @@ class MenuArt extends Entity {
       ];
       lines.forEach((l, k) => ctx.fillText(l, VIEW_W / 2, 560 + k * 22));
     }
+
+    ctx.textAlign = "left";
+    ctx.fillStyle = "rgba(10, 25, 45, 0.72)";
+    ctx.fillRect(50, 690, VIEW_W - 100, 184);
+    ctx.strokeStyle = "rgba(140, 190, 235, 0.45)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(50, 690, VIEW_W - 100, 184);
+    ctx.font = `15px ${FONT}`;
+    ctx.fillStyle = COLORS.gold;
+    ctx.fillText("CLASSEMENT MULTI", 70, 722);
+    ctx.textAlign = "right";
+    ctx.fillStyle = this.authName ? "#9fc3e4" : "#ffb13d";
+    ctx.font = `11px ${FONT}`;
+    ctx.fillText(this.authName ? this.authName : "non connecte", VIEW_W - 70, 721);
+    ctx.textAlign = "left";
+    ctx.font = `11px ${FONT}`;
+    ctx.fillStyle = "#e8f2fc";
+    if (this.myRank !== null && this.multiWins !== null) {
+      ctx.fillStyle = COLORS.gold;
+      ctx.fillText(`Votre place : #${this.myRank} avec ${this.multiWins} victoire${this.multiWins > 1 ? "s" : ""}`, 70, 744);
+    }
+    if (this.leaderboard.length === 0) {
+      ctx.fillStyle = "#e8f2fc";
+      ctx.fillText("Aucune victoire multi enregistree.", 70, 768);
+    } else {
+      this.leaderboard.slice(0, 5).forEach((e, i) => {
+        const y = 766 + i * 20;
+        const mine = e.uid === this.myUid;
+        if (mine) {
+          ctx.fillStyle = "rgba(255, 217, 94, 0.18)";
+          ctx.fillRect(62, y - 15, VIEW_W - 124, 19);
+        }
+        ctx.fillStyle = mine || i === 0 ? COLORS.gold : "#e8f2fc";
+        ctx.fillText(`${i + 1}. ${e.name}`, 70, y);
+        ctx.textAlign = "right";
+        ctx.fillText(`${e.wins} V`, VIEW_W - 128, y);
+        ctx.fillText(e.bestTime ? formatTime(e.bestTime) : "--", VIEW_W - 70, y);
+        ctx.textAlign = "left";
+      });
+    }
+    if (this.authError) {
+      ctx.fillStyle = "#ff8b7a";
+      ctx.font = `10px ${FONT}`;
+      ctx.fillText(this.authError, 70, 862);
+    }
+    ctx.textAlign = "center";
+    ctx.font = `13px ${FONT}`;
+    ctx.fillStyle = COLORS.gold;
+    const stats =
+      this.multiWins === null
+        ? `VICTOIRES SOLO : ${this.soloWins}`
+        : `VICTOIRES SOLO : ${this.soloWins}  |  VICTOIRES MULTI : ${this.multiWins}`;
+    ctx.fillText(stats, VIEW_W / 2, 940);
     ctx.textAlign = "left";
   }
 }
@@ -94,6 +167,8 @@ export class MenuStep extends GameStep {
   private starting = false;
   private art!: MenuArt;
   private soundHint: Entities.Label | null = null;
+  private unsubAuth: (() => void) | null = null;
+  private logoutBtn: Entities.Button | null = null;
 
   constructor(board: Board) {
     super(board);
@@ -111,10 +186,18 @@ export class MenuStep extends GameStep {
     this.starting = false;
     this.camera.x = 0;
     this.camera.y = 0;
+    trackScreen("menu");
 
     this.board.addEntity(new TileMap());
     this.art = new MenuArt();
+    this.art.soloWins = loadBest()?.wins ?? 0;
     this.board.addEntity(this.art);
+    this.refreshAccount();
+    this.refreshLeaderboard();
+    this.unsubAuth = onUserChange(() => {
+      this.refreshAccount();
+      this.refreshLeaderboard();
+    });
 
     const playBtn = this.makeButton(VIEW_W / 2 - 140, 504, 280, 58, "JOUER", "#ffe27a", 22);
     playBtn.onMouseEvent("click", () => this.startGame());
@@ -126,6 +209,7 @@ export class MenuStep extends GameStep {
     let openingClick = false;
     helpBtn.onMouseEvent("click", () => {
       this.board.playSound("click", false, 0.4);
+      track("help_opened");
       this.art.showHelp = true;
       playBtn.visible = false;
       multiBtn.visible = false;
@@ -143,20 +227,17 @@ export class MenuStep extends GameStep {
       this.board.playSound("click", false, 0.4);
     });
 
-    const best = loadBest();
-    if (best && best.wins > 0) {
-      const label = new Entities.Label(
-        0,
-        706,
-        `VICTOIRES : ${best.wins}  —  MEILLEUR TEMPS : ${formatTime(best.bestTime)}`,
-        this.board.ctx
-      );
-      label.fontFamily = FONT;
-      label.fontSize = 14;
-      label.fontColor = COLORS.gold;
-      label.x = VIEW_W / 2 - label.width / 2;
-      this.board.addEntity(label);
-    }
+    const googleBtn = this.makeButton(VIEW_W / 2 - 140, 884, 280, 34, "CONNEXION GOOGLE", "#7fd1ff", 10);
+    googleBtn.onMouseEvent("click", () => {
+      track("login", { method: "google" });
+      this.authAction(() => this.signInGoogleWithPseudo());
+    });
+    this.logoutBtn = this.makeButton(VIEW_W / 2 + 152, 884, 118, 34, "LOGOUT", "rgba(190, 215, 240, 0.9)", 11);
+    this.logoutBtn.onMouseEvent("click", () => {
+      track("logout");
+      this.authAction(() => logout());
+    });
+    this.refreshAccount();
 
     const footer = new Entities.Label(0, VIEW_H - 30, `v${GAME_VERSION} — cree avec BGEW, le Baguette Game Engine Web`, this.board.ctx);
     footer.fontFamily = FONT;
@@ -177,6 +258,54 @@ export class MenuStep extends GameStep {
 
   onLeave(): void {
     this.soundHint = null;
+    this.unsubAuth?.();
+    this.unsubAuth = null;
+  }
+
+  private refreshAccount(): void {
+    const user = currentUser();
+    this.art.authName = user ? (user.isAnonymous ? "invite" : displayName(user)) : "invite";
+    this.art.myUid = user && !user.isAnonymous ? user.uid : "";
+    if (!this.art.myUid) {
+      this.art.multiWins = null;
+      this.art.myRank = null;
+    }
+    if (this.logoutBtn) this.logoutBtn.visible = !!user && !user.isAnonymous;
+  }
+
+  private refreshLeaderboard(): void {
+    Promise.all([loadLeaderboard(10), loadMyRank()])
+      .then(([rows, rank]) => {
+        if (this.art) this.art.leaderboard = rows;
+        if (this.art) {
+          this.art.multiWins = rank?.entry.wins ?? null;
+          this.art.myRank = rank?.rank ?? null;
+        }
+      })
+      .catch(() => {
+        if (this.art) this.art.authError = "classement indisponible";
+      });
+  }
+
+  private authAction(fn: () => Promise<unknown>): void {
+    this.board.playSound("click", false, 0.4);
+    this.art.authError = "";
+    fn()
+      .then(() => {
+        this.refreshAccount();
+        this.refreshLeaderboard();
+      })
+      .catch((err) => {
+        this.art.authError = String(err?.code || err?.message || "connexion impossible").slice(0, 48);
+      });
+  }
+
+  private async signInGoogleWithPseudo(): Promise<void> {
+    const user = await signInGoogle();
+    if (!(await needsPseudo(user))) return;
+    const chosen = window.prompt("Choisissez votre pseudo pour le classement", displayName(user));
+    await setPseudo(chosen || displayName(user), user);
+    track("set_pseudo");
   }
 
   private startGame(): void {
@@ -193,6 +322,7 @@ export class MenuStep extends GameStep {
   private goLobby(): void {
     if (this.starting) return;
     this.starting = true;
+    track("multiplayer_open");
     this.board.playSound("click", false, 0.5);
     this.board.addEntity(
       new Fader(0, 1, 450, "#08111f", () => {

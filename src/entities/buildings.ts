@@ -21,7 +21,9 @@ export const BUILDING_SPRITE: Record<BuildingType, [number, number]> = {
 interface BuildingStats {
   hp: number;
   size: number;
-  spawnEvery?: number; // s — barracks/factory
+  spawnEvery?: number; // s — time between production waves
+  waveCount?: number;
+  waveSpacing?: number; // s — delay between units inside a wave
   range?: number; // px — turret
   dmg?: number;
   firePeriod?: number;
@@ -31,10 +33,10 @@ interface BuildingStats {
 const STATS: Record<BuildingType, BuildingStats> = {
   // The HQ is a fortress: lots of HP and it shoots back — rushing it
   // without grinding the front first must fail.
-  hq: { hp: 150, size: 58, range: 160, dmg: 4, firePeriod: 0.7 },
-  barracks: { hp: 16, size: 38, spawnEvery: 2.5, buildTime: 3 },
-  factory: { hp: 20, size: 38, spawnEvery: 9, buildTime: 5 },
-  turret: { hp: 14, size: 38, range: 150, dmg: 2, firePeriod: 0.55, buildTime: 4 },
+  hq: { hp: 320, size: 58, range: 170, dmg: 4, firePeriod: 0.7 },
+  barracks: { hp: 36, size: 38, spawnEvery: 8, waveCount: 12, waveSpacing: 0.18, buildTime: 3 },
+  factory: { hp: 48, size: 38, spawnEvery: 12, waveCount: 5, waveSpacing: 0.45, buildTime: 5 },
+  turret: { hp: 30, size: 38, range: 150, dmg: 3, firePeriod: 0.55, buildTime: 4 },
 };
 
 const SPRITES = BUILDING_SPRITE;
@@ -147,10 +149,16 @@ export class Building extends GameObject {
   public nid = 0;
   /** Soldier level its faction spawns at (kept fresh by the game step) */
   public soldierLevel = 1;
+  /** Tank level factories spawn at (kept fresh by the game step). */
+  public tankLevel = 1;
+  /** Turret upgrade level for damage/range/fire rate (kept fresh by the game step). */
+  public turretLevel = 1;
 
   private game: GameAPI;
   private stats: BuildingStats;
   private spawnT: number;
+  private waveLeft = 0;
+  private waveT = 0;
   private cd = 0;
   private muzzleT = 0;
   private aim = { x: 0, y: -1 };
@@ -200,29 +208,40 @@ export class Building extends GameObject {
 
     if (this.stats.spawnEvery) {
       this.spawnT -= dt;
-      if (this.spawnT <= 0) {
+      this.waveT -= dt;
+      if (this.waveLeft <= 0 && this.spawnT <= 0) {
         this.spawnT = this.stats.spawnEvery;
+        this.waveLeft = this.stats.waveCount ?? 1;
+        this.waveT = 0;
+      }
+      if (this.waveLeft > 0 && this.waveT <= 0) {
+        this.waveLeft--;
+        this.waveT = this.stats.waveSpacing ?? 0.25;
         const dir = this.faction === RED ? 1 : -1;
         const x = this.cx + rand(-14, 14);
         const y = this.cy + dir * (TILE * 0.8);
         if (this.type === "barracks") this.game.spawnSoldier(this.faction, x, y, this.soldierLevel);
-        else this.game.spawnTank(this.faction, x, y);
+        else this.game.spawnTank(this.faction, x, y, this.tankLevel);
       }
     }
 
     if (this.stats.range) {
       this.cd -= dt;
+      const lvl = this.type === "turret" ? this.turretLevel : 1;
+      const range = (this.stats.range ?? 0) + (this.type === "turret" ? 10 * (lvl - 1) : 0);
+      const dmg = (this.stats.dmg ?? 1) * (this.type === "turret" ? 1 + 0.42 * (lvl - 1) : 1);
+      const firePeriod = (this.stats.firePeriod ?? 0.6) * (this.type === "turret" ? Math.pow(0.88, lvl - 1) : 1);
       // Anti-air d'abord : tourelles et QG sont la seule défense contre les hélicos
       const target =
-        this.game.nearestAirEnemy(this.cx, this.cy, this.faction, this.stats.range) ??
-        this.game.nearestEnemy(this.cx, this.cy, this.faction, this.stats.range);
+        this.game.nearestAirEnemy(this.cx, this.cy, this.faction, range) ??
+        this.game.nearestEnemy(this.cx, this.cy, this.faction, range);
       if (target) {
         this.aim.x = target.cx - this.cx;
         this.aim.y = target.cy - this.cy;
         if (this.cd <= 0) {
-          this.cd = this.stats.firePeriod ?? 0.6;
+          this.cd = firePeriod;
           this.muzzleT = 0.06;
-          this.game.fireBullet(this.cx, this.cy - 10, target, this.stats.dmg ?? 1, this.faction, false);
+          this.game.fireBullet(this.cx, this.cy - 10, target, dmg, this.faction, false);
           this.game.sfx("turret", 0.1);
         }
       }

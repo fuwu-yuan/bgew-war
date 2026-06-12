@@ -54,7 +54,7 @@ const errors = [];
     if (m.type() === "error") errors.push(`DESKTOP CONSOLE: ${m.text()}`);
   });
 
-  await page.goto(`http://localhost:${PORT}/`, { waitUntil: "networkidle" });
+  await page.goto(`http://localhost:${PORT}/?firebase=off`, { waitUntil: "networkidle" });
   await page.waitForTimeout(1800);
   await page.screenshot({ path: "/tmp/bgew-war-1-menu.png" });
 
@@ -78,14 +78,14 @@ const errors = [];
 
   // Let the front move, then build a barracks bottom middle
   await page.waitForTimeout(4000);
-  await page.mouse.click(...at(65, 992)); // CASERNE button
+  await page.mouse.click(...at(157, 992)); // CASERNE button
   await page.waitForTimeout(300);
   await page.screenshot({ path: "/tmp/bgew-war-4-build-mode.png" });
   await page.mouse.click(...at(320, 700)); // blue tile mid-south
   await page.waitForTimeout(400);
 
   // Attack axis on column 3
-  await page.mouse.click(...at(593, 992)); // AXE button
+  await page.mouse.click(...at(587, 992)); // AXE button
   await page.waitForTimeout(200);
   await page.mouse.click(...at(140, 480));
   await page.waitForTimeout(3000);
@@ -93,13 +93,13 @@ const errors = [];
 
   // Soldier upgrade once the gold is there
   await page.waitForTimeout(8000);
-  await page.mouse.click(...at(329, 992)); // SOLDATS+ button
+  await page.mouse.click(...at(159, 935)); // SOLDATS+ button
   await page.waitForTimeout(500);
   await page.screenshot({ path: "/tmp/bgew-war-5b-upgrade.png" });
 
   // Airstrike on the middle of the front
   await page.waitForTimeout(6000);
-  await page.mouse.click(...at(505, 992)); // FRAPPE button
+  await page.mouse.click(...at(501, 992)); // FRAPPE button
   await page.waitForTimeout(250);
   await page.mouse.click(...at(320, 440));
   await page.waitForTimeout(1300);
@@ -109,7 +109,7 @@ const errors = [];
   await page.evaluate(() => {
     window.__bgewwar.steps.play.gold[2] += 120;
   });
-  await page.mouse.click(...at(417, 992)); // HELICO button
+  await page.mouse.click(...at(415, 992)); // HELICO button
   await page.waitForTimeout(250);
   await page.mouse.click(...at(200, 500)); // flight lane
   await page.waitForTimeout(2500);
@@ -149,6 +149,8 @@ const errors = [];
     const play = window.__bgewwar.steps.play;
     const hq = play.buildings.find((b) => b.type === "hq" && b.faction === 1 && !b.dead);
     if (!hq) return -1;
+    play.ended = false;
+    hq.hp = hq.maxHp;
     const before = play.units.filter((u) => u.faction === 2).length;
     for (let i = 0; i < 15; i++) {
       play.spawnSoldier(2, hq.cx + (Math.random() * 160 - 80), hq.cy + 90 + Math.random() * 70);
@@ -163,7 +165,50 @@ const errors = [];
   });
   console.log(`rush test: ${spawned} soldiers dropped on the HQ → ${JSON.stringify(rush)}`);
   await page.screenshot({ path: "/tmp/bgew-war-6b-rush.png" });
-  if (!rush.hqAlive || rush.ended) errors.push(`BALANCE: a 15-soldier rush still kills the HQ (${JSON.stringify(rush)})`);
+  if (!rush.hqAlive) errors.push(`BALANCE: a 15-soldier rush still kills the HQ (${JSON.stringify(rush)})`);
+
+  // Massive assault regression: the HQ defense must scale with the threat,
+  // otherwise a 200-soldier blob visually erases the response.
+  const bigRush = await page.evaluate(() => {
+    const play = window.__bgewwar.steps.play;
+    const hq = play.buildings.find((b) => b.type === "hq" && b.faction === 1 && !b.dead);
+    if (!hq) return { spawned: -1, redBefore: -1 };
+    play.ended = false;
+    play.hqDefenseUsed[1] = false;
+    hq.hp = hq.maxHp;
+    const blueBefore = play.units.filter((u) => u.faction === 2).length;
+    const redBefore = play.units.filter((u) => u.faction === 1).length;
+    for (let i = 0; i < 200; i++) {
+      play.spawnSoldier(2, hq.cx + (Math.random() * 280 - 140), hq.cy + 70 + Math.random() * 190);
+    }
+    hq.hp = Math.max(1, hq.hp - 1);
+    return { spawned: play.units.filter((u) => u.faction === 2).length - blueBefore, redBefore };
+  });
+  await page.waitForTimeout(1200);
+  const bigDefense = await page.evaluate((redBefore) => {
+    const play = window.__bgewwar.steps.play;
+    return {
+      redAdded: play.units.filter((u) => u.faction === 1).length - redBefore,
+      redTotal: play.units.filter((u) => u.faction === 1).length,
+    };
+  }, bigRush.redBefore);
+  console.log(`big rush test: ${bigRush.spawned} soldiers → ${JSON.stringify(bigDefense)}`);
+  if (bigRush.spawned >= 180 && bigDefense.redAdded < 60) {
+    errors.push(`BALANCE: massive HQ attack spawned too small a defense (${JSON.stringify({ bigRush, bigDefense })})`);
+  }
+  const secondDefense = await page.evaluate(() => {
+    const play = window.__bgewwar.steps.play;
+    const hq = play.buildings.find((b) => b.type === "hq" && b.faction === 1 && !b.dead);
+    const redBefore = play.units.filter((u) => u.faction === 1).length;
+    if (hq) hq.hp = Math.max(1, hq.hp - 1);
+    return { redBefore };
+  });
+  await page.waitForTimeout(1200);
+  const secondAdded = await page.evaluate((redBefore) => {
+    const play = window.__bgewwar.steps.play;
+    return play.units.filter((u) => u.faction === 1).length - redBefore;
+  }, secondDefense.redBefore);
+  if (secondAdded > 8) errors.push(`BALANCE: HQ defense spawned more than once (secondAdded=${secondAdded})`);
 
   const fps = await page.evaluate(
     () =>
@@ -206,7 +251,7 @@ const errors = [];
     if (m.type() === "error") errors.push(`MOBILE CONSOLE: ${m.text()}`);
   });
 
-  await page.goto(`http://localhost:${PORT}/`, { waitUntil: "networkidle" });
+  await page.goto(`http://localhost:${PORT}/?firebase=off`, { waitUntil: "networkidle" });
   await page.waitForTimeout(1800);
   await page.screenshot({ path: "/tmp/bgew-war-m1-menu.png" });
 
@@ -223,7 +268,7 @@ const errors = [];
   // Tap the TOURELLE button: its HUD position is fixed (independent of the
   // random map), so the build mode toggling on proves touch coordinates map
   // correctly through the HiDPI buffer (deviceScaleFactor 3 here).
-  await page.touchscreen.tap(...at(153, 992));
+  await page.touchscreen.tap(...at(243, 992));
   await page.waitForTimeout(250);
   const mode = await page.evaluate(() => window.__bgewwar.steps.play.mode);
   if (mode !== "turret") errors.push(`MOBILE: TOURELLE tap did not select build mode (mode=${mode}, HiDPI input regression?)`);

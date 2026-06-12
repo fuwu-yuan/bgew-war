@@ -17,7 +17,7 @@ export interface GameAPI {
   nearestAirEnemy(x: number, y: number, f: Faction, range: number): Target | null;
   fireBullet(x: number, y: number, target: Target, dmg: number, f: Faction, big: boolean): void;
   spawnSoldier(f: Faction, x: number, y: number, level?: number): void;
-  spawnTank(f: Faction, x: number, y: number): void;
+  spawnTank(f: Faction, x: number, y: number, level?: number): void;
   /** Convert the tile under (x, y) — gold, flash and sound handled inside. */
   tryConvert(x: number, y: number, f: Faction): void;
   /** Impact/explosion particles at (x, y). */

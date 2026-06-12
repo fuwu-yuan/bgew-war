@@ -4,6 +4,7 @@ import { gameData, serverLabel } from "../network";
 import { TileMap } from "../entities/tilemap";
 import { Fader } from "../entities/effects";
 import { drawSprite, SPR } from "../sprites";
+import { trackScreen } from "../analytics";
 
 interface SalonData {
   role: "host" | "guest";
@@ -113,6 +114,7 @@ export class SalonStep extends GameStep {
     this.leaving = false;
     this.camera.x = 0;
     this.camera.y = 0;
+    trackScreen("salon");
 
     this.board.addEntity(new TileMap());
     this.art = new SalonArt();

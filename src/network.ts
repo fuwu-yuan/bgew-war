@@ -127,7 +127,7 @@ export interface SnapMsg {
   /** [x, y, text, colorIdx] popups since last snap (colorIdx: 0 gold, 1 red) */
   pops: [number, number, string, number][];
   gold: { red: number; blue: number };
-  lvl: { red: number; blue: number };
+  lvl: { red: number; blue: number; tankRed?: number; tankBlue?: number; turretRed?: number; turretBlue?: number };
   share: number; // blue share 0..1
 }
 
@@ -144,7 +144,7 @@ export interface EndMsg {
 export interface CmdMsg {
   type: "cmd";
   cmd: "build" | "axis" | "upgrade" | "strike" | "helico";
-  kind?: "barracks" | "turret" | "factory";
+  kind?: "barracks" | "turret" | "factory" | "soldier" | "tank";
   c?: number;
   r?: number;
   col?: number;

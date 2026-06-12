@@ -2,6 +2,7 @@ import { Board } from "@fuwu-yuan/bgew";
 import { COLORS, GAME_NAME, GAME_VERSION, VIEW_H, VIEW_W } from "./globals";
 import { loadSprites } from "./sprites";
 import { installNetwork } from "./network";
+import { track } from "./analytics";
 import { MenuStep } from "./steps/menu.step";
 import { PlayStep } from "./steps/game.step";
 import { LobbyStep } from "./steps/lobby.step";
@@ -134,6 +135,12 @@ board.step = menu;
 (window as unknown as Record<string, unknown>).__bgewwar = { board, steps: { menu, play, lobby, salon, end } };
 
 board.canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+/* Analytics: ouverture de l'app (mode PWA standalone vs onglet, plateforme) */
+track("app_open", {
+  standalone: window.matchMedia?.("(display-mode: standalone)").matches ?? false,
+  touch: "ontouchstart" in window,
+});
 
 /* Wait for the spritesheet and the title font before the first frame */
 const start = () => board.start();

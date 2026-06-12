@@ -19,7 +19,9 @@ import {
   TILE,
   VIEW_W,
   enemyOf,
-  upgradeCost,
+  soldierUpgradeCost,
+  tankUpgradeCost,
+  turretUpgradeCost,
 } from "../globals";
 import { clamp, pick, rand, randInt, TAU } from "../utils";
 import { flipMapData, flipTileIndex, TileMap } from "../entities/tilemap";
@@ -31,6 +33,7 @@ import { BuildMode, Hud, HudState } from "../entities/hud";
 import { GameObject } from "../entities/gameobject";
 import { RemoteWorld } from "../entities/remote";
 import { CmdMsg, EndMsg, GameMsg, gameData, InitMsg, MultiData, SnapMsg } from "../network";
+import { track, trackScreen } from "../analytics";
 
 const BRAIN_EVERY = 3; // s — red AI thinks (solo only)
 const INCOME_EVERY = 1; // s
@@ -39,8 +42,37 @@ const AI_GRACE = 6; // s before the AI starts spending
 const GARRISON_COST = 50;
 const GARRISON_CD = 8; // s
 const HQ_ALERT_RADIUS = 240; // px — enemies this close to the HQ trigger panic
+const AI_MIN_RESERVE = GARRISON_COST + 20;
+const AI_REPLAN_VARIANCE = 0.35;
+const HQ_DEFENSE_RADIUS = 340;
+const HQ_DEFENSE_MIN_SOLDIERS = 36;
+const HQ_DEFENSE_MAX_SOLDIERS = 130;
+const HQ_DEFENSE_MIN_TANKS = 4;
+const HQ_DEFENSE_MAX_TANKS = 16;
 
 type NetRole = "solo" | "host" | "guest";
+type AiPosture = "defend" | "counter" | "press" | "tech";
+type UpgradeKind = "soldier" | "tank" | "turret";
+
+interface RedAiIntel {
+  posture: AiPosture;
+  axis: number;
+  pressureCol: number;
+  opportunityCol: number;
+  blueTanks: number;
+  blueSoldiers: number;
+  blueTurrets: number;
+  blueFactories: number;
+  blueBarracks: number;
+  blueHelis: number;
+  redSoldiers: number;
+  redTurrets: number;
+  redFactories: number;
+  redBarracks: number;
+  redShare: number;
+  deepestBlueRow: number;
+  infantryFlood: boolean;
+}
 
 export class PlayStep extends GameStep implements GameAPI, HudState {
   name = "game";
@@ -73,6 +105,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private strikes: { x: number; y: number; t: number; faction: Faction }[] = [];
   private garrisonCd = 0;
   private alertT = 0;
+  private hqLastHp: Record<Faction, number> = { [RED]: 0, [BLUE]: 0 };
+  private hqDefenseUsed: Record<Faction, boolean> = { [RED]: false, [BLUE]: false };
 
   /* HudState */
   public mode: BuildMode = null;
@@ -82,6 +116,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
   private gold: Record<Faction, number> = { [RED]: 0, [BLUE]: 0 };
   private levels: Record<Faction, number> = { [RED]: 1, [BLUE]: 1 };
+  private tankLevels: Record<Faction, number> = { [RED]: 1, [BLUE]: 1 };
+  private turretLevels: Record<Faction, number> = { [RED]: 1, [BLUE]: 1 };
   private killsBy: Record<Faction, number> = { [RED]: 0, [BLUE]: 0 };
   private axisCol: Record<Faction, number> = { [RED]: 8, [BLUE]: 8 };
   private counts = {
@@ -90,6 +126,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   };
   private ended = false;
   private brainT = BRAIN_EVERY;
+  private aiPosture: AiPosture = "counter";
   private incomeT = INCOME_EVERY;
   private buckets: Target[][] = [];
   private sfxLast = new Map<string, number>();
@@ -102,8 +139,24 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     return this.levels[this.myFaction];
   }
 
-  get soldierUpgradeCost(): number | null {
-    return upgradeCost(this.levels[this.myFaction]);
+  get soldierUpgradeCost(): number {
+    return soldierUpgradeCost(this.levels[this.myFaction]);
+  }
+
+  get tankLevel(): number {
+    return this.tankLevels[this.myFaction];
+  }
+
+  get tankUpgradeCost(): number {
+    return tankUpgradeCost(this.tankLevels[this.myFaction]);
+  }
+
+  get turretLevel(): number {
+    return this.turretLevels[this.myFaction];
+  }
+
+  get turretUpgradeCost(): number {
+    return turretUpgradeCost(this.turretLevels[this.myFaction]);
   }
 
   constructor(board: Board) {
@@ -121,6 +174,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   onEnter(data: { multi?: MultiData }): void {
     this.role = data?.multi ? (data.multi.role === "guest" ? "guest" : "host") : "solo";
     this.myFaction = this.role === "guest" ? RED : BLUE;
+    trackScreen("game");
+    track("game_start", { mode: this.role, faction: this.myFaction === RED ? "red" : "blue" });
 
     this.units = [];
     this.bullets = [];
@@ -132,6 +187,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.remote = null;
     this.gold = { [RED]: this.role === "solo" ? 40 : 80, [BLUE]: 80 };
     this.levels = { [RED]: 1, [BLUE]: 1 };
+    this.tankLevels = { [RED]: 1, [BLUE]: 1 };
+    this.turretLevels = { [RED]: 1, [BLUE]: 1 };
     this.killsBy = { [RED]: 0, [BLUE]: 0 };
     this.mode = null;
     this.elapsed = 0;
@@ -141,6 +198,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.counts = { [RED]: { soldiers: 0, tanks: 0 }, [BLUE]: { soldiers: 0, tanks: 0 } };
     this.ended = false;
     this.brainT = BRAIN_EVERY;
+    this.aiPosture = "counter";
     this.incomeT = INCOME_EVERY;
     this.snapT = 0;
     this.readyT = 0;
@@ -152,6 +210,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.strikes = [];
     this.garrisonCd = 0;
     this.alertT = 0;
+    this.hqLastHp = { [RED]: 0, [BLUE]: 0 };
+    this.hqDefenseUsed = { [RED]: false, [BLUE]: false };
     this.inited = this.role !== "guest";
     this.sfxLast.clear();
     this.camera.x = 0;
@@ -283,6 +343,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
   private opponentGone(reason: string): void {
     if (this.role === "solo" || this.ended) return;
+    track("opponent_left", { mode: this.role, elapsed: Math.round(this.elapsed) });
     this.spawnEffect(new ScorePopup(VIEW_W / 2, MAP_H / 2, reason.toUpperCase(), "#ffe27a", 18));
     if (this.role === "host") {
       this.endGame(this.myFaction);
@@ -299,7 +360,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       return;
     }
     if (cmd.cmd === "upgrade") {
-      this.buyUpgrade(RED);
+      this.buyUpgrade(RED, (cmd.kind === "tank" || cmd.kind === "turret" ? cmd.kind : "soldier") as UpgradeKind);
       return;
     }
     if (cmd.cmd === "strike" && typeof cmd.x === "number" && typeof cmd.y === "number") {
@@ -316,7 +377,12 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
       return;
     }
-    if (cmd.cmd === "build" && cmd.kind && typeof cmd.c === "number" && typeof cmd.r === "number") {
+    if (
+      cmd.cmd === "build" &&
+      (cmd.kind === "barracks" || cmd.kind === "turret" || cmd.kind === "factory") &&
+      typeof cmd.c === "number" &&
+      typeof cmd.r === "number"
+    ) {
       const cost = COST[cmd.kind];
       const i = this.map.idx(cmd.c, cmd.r);
       if (
@@ -374,7 +440,14 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       pops: this.pPops,
       warns: this.pWarns,
       gold: { red: this.gold[RED], blue: this.gold[BLUE] },
-      lvl: { red: this.levels[RED], blue: this.levels[BLUE] },
+      lvl: {
+        red: this.levels[RED],
+        blue: this.levels[BLUE],
+        tankRed: this.tankLevels[RED],
+        tankBlue: this.tankLevels[BLUE],
+        turretRed: this.turretLevels[RED],
+        turretBlue: this.turretLevels[BLUE],
+      },
       share: this.map.share(BLUE),
     };
     this.pShots = [];
@@ -413,6 +486,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.gold[BLUE] = snap.gold.blue;
     this.levels[RED] = snap.lvl.red;
     this.levels[BLUE] = snap.lvl.blue;
+    this.tankLevels[RED] = snap.lvl.tankRed ?? 1;
+    this.tankLevels[BLUE] = snap.lvl.tankBlue ?? 1;
+    this.turretLevels[RED] = snap.lvl.turretRed ?? 1;
+    this.turretLevels[BLUE] = snap.lvl.turretBlue ?? 1;
     this.blueShare = snap.share;
     this.updateHeliLoop(snap.units.some((u) => u[1] === 2));
   }
@@ -427,8 +504,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     if (y >= MAP_H) {
       const btn = this.hud.hitButton(x, y);
       if (!btn) return;
-      if (btn === "upgrade") {
-        this.requestUpgrade();
+      if (btn === "upgradeSoldier" || btn === "upgradeTank" || btn === "upgradeTurret") {
+        this.requestUpgrade(btn === "upgradeTank" ? "tank" : btn === "upgradeTurret" ? "turret" : "soldier");
         return;
       }
       this.board.playSound("click", false, 0.4);
@@ -444,6 +521,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         return;
       }
       this.mode = null;
+      track("use_airstrike", { mode: this.role });
       if (this.role === "guest") {
         // back to host space: the guest's view is mirrored
         this.sendNet({ type: "cmd", cmd: "strike", x: Math.round(x), y: Math.round(this.viewY(y)) });
@@ -461,6 +539,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         return;
       }
       this.mode = null;
+      track("use_helico", { mode: this.role });
       if (this.role === "guest") {
         // x n'a pas besoin de conversion : le miroir invité n'inverse que y
         this.sendNet({ type: "cmd", cmd: "helico", x: Math.round(x) });
@@ -476,6 +555,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       const c = clamp(Math.floor(x / TILE), 0, GRID_W - 1);
       this.axisCol[mine] = c;
       this.mode = null;
+      track("set_axis", { mode: this.role });
       this.board.playSound("click", false, 0.5);
       this.spawnEffect(new ScorePopup(x, y, "AXE D'ATTAQUE", "#ffe27a", 16));
       if (this.role === "guest") this.sendNet({ type: "cmd", cmd: "axis", col: c });
@@ -501,6 +581,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       return;
     }
     this.mode = null;
+    track("build", { type: kind, mode: this.role });
     if (this.role === "guest") {
       // The host owns the truth: it validates, spends and spawns
       // (row converted back to host space — the guest's view is mirrored)
@@ -515,30 +596,47 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.spawnEffect(new Shockwave(center.x, center.y, 50, "#ffffff", 0.35));
   }
 
-  private requestUpgrade(): void {
-    const cost = this.soldierUpgradeCost;
-    if (cost === null || this.myGold < cost) {
+  private requestUpgrade(kind: UpgradeKind): void {
+    const cost = this.upgradeCostFor(this.myFaction, kind);
+    if (this.myGold < cost) {
       this.board.playSound("error", false, 0.4);
       return;
     }
+    track("upgrade", { kind, level: this.upgradeLevelFor(this.myFaction, kind) + 1, mode: this.role });
     if (this.role === "guest") {
-      this.sendNet({ type: "cmd", cmd: "upgrade" });
+      this.sendNet({ type: "cmd", cmd: "upgrade", kind });
       this.board.playSound("build", false, 0.5);
       return;
     }
-    this.buyUpgrade(this.myFaction);
+    this.buyUpgrade(this.myFaction, kind);
   }
 
-  /** Solo/host: pay and raise a faction's soldier level. */
-  private buyUpgrade(f: Faction): void {
-    const cost = upgradeCost(this.levels[f]);
-    if (cost === null || this.gold[f] < cost) return;
+  private upgradeLevelFor(f: Faction, kind: UpgradeKind): number {
+    if (kind === "tank") return this.tankLevels[f];
+    if (kind === "turret") return this.turretLevels[f];
+    return this.levels[f];
+  }
+
+  private upgradeCostFor(f: Faction, kind: UpgradeKind): number {
+    if (kind === "tank") return tankUpgradeCost(this.tankLevels[f]);
+    if (kind === "turret") return turretUpgradeCost(this.turretLevels[f]);
+    return soldierUpgradeCost(this.levels[f]);
+  }
+
+  /** Solo/host: pay and raise one faction upgrade level. */
+  private buyUpgrade(f: Faction, kind: UpgradeKind): void {
+    const cost = this.upgradeCostFor(f, kind);
+    if (this.gold[f] < cost) return;
     this.gold[f] -= cost;
-    this.levels[f]++;
+    if (kind === "tank") this.tankLevels[f]++;
+    else if (kind === "turret") this.turretLevels[f]++;
+    else this.levels[f]++;
     const hq = this.buildings.find((b) => !b.dead && b.type === "hq" && b.faction === f);
     const x = hq ? hq.cx : VIEW_W / 2;
     const y = hq ? hq.cy : MAP_H / 2;
-    this.popup(x, y - 30, `SOLDATS NIVEAU ${this.levels[f]}`, 0);
+    const label = kind === "tank" ? "TANKS" : kind === "turret" ? "TOURELLES" : "SOLDATS";
+    const level = kind === "tank" ? this.tankLevels[f] : kind === "turret" ? this.turretLevels[f] : this.levels[f];
+    this.popup(x, y - 30, `${label} NIVEAU ${level}`, 0);
     this.spawnEffect(new Shockwave(x, y, 70, COLORS.gold, 0.45));
     this.sfx("coin", 0.5);
   }
@@ -595,10 +693,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.board.addEntity(u);
   }
 
-  spawnTank(f: Faction, x: number, y: number): void {
+  spawnTank(f: Faction, x: number, y: number, level?: number): void {
     if (this.counts[f].tanks >= MAX_TANKS) return;
     this.counts[f].tanks++;
-    const u = new Tank(this, f, x, y);
+    const u = new Tank(this, f, x, y, level ?? this.tankLevels[f]);
     u.nid = this.nextNid++;
     this.units.push(u);
     this.board.addEntity(u);
@@ -735,6 +833,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     }
     for (const b of [...this.buildings]) {
       if (b.dead || b.distTo(x, y) > STRIKE_RADIUS + b.radius) continue;
+      if (b.type === "hq") continue;
       b.hp -= STRIKE_DMG_BUILDING;
       if (b.hp <= 0) this.notifyKill(b, b.faction === f ? enemyOf(f) : f);
     }
@@ -750,8 +849,12 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
     if (this.role !== "guest") {
       this.rebuildBuckets();
-      // Barracks spawn at their faction's current level
-      for (const b of this.buildings) b.soldierLevel = this.levels[b.faction];
+      // Buildings spawn/fire at their faction's current upgrade levels.
+      for (const b of this.buildings) {
+        b.soldierLevel = this.levels[b.faction];
+        b.tankLevel = this.tankLevels[b.faction];
+        b.turretLevel = this.turretLevels[b.faction];
+      }
     }
 
     super.update(delta); // updates every entity + timers
@@ -777,6 +880,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
           this.redPanic(dt);
         }
 
+        this.updateHqDefense(dt);
         this.blueShare = this.map.share(BLUE);
         this.updateHeliLoop(this.helis.some((h) => !h.dead));
       }
@@ -814,6 +918,66 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   /* ---------------------------------------------------------------- *
    * Red AI (solo only)
    * ---------------------------------------------------------------- */
+
+  private updateHqDefense(_dt: number): void {
+    for (const f of [RED, BLUE] as const) {
+      const hq = this.buildings.find((b) => !b.dead && b.type === "hq" && b.faction === f);
+      if (!hq) {
+        this.hqLastHp[f] = 0;
+        continue;
+      }
+
+      const last = this.hqLastHp[f];
+      if (last <= 0) {
+        this.hqLastHp[f] = hq.hp;
+        continue;
+      }
+
+      if (hq.hp < last && !this.hqDefenseUsed[f]) {
+        this.hqDefenseUsed[f] = true;
+        this.spawnHqDefenseWave(hq);
+      }
+      this.hqLastHp[f] = hq.hp;
+    }
+  }
+
+  private spawnHqDefenseWave(hq: Building): void {
+    const dir = hq.faction === RED ? 1 : -1;
+    const enemy = enemyOf(hq.faction);
+    const attackers = this.units.filter(
+      (u) => !u.dead && u.faction === enemy && u.distTo(hq.cx, hq.cy) <= HQ_DEFENSE_RADIUS
+    );
+    const nearest = attackers.sort((a, b) => a.distTo(hq.cx, hq.cy) - b.distTo(hq.cx, hq.cy))[0];
+    if (nearest) this.axisCol[hq.faction] = clamp(Math.floor(nearest.cx / TILE), 0, GRID_W - 1);
+
+    const attackersPower = attackers.reduce((sum, u) => sum + (u instanceof Tank ? 3 : 1), 0);
+    const soldiers = clamp(
+      Math.round(HQ_DEFENSE_MIN_SOLDIERS + attackersPower * 0.45),
+      HQ_DEFENSE_MIN_SOLDIERS,
+      HQ_DEFENSE_MAX_SOLDIERS
+    );
+    const tanks = clamp(
+      Math.round(HQ_DEFENSE_MIN_TANKS + attackersPower / 18),
+      HQ_DEFENSE_MIN_TANKS,
+      HQ_DEFENSE_MAX_TANKS
+    );
+
+    for (let i = 0; i < soldiers; i++) {
+      const spread = i % 2 === 0 ? -1 : 1;
+      this.spawnSoldier(
+        hq.faction,
+        hq.cx + spread * rand(18, 150),
+        hq.cy + dir * rand(35, 165),
+        this.levels[hq.faction]
+      );
+    }
+    for (let i = 0; i < tanks; i++) {
+      this.spawnTank(hq.faction, hq.cx + rand(-130, 130), hq.cy + dir * rand(55, 150));
+    }
+    this.popup(hq.cx, hq.cy - 54, `DEFENSE QG +${soldiers}`, hq.faction === RED ? 1 : 0);
+    this.spawnEffect(new Shockwave(hq.cx, hq.cy, 150, "#ffffff", 0.55));
+    this.sfx("build", 0.5);
+  }
 
   /**
    * Anti-rush reflex, checked every frame: blue troops close to the red HQ
@@ -872,87 +1036,219 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   private redBrain(): void {
-    // Aim where it hurts: the column where blue pushed deepest — or, when
-    // red dominates, the weakest blue column to finish the job.
-    let deepest = 8;
-    let deepestRow = GRID_H;
-    let weakest = 8;
-    let weakestRow = 0;
-    for (let c = 0; c < GRID_W; c++) {
-      if (!this.map.isLand(c, 1) && !this.map.isLand(c, GRID_H - 2)) continue;
-      const fr = this.map.blueFrontRow(c);
-      if (fr < deepestRow) {
-        deepestRow = fr;
-        deepest = c;
-      }
-      if (fr > weakestRow && fr < GRID_H) {
-        weakestRow = fr;
-        weakest = c;
-      }
-    }
-    const dominating = this.map.share(RED) > 0.58;
-    this.axisCol[RED] = dominating ? weakest : deepest;
+    const intel = this.redIntel();
+    this.aiPosture = intel.posture;
+    this.axisCol[RED] = intel.axis;
 
-    // Spend gold: keep barracks up, then turrets, then a factory.
     // Short grace so the player can take the early initiative.
     if (this.elapsed < AI_GRACE) return;
 
-    // Airstrike on the densest blue pack (keeps a reserve for the garrison)
-    if (this.gold[RED] >= COST.strike + GARRISON_COST + 30) {
-      const target = this.densestBluePack();
+    const reserve = intel.infantryFlood ? 25 : intel.posture === "defend" ? 45 : AI_MIN_RESERVE;
+
+    // Strike only when it really changes the fight: packed troops first,
+    // then exposed production/defense clusters if the player turtles.
+    if (this.gold[RED] >= COST.strike + reserve) {
+      const target = this.bestRedStrikeTarget(intel);
       if (target) {
         this.gold[RED] -= COST.strike;
         this.scheduleStrike(target.x, target.y, RED);
-      }
-    }
-
-    // Une sortie d'hélico quand le trésor le permet : harcèle la ligne
-    // arrière bleue, et punit surtout un joueur sans tourelles défensives
-    if (this.gold[RED] >= COST.helico + GARRISON_COST + 60 && Math.random() < 0.4) {
-      this.gold[RED] -= COST.helico;
-      this.spawnHeli(RED, rand(60, VIEW_W - 60));
-    }
-
-    // Soldier upgrades when comfortable
-    const upCost = upgradeCost(this.levels[RED]);
-    if (upCost !== null && this.gold[RED] >= upCost + 60) {
-      this.buyUpgrade(RED);
-      return;
-    }
-
-    const mine = this.buildings.filter((b) => !b.dead && b.faction === RED);
-    const n = (t: BuildingType) => mine.filter((b) => b.type === t).length;
-    const maxBarracks = Math.min(6, 4 + Math.floor(this.elapsed / 90));
-    let want: BuildingType | null = null;
-    if (n("barracks") < maxBarracks && this.gold[RED] >= COST.barracks) want = "barracks";
-    else if (n("turret") < 4 && this.gold[RED] >= COST.turret) want = "turret";
-    else if (n("factory") < 2 && this.gold[RED] >= COST.factory) want = "factory";
-    else if (this.gold[RED] >= COST.barracks + 40) want = "barracks";
-    if (!want) return;
-
-    // A few rows behind the front, near the chosen axis
-    for (let tries = 0; tries < 12; tries++) {
-      const c = clamp(this.axisCol[RED] + randInt(-3, 3), 0, GRID_W - 1);
-      const front = this.map.blueFrontRow(c) - 1;
-      const r = clamp(front - randInt(2, 4), 1, GRID_H - 2);
-      const i = this.map.idx(c, r);
-      if (
-        this.map.isLand(c, r) &&
-        this.map.owner[i] === RED &&
-        !this.buildingAt.has(i) &&
-        !this.map.hasDecor(i)
-      ) {
-        this.gold[RED] -= COST[want];
-        this.placeBuilding(RED, want, c, r);
         return;
       }
     }
+
+    // Helico punishes players who skip anti-air, but it becomes rarer once
+    // blue has built enough turrets to avoid wasting gold.
+    const antiAirGap = intel.blueTurrets < 2 || intel.blueFactories + intel.blueBarracks >= intel.blueTurrets + 3;
+    const wantsHeli = antiAirGap && intel.posture !== "defend" && Math.random() < (intel.blueTurrets === 0 ? 0.75 : 0.38);
+    if (wantsHeli && this.gold[RED] >= COST.helico + reserve) {
+      this.gold[RED] -= COST.helico;
+      this.spawnHeli(RED, this.columnCenter(intel.opportunityCol + randInt(-1, 1)));
+      return;
+    }
+
+    // Upgrade whatever answers the current pressure best.
+    const upgradeKind: UpgradeKind =
+      intel.infantryFlood || intel.blueSoldiers > intel.redSoldiers + 8
+        ? "turret"
+        : intel.blueTanks >= 2 || intel.blueFactories >= 2
+          ? "tank"
+          : "soldier";
+    const upCost = this.upgradeCostFor(RED, upgradeKind);
+    const wantsUpgrade =
+      (intel.blueBarracks >= 5 ||
+        intel.redShare > 0.54 ||
+        this.levels[BLUE] > this.levels[RED] ||
+        this.tankLevels[BLUE] > this.tankLevels[RED] ||
+        this.turretLevels[BLUE] > this.turretLevels[RED]) &&
+      this.gold[RED] >= upCost + reserve;
+    if (wantsUpgrade) {
+      this.buyUpgrade(RED, upgradeKind);
+      return;
+    }
+
+    const maxBarracks = Math.min(6, 4 + Math.floor(this.elapsed / 90));
+    let want: BuildingType | null = null;
+    if (intel.infantryFlood && intel.redTurrets < 7 && this.gold[RED] >= COST.turret + 5) {
+      want = "turret";
+    } else if (intel.infantryFlood && intel.redBarracks < Math.max(5, intel.blueBarracks - 1) && this.gold[RED] >= COST.barracks + 5) {
+      want = "barracks";
+    } else if (intel.posture === "defend" && intel.redTurrets < 5 && this.gold[RED] >= COST.turret + 15) {
+      want = "turret";
+    } else if ((intel.blueTanks >= 2 || intel.blueFactories >= 2) && intel.redFactories < 2 && this.gold[RED] >= COST.factory + reserve) {
+      want = "factory";
+    } else if (intel.redBarracks < maxBarracks && this.gold[RED] >= COST.barracks + reserve * 0.4) {
+      want = "barracks";
+    } else if (intel.redTurrets < 4 && this.gold[RED] >= COST.turret + reserve) {
+      want = "turret";
+    } else if (intel.redFactories < (intel.posture === "tech" ? 3 : 2) && this.gold[RED] >= COST.factory + reserve) {
+      want = "factory";
+    } else if (this.gold[RED] >= COST.barracks + reserve + 30) {
+      want = "barracks";
+    }
+    if (!want) return;
+
+    const built = this.tryRedBuild(want, intel);
+    if (built) this.gold[RED] -= COST[want];
+  }
+
+  private redIntel(): RedAiIntel {
+    let pressureCol = 8;
+    let pressureScore = -Infinity;
+    let opportunityCol = 8;
+    let opportunityScore = -Infinity;
+    let deepestBlueRow = GRID_H;
+
+    for (let c = 0; c < GRID_W; c++) {
+      if (!this.map.isLand(c, 1) && !this.map.isLand(c, GRID_H - 2)) continue;
+      const front = this.map.blueFrontRow(c);
+      if (front < deepestBlueRow) deepestBlueRow = front;
+      let blueUnits = 0;
+      let redUnits = 0;
+      for (const u of this.units) {
+        if (u.dead || Math.abs(Math.floor(u.cx / TILE) - c) > 1) continue;
+        if (u.faction === BLUE) blueUnits += u instanceof Tank ? 2.2 : 1;
+        else redUnits += u instanceof Tank ? 2 : 1;
+      }
+      const blueDepth = front < GRID_H ? GRID_H - front : 0;
+      const pressure = blueDepth * 1.7 + blueUnits * 1.8 - redUnits * 0.7;
+      const opportunity = front < GRID_H ? front * 1.2 - blueUnits * 0.6 : -Infinity;
+      if (pressure > pressureScore) {
+        pressureScore = pressure;
+        pressureCol = c;
+      }
+      if (opportunity > opportunityScore) {
+        opportunityScore = opportunity;
+        opportunityCol = c;
+      }
+    }
+
+    const redShare = this.map.share(RED);
+    const alive = this.buildings.filter((b) => !b.dead);
+    const count = (f: Faction, t: BuildingType) => alive.filter((b) => b.faction === f && b.type === t).length;
+    const blueTanks = this.units.filter((u) => !u.dead && u.faction === BLUE && u instanceof Tank).length;
+    const blueSoldiers = this.units.filter((u) => !u.dead && u.faction === BLUE && !(u instanceof Tank)).length;
+    const redSoldiers = this.units.filter((u) => !u.dead && u.faction === RED && !(u instanceof Tank)).length;
+    const blueHelis = this.helis.filter((h) => !h.dead && h.faction === BLUE).length;
+    const blueTurrets = count(BLUE, "turret");
+    const blueFactories = count(BLUE, "factory");
+    const blueBarracks = count(BLUE, "barracks");
+    const redTurrets = count(RED, "turret");
+    const redFactories = count(RED, "factory");
+    const redBarracks = count(RED, "barracks");
+    const infantryFlood =
+      blueBarracks >= redBarracks + 2 ||
+      blueBarracks >= 5 ||
+      blueSoldiers >= redSoldiers + 10 ||
+      (blueSoldiers >= 18 && blueTanks === 0);
+
+    let posture: AiPosture = "counter";
+    if (redShare < 0.46 || deepestBlueRow <= 7 || blueHelis > 0 || infantryFlood) posture = "defend";
+    else if (redShare > 0.57) posture = "press";
+    else if (blueFactories >= 2 || blueTanks >= 3 || blueTurrets >= 5) posture = "tech";
+
+    let axis = posture === "press" ? opportunityCol : pressureCol;
+    if (posture === "tech" && Math.random() < 0.45) axis = opportunityCol;
+    if (Math.random() < AI_REPLAN_VARIANCE) axis = clamp(axis + randInt(-1, 1), 0, GRID_W - 1);
+
+    return {
+      posture,
+      axis,
+      pressureCol,
+      opportunityCol,
+      blueTanks,
+      blueSoldiers,
+      blueTurrets,
+      blueFactories,
+      blueBarracks,
+      blueHelis,
+      redSoldiers,
+      redTurrets,
+      redFactories,
+      redBarracks,
+      redShare,
+      deepestBlueRow,
+      infantryFlood,
+    };
+  }
+
+  private bestRedStrikeTarget(intel: RedAiIntel): { x: number; y: number } | null {
+    const pack = this.densestBluePack(intel.infantryFlood || intel.posture === "defend" ? 3 : 4);
+    if (pack) return pack;
+
+    if (intel.blueTurrets + intel.blueFactories + intel.blueBarracks < 5) return null;
+    let best: { x: number; y: number; score: number } | null = null;
+    for (const b of this.buildings) {
+      if (b.dead || b.faction !== BLUE || b.type === "hq") continue;
+      let score = b.type === "turret" ? 2.3 : b.type === "factory" ? 2.8 : 1.6;
+      for (const other of this.buildings) {
+        if (other.dead || other.faction !== BLUE || other === b || other.type === "hq") continue;
+        if (other.distTo(b.cx, b.cy) < STRIKE_RADIUS * 1.35) score += other.type === "factory" ? 2 : 1;
+      }
+      if (!best || score > best.score) best = { x: b.cx, y: b.cy, score };
+    }
+    return best && best.score >= 4.4 ? { x: best.x, y: best.y } : null;
+  }
+
+  private tryRedBuild(kind: BuildingType, intel: RedAiIntel): boolean {
+    const axis = kind === "turret" ? intel.pressureCol : this.axisCol[RED];
+    const rowBias = kind === "turret" ? [1, 2, 3, 4] : kind === "factory" ? [4, 5, 6, 3] : [2, 3, 4, 5];
+    for (let tries = 0; tries < 18; tries++) {
+      const c = clamp(axis + randInt(-3, 3), 0, GRID_W - 1);
+      const front = this.map.blueFrontRow(c);
+      const r = clamp(front - pick(rowBias), 1, GRID_H - 2);
+      if (this.canRedBuildAt(c, r)) {
+        this.placeBuilding(RED, kind, c, r);
+        return true;
+      }
+    }
+
+    // Fallback around the HQ so saved gold still becomes useful defense.
+    const hq = this.buildings.find((b) => !b.dead && b.type === "hq" && b.faction === RED);
+    if (!hq) return false;
+    for (let tries = 0; tries < 12; tries++) {
+      const c = clamp(hq.col + randInt(-4, 4), 0, GRID_W - 1);
+      const r = clamp(hq.row + randInt(1, 5), 1, GRID_H - 2);
+      if (this.canRedBuildAt(c, r)) {
+        this.placeBuilding(RED, kind, c, r);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private canRedBuildAt(c: number, r: number): boolean {
+    const i = this.map.idx(c, r);
+    return this.map.isLand(c, r) && this.map.owner[i] === RED && !this.buildingAt.has(i) && !this.map.hasDecor(i);
+  }
+
+  private columnCenter(c: number): number {
+    return clamp(c, 0, GRID_W - 1) * TILE + TILE / 2;
   }
 
   /** Best airstrike target: ≥5 blue units packed in a 3×3-tile window. */
-  private densestBluePack(): { x: number; y: number } | null {
+  private densestBluePack(minUnits = 4): { x: number; y: number } | null {
     let best: { x: number; y: number } | null = null;
-    let bestCount = 4;
+    let bestCount = minUnits;
     for (let r = 1; r < GRID_H - 1; r++) {
       for (let c = 1; c < GRID_W - 1; c++) {
         let count = 0;
@@ -988,6 +1284,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     const b = new Building(this, f, type, c, r, instant);
     b.nid = this.nextNid++;
     b.soldierLevel = this.levels[f];
+    b.tankLevel = this.tankLevels[f];
+    b.turretLevel = this.turretLevels[f];
     this.buildings.push(b);
     this.buildingAt.set(this.map.idx(c, r), b);
     this.board.addEntity(b);

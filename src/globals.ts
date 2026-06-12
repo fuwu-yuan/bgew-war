@@ -1,11 +1,11 @@
-/** Viewport: portrait like the ad — map 640×960 + 64px HUD strip */
+/** Viewport: portrait like the ad — map + two-row command HUD */
 export const VIEW_W = 640;
 export const VIEW_H = 1024;
 
 /** Map grid */
 export const TILE = 40;
 export const GRID_W = 16; // 640
-export const GRID_H = 24; // 960
+export const GRID_H = 22; // 880
 export const MAP_H = GRID_H * TILE;
 
 export const GAME_NAME = "BGEW WAR";
@@ -42,15 +42,15 @@ export const COLORS = {
 export const FONT = "'Black Ops One', sans-serif";
 
 /** Costs (gold) */
-export const COST = { barracks: 50, turret: 75, factory: 120, strike: 100, helico: 90 } as const;
+export const COST = { barracks: 50, turret: 75, factory: 120, strike: 100, helico: 150 } as const;
 
 /** Sortie d'hélico : traverse la carte, mitraille, revient. Ne convertit
  * pas les tuiles ; seuls TOURELLES et QG peuvent le toucher (anti-air). */
-export const HELI_HP = 10;
-export const HELI_DMG = 2;
-export const HELI_RANGE = 110;
-export const HELI_FIRE_PERIOD = 0.35;
-export const HELI_SPEED = 100; // px/s
+export const HELI_HP = 28;
+export const HELI_DMG = 5;
+export const HELI_RANGE = 130;
+export const HELI_FIRE_PERIOD = 0.24;
+export const HELI_SPEED = 92; // px/s
 export const MAX_HELIS = 3; // sorties simultanées par faction
 
 /** Airstrike: radius and damage (hits BOTH sides — aim carefully) */
@@ -59,16 +59,22 @@ export const STRIKE_DMG_UNIT = 12;
 export const STRIKE_DMG_BUILDING = 10;
 export const STRIKE_DELAY = 0.9; // s between the warning marker and the blast
 
-/** Soldier upgrades: level 1 (base) → MAX_SOLDIER_LEVEL */
-export const MAX_SOLDIER_LEVEL = 5;
-/** Gold cost to reach `level + 1` from `level`, null at max */
-export function upgradeCost(level: number): number | null {
-  return level >= MAX_SOLDIER_LEVEL ? null : 80 * level;
+/** Upgrade costs to reach `level + 1` from `level`. No max level. */
+export function soldierUpgradeCost(level: number): number {
+  return Math.round(80 * Math.pow(level, 1.18));
 }
 
-/** Caps to keep 60 fps on phones */
-export const MAX_SOLDIERS = 70;
-export const MAX_TANKS = 8;
+export function tankUpgradeCost(level: number): number {
+  return Math.round(120 * Math.pow(level, 1.2));
+}
+
+export function turretUpgradeCost(level: number): number {
+  return Math.round(100 * Math.pow(level, 1.2));
+}
+
+/** Caps to keep 60 fps on phones while allowing wave-based production. */
+export const MAX_SOLDIERS = 320;
+export const MAX_TANKS = 48;
 
 export interface BestStats {
   wins: number;

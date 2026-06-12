@@ -5,6 +5,7 @@ import { randInt } from "../utils";
 import { TileMap } from "../entities/tilemap";
 import { Fader } from "../entities/effects";
 import { drawSprite, SPR } from "../sprites";
+import { track, trackScreen } from "../analytics";
 
 type LobbyState = "idle" | "creating" | "waiting" | "joining" | "starting";
 
@@ -66,6 +67,7 @@ export class LobbyStep extends GameStep {
     this.actionButtons = [];
     this.camera.x = 0;
     this.camera.y = 0;
+    trackScreen("lobby");
 
     this.board.addEntity(new TileMap());
     this.art = new LobbyArt();
@@ -132,6 +134,7 @@ export class LobbyStep extends GameStep {
       .then((res) => {
         if (res.status === "success") {
           this.state = "starting";
+          track("room_created");
           this.board.addEntity(
             new Fader(0, 1, 350, "#08111f", () => {
               this.board.moveToStep("salon", { role: "host", roomName });
@@ -187,6 +190,7 @@ export class LobbyStep extends GameStep {
       .then((res) => {
         if (res.status === "success") {
           // Still "joining": the start-race shield above stays armed
+          track("room_joined");
           this.board.addEntity(
             new Fader(0, 1, 350, "#08111f", () => {
               if (this.state !== "joining") return; // already gone to war
