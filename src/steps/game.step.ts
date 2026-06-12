@@ -34,6 +34,7 @@ import { GameObject } from "../entities/gameobject";
 import { RemoteWorld } from "../entities/remote";
 import { CmdMsg, EndMsg, GameMsg, gameData, InitMsg, MultiData, SnapMsg } from "../network";
 import { track, trackScreen } from "../analytics";
+import { toggleMute } from "../sound";
 
 const BRAIN_EVERY = 3; // s — red AI thinks (solo only)
 const INCOME_EVERY = 1; // s
@@ -181,6 +182,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
       return;
     }
+    if (e.key.toLowerCase() === "m") {
+      this.toggleSound();
+      return;
+    }
     const id = this.hud.buttonForKey(e.key);
     if (!id) return;
     if (id === "upgradeSoldier" || id === "upgradeTank" || id === "upgradeTurret") {
@@ -189,6 +194,12 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     }
     this.board.playSound("click", false, 0.4);
     this.mode = this.mode === id ? null : (id as BuildMode);
+  }
+
+  private toggleSound(): void {
+    const muted = toggleMute();
+    if (!muted) this.board.playSound("click", false, 0.4); // audible only when turning sound back on
+    track("toggle_mute", { muted });
   }
 
   /* ---------------------------------------------------------------- *
@@ -527,6 +538,11 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
   private handleTap(x: number, y: number): void {
     const mine = this.myFaction;
+
+    if (this.hud.hitMute(x, y)) {
+      this.toggleSound();
+      return;
+    }
 
     if (y >= MAP_H) {
       const btn = this.hud.hitButton(x, y);

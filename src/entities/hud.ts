@@ -2,6 +2,7 @@ import { Entity } from "@fuwu-yuan/bgew";
 import { BLUE, COLORS, COST, Faction, FONT, MAP_H, VIEW_H, VIEW_W } from "../globals";
 import { clamp } from "../utils";
 import { drawSprite, SPR } from "../sprites";
+import { drawMuteIcon, isMuted } from "../sound";
 
 export type BuildMode = "barracks" | "turret" | "factory" | "axis" | "strike" | "helico" | null;
 export type UpgradeButton = "upgradeSoldier" | "upgradeTank" | "upgradeTurret";
@@ -36,6 +37,11 @@ interface Btn {
 
 const BTN_H = 46;
 const BTN_GAP = 4;
+
+/** Mute toggle — top-right strip of the command panel, above the buttons. */
+const MUTE_R = 15;
+const MUTE_CX = VIEW_W - 26;
+const MUTE_CY = MAP_H + 20;
 
 /**
  * Command panel (bottom strip) + territory bar (top) + attack-axis marker.
@@ -82,6 +88,11 @@ export class Hud extends Entity {
         w,
       };
     });
+  }
+
+  /** The mute toggle is hit (game coords) — checked before build taps. */
+  hitMute(x: number, y: number): boolean {
+    return Math.abs(x - MUTE_CX) <= MUTE_R + 4 && Math.abs(y - MUTE_CY) <= MUTE_R + 4;
   }
 
   /** Button under (x, y) — game coords — or null. */
@@ -165,6 +176,9 @@ export class Hud extends Entity {
     ctx.font = `9px ${FONT}`;
     ctx.fillStyle = "#9fc3e4";
     ctx.fillText(mine === BLUE ? "BLEU" : "ROUGE", 32, MAP_H + 78);
+
+    // Mute toggle
+    drawMuteIcon(ctx, MUTE_CX, MUTE_CY, MUTE_R, isMuted());
 
     // Buttons
     for (const b of this.buttons) {

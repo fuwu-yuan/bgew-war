@@ -3,6 +3,7 @@ import { COLORS, GAME_NAME, GAME_VERSION, VIEW_H, VIEW_W } from "./globals";
 import { loadSprites } from "./sprites";
 import { installNetwork } from "./network";
 import { track } from "./analytics";
+import { applyMute } from "./sound";
 import { MenuStep } from "./steps/menu.step";
 import { PlayStep } from "./steps/game.step";
 import { LobbyStep } from "./steps/lobby.step";
@@ -118,6 +119,9 @@ sfx("helico", "wav", true, 0.22);
 sfx("victory", "m4a", false, 0.6);
 sfx("defeat", "m4a", false, 0.6);
 sfx("music_battle", "m4a", true, 0.3);
+
+/* Restore the saved mute preference onto the Howler bus */
+applyMute();
 
 /* Network: same protocol as the official server, overridable via ?server= */
 installNetwork(board);

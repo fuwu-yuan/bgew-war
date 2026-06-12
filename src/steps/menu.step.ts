@@ -17,6 +17,12 @@ import {
   type LeaderboardEntry,
 } from "../firebase";
 import { track, trackScreen } from "../analytics";
+import { drawMuteIcon, isMuted, toggleMute } from "../sound";
+
+/** Mute toggle — top-right corner of the menu. */
+const MUTE_R = 16;
+const MUTE_CX = VIEW_W - 30;
+const MUTE_CY = 34;
 
 /* ------------------------------------------------------------------ *
  * "Comment jouer" modal — a scrollable help panel with a close cross.
@@ -211,6 +217,9 @@ class MenuArt extends Entity {
         : `VICTOIRES SOLO : ${this.soloWins}  |  VICTOIRES MULTI : ${this.multiWins}`;
     ctx.fillText(stats, VIEW_W / 2, 940);
     ctx.textAlign = "left";
+
+    // Mute toggle (normal menu only — the help modal covers this corner)
+    drawMuteIcon(ctx, MUTE_CX, MUTE_CY, MUTE_R, isMuted());
   }
 
   /** Scrollable "Comment jouer" modal with a close cross. */
@@ -341,6 +350,12 @@ export class MenuStep extends GameStep {
     board.onMouseEvent("click", (_e: MouseEvent, x: number, y: number) => {
       if (board.step !== this) return;
       if (this.soundHint) this.soundHint.visible = false;
+      if (this.art && !this.art.showHelp && Math.abs(x - MUTE_CX) <= MUTE_R + 4 && Math.abs(y - MUTE_CY) <= MUTE_R + 4) {
+        const muted = toggleMute();
+        if (!muted) this.board.playSound("click", false, 0.4);
+        track("toggle_mute", { muted });
+        return;
+      }
       if (!this.art?.showHelp || this.openingHelp) return;
       // X or a tap on the dark backdrop closes; a drag never does
       if (this.art.isOnClose(x, y)) this.closeHelp();
