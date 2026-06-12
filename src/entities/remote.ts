@@ -3,7 +3,7 @@ import { BLUE, MAP_H, VIEW_W } from "../globals";
 import { clamp, TAU } from "../utils";
 import { drawSprite, SPR } from "../sprites";
 import { drawLevelPips } from "./units";
-import { BUILDING_SIZE, BUILDING_SPRITE, BUILDING_TYPES, BuildingType } from "./buildings";
+import { BUILDING_SIZE, BUILDING_TYPES, BuildingType, drawBuildingBody } from "./buildings";
 
 interface RUnit {
   kind: number; // 0 soldier, 1 tank
@@ -30,6 +30,8 @@ interface RBuilding {
   row: number;
   hp: number;
   maxHp: number;
+  prog: number; // 0..1 — chantier (1 = opérationnel)
+  t: number; // horloge d'animation (ouvrier)
 }
 
 const LERP_TIME = 0.12; // s — slightly longer than the 100 ms snapshot period
@@ -92,12 +94,13 @@ export class RemoteWorld extends Entity {
     }
 
     const seenB = new Set<number>();
-    for (const [nid, typeCode, faction, col, row, hp, maxHp] of buildings) {
+    for (const [nid, typeCode, faction, col, row, hp, maxHp, prog] of buildings) {
       seenB.add(nid);
       const b = this.buildings.get(nid);
       if (b) {
         b.hp = hp;
         b.maxHp = maxHp;
+        b.prog = (prog ?? 100) / 100;
       } else {
         this.buildings.set(nid, {
           type: BUILDING_TYPES[typeCode],
@@ -108,6 +111,8 @@ export class RemoteWorld extends Entity {
           row,
           hp,
           maxHp,
+          prog: (prog ?? 100) / 100,
+          t: Math.random() * 10,
         });
       }
     }
@@ -126,6 +131,9 @@ export class RemoteWorld extends Entity {
       u.y = u.fromY + (u.toY - u.fromY) * this.lerpT;
       if (u.moving) u.walkP += dt * 11;
     }
+    for (const b of this.buildings.values()) {
+      if (b.prog < 1) b.t += dt;
+    }
   }
 
   draw(ctx: CanvasRenderingContext2D): void {
@@ -133,15 +141,8 @@ export class RemoteWorld extends Entity {
 
     for (const b of this.buildings.values()) {
       const size = BUILDING_SIZE[b.type];
-      ctx.fillStyle = "rgba(0,0,0,0.25)";
-      ctx.beginPath();
-      ctx.ellipse(b.x, b.y + size * 0.36, size * 0.4, size * 0.15, 0, 0, TAU);
-      ctx.fill();
-      drawSprite(ctx, BUILDING_SPRITE[b.type][b.faction === BLUE ? 1 : 0], b.x, b.y, size);
-      if (b.type === "hq") {
-        drawSprite(ctx, b.faction === BLUE ? SPR.B_FLAG : SPR.R_FLAG, b.x + size * 0.48, b.y - size * 0.38, 24);
-      }
-      if (b.hp < b.maxHp) {
+      drawBuildingBody(ctx, b.type, b.faction, b.x, b.y, b.prog, b.t);
+      if (b.prog >= 1 && b.hp < b.maxHp) {
         const w = size * 0.85;
         ctx.fillStyle = "rgba(0,0,0,0.5)";
         ctx.fillRect(b.x - w / 2, b.y - size * 0.62, w, 4);

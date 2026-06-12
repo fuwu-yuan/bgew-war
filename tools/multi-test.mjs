@@ -104,7 +104,8 @@ await guest.page.screenshot({ path: "/tmp/bgew-war-mp-4-guest-game.png" });
 await guest.page.waitForTimeout(4000);
 await guest.page.mouse.click(...guest.at(108, 992)); // CASERNE
 await guest.page.waitForTimeout(300);
-await guest.page.mouse.click(...guest.at(320, 220)); // red tile north
+// The guest's view is mirrored: their red territory is at the BOTTOM
+await guest.page.mouse.click(...guest.at(280, 700));
 await guest.page.waitForTimeout(800);
 await guest.page.mouse.click(...guest.at(588, 992)); // AXE
 await guest.page.waitForTimeout(300);
@@ -126,6 +127,19 @@ const guestUnits = await guest.page.evaluate(() => {
 });
 console.log(`guest sees ${guestUnits} remote units`);
 if (guestUnits < 5) errors.push(`SYNC: guest only sees ${guestUnits} units`);
+
+// Mirror check: the red HQ sits near the top for the host and near the
+// bottom for the guest (rows must be vertical mirrors of each other)
+const hostHqRow = await host.page.evaluate(
+  () => window.__bgewwar.steps.play.buildings.find((b) => b.type === "hq" && b.faction === 1)?.row
+);
+const guestHqRow = await guest.page.evaluate(
+  () => [...window.__bgewwar.steps.play.remote.buildings.values()].find((b) => b.type === "hq" && b.faction === 1)?.row
+);
+console.log(`red HQ row: host=${hostHqRow} guest=${guestHqRow} (mirror of ${hostHqRow} is ${23 - hostHqRow})`);
+if (guestHqRow !== 23 - hostHqRow) {
+  errors.push(`FLIP: red HQ should be mirrored (host row ${hostHqRow}, guest row ${guestHqRow})`);
+}
 
 // Host leaves → the guest must win by forfeit
 await host.page.close();

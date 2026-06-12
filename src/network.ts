@@ -114,7 +114,7 @@ export interface SnapMsg {
   type: "snap";
   /** [nid, kind(0 soldier/1 tank), faction, x, y, hp, maxHp, level] */
   units: number[][];
-  /** [nid, typeCode, faction, col, row, hp, maxHp] */
+  /** [nid, typeCode, faction, col, row, hp, maxHp, buildPct(0-100)] */
   buildings: number[][];
   /** [tileIndex, owner] since last snap */
   own: number[][];

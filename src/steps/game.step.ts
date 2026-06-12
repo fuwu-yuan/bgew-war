@@ -21,7 +21,7 @@ import {
   upgradeCost,
 } from "../globals";
 import { clamp, pick, rand, randInt, TAU } from "../utils";
-import { TileMap } from "../entities/tilemap";
+import { flipMapData, flipTileIndex, TileMap } from "../entities/tilemap";
 import { Bullet, Soldier, Tank, Unit } from "../entities/units";
 import { Building, BUILDING_CODE, BuildingType } from "../entities/buildings";
 import { Fader, Particle, ScorePopup, Shockwave, StrikeMarker, Tracer } from "../entities/effects";
@@ -161,19 +161,19 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       this.sendNet({ type: "ready" });
     } else {
       // Symmetric starting bases (HQ + 3 barracks + 2 turrets each)
-      this.placeBuilding(RED, "hq", 8, 2);
-      this.placeBuilding(RED, "barracks", 4, 4);
-      this.placeBuilding(RED, "barracks", 8, 4);
-      this.placeBuilding(RED, "barracks", 12, 4);
-      this.placeBuilding(RED, "turret", 6, 3);
-      this.placeBuilding(RED, "turret", 10, 3);
+      this.placeBuilding(RED, "hq", 8, 2, true);
+      this.placeBuilding(RED, "barracks", 4, 4, true);
+      this.placeBuilding(RED, "barracks", 8, 4, true);
+      this.placeBuilding(RED, "barracks", 12, 4, true);
+      this.placeBuilding(RED, "turret", 6, 3, true);
+      this.placeBuilding(RED, "turret", 10, 3, true);
 
-      this.placeBuilding(BLUE, "hq", 8, GRID_H - 3);
-      this.placeBuilding(BLUE, "barracks", 4, GRID_H - 5);
-      this.placeBuilding(BLUE, "barracks", 8, GRID_H - 5);
-      this.placeBuilding(BLUE, "barracks", 12, GRID_H - 5);
-      this.placeBuilding(BLUE, "turret", 6, GRID_H - 4);
-      this.placeBuilding(BLUE, "turret", 10, GRID_H - 4);
+      this.placeBuilding(BLUE, "hq", 8, GRID_H - 3, true);
+      this.placeBuilding(BLUE, "barracks", 4, GRID_H - 5, true);
+      this.placeBuilding(BLUE, "barracks", 8, GRID_H - 5, true);
+      this.placeBuilding(BLUE, "barracks", 12, GRID_H - 5, true);
+      this.placeBuilding(BLUE, "turret", 6, GRID_H - 4, true);
+      this.placeBuilding(BLUE, "turret", 10, GRID_H - 4, true);
 
       // First squads so the front moves right away
       for (let i = 0; i < 10; i++) {
@@ -210,6 +210,29 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     });
   }
 
+  /* ------------------------------------------------------------------
+   * Guest view mirror: the red player sees the island flipped vertically
+   * so THEIR army sits at the bottom of the screen. Everything coming
+   * from the host is converted to view space here, and every command
+   * sent back is converted to host space. No-ops for solo/host.
+   * ------------------------------------------------------------------ */
+
+  private get flipped(): boolean {
+    return this.role === "guest";
+  }
+
+  private viewY(y: number): number {
+    return this.flipped ? MAP_H - y : y;
+  }
+
+  private viewRow(r: number): number {
+    return this.flipped ? GRID_H - 1 - r : r;
+  }
+
+  private viewIdx(i: number): number {
+    return this.flipped ? flipTileIndex(i) : i;
+  }
+
   onNetworkMessage(msg: Network.SocketMessage): void {
     const data = gameData(msg);
     if (!data || this.role === "solo") return;
@@ -228,7 +251,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
     // Guest
     if (data.type === "init") {
-      this.map.applyInit((data as InitMsg).map);
+      const init = (data as InitMsg).map;
+      this.map.applyInit(this.flipped ? flipMapData(init) : init);
       this.inited = true;
     } else if (data.type === "snap") {
       this.applySnapshot(data as SnapMsg);
@@ -315,7 +339,16 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         ]),
       buildings: this.buildings
         .filter((b) => !b.dead)
-        .map((b) => [b.nid, BUILDING_CODE[b.type], b.faction, b.col, b.row, Math.ceil(b.hp), b.maxHp]),
+        .map((b) => [
+          b.nid,
+          BUILDING_CODE[b.type],
+          b.faction,
+          b.col,
+          b.row,
+          Math.ceil(b.hp),
+          b.maxHp,
+          Math.round(b.buildProgress * 100),
+        ]),
       own: this.map.flushDirty(),
       shots: this.pShots,
       booms: this.pBooms,
@@ -332,27 +365,30 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.sendNet(snap);
   }
 
-  /** Guest: render what the host says. */
+  /** Guest: render what the host says (converted to the mirrored view). */
   private applySnapshot(snap: SnapMsg): void {
     if (!this.remote) return;
-    this.remote.applySnapshot(snap.units, snap.buildings);
+    this.remote.applySnapshot(
+      snap.units.map(([nid, kind, f, x, y, hp, maxHp, level]) => [nid, kind, f, x, this.viewY(y), hp, maxHp, level]),
+      snap.buildings.map(([nid, t, f, c, r, hp, maxHp, prog]) => [nid, t, f, c, this.viewRow(r), hp, maxHp, prog])
+    );
     for (const [i, owner] of snap.own) {
-      this.map.setOwner(i, owner);
+      this.map.setOwner(this.viewIdx(i), owner);
     }
     if (snap.own.length > 0) this.sfx("capture", 0.16);
     for (const [x, y, tx, ty, big] of snap.shots) {
-      this.spawnEffect(new Tracer(x, y, tx, ty, big === 1));
+      this.spawnEffect(new Tracer(x, this.viewY(y), tx, this.viewY(ty), big === 1));
       this.sfx(big === 1 ? "tankshot" : `shot${1 + (Math.abs(x + y) % 3)}`, big === 1 ? 0.2 : 0.12);
     }
     for (const [x, y, big] of snap.booms) {
-      this.explosionVisual(x, y, big === 1);
+      this.explosionVisual(x, this.viewY(y), big === 1);
     }
     for (const [x, y] of snap.warns ?? []) {
-      this.spawnEffect(new StrikeMarker(x, y, STRIKE_RADIUS, STRIKE_DELAY));
+      this.spawnEffect(new StrikeMarker(x, this.viewY(y), STRIKE_RADIUS, STRIKE_DELAY));
       this.sfx("click", 0.5);
     }
     for (const [x, y, text, colorIdx] of snap.pops) {
-      this.spawnEffect(new ScorePopup(x, y, text, colorIdx === 1 ? "#ff8b7a" : COLORS.gold, 15));
+      this.spawnEffect(new ScorePopup(x, this.viewY(y), text, colorIdx === 1 ? "#ff8b7a" : COLORS.gold, 15));
     }
     this.gold[RED] = snap.gold.red;
     this.gold[BLUE] = snap.gold.blue;
@@ -389,7 +425,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
       this.mode = null;
       if (this.role === "guest") {
-        this.sendNet({ type: "cmd", cmd: "strike", x: Math.round(x), y: Math.round(y) });
+        // back to host space: the guest's view is mirrored
+        this.sendNet({ type: "cmd", cmd: "strike", x: Math.round(x), y: Math.round(this.viewY(y)) });
         this.board.playSound("click", false, 0.5);
         return;
       }
@@ -429,7 +466,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.mode = null;
     if (this.role === "guest") {
       // The host owns the truth: it validates, spends and spawns
-      this.sendNet({ type: "cmd", cmd: "build", kind, c, r });
+      // (row converted back to host space — the guest's view is mirrored)
+      this.sendNet({ type: "cmd", cmd: "build", kind, c, r: this.viewRow(r) });
       this.board.playSound("build", false, 0.5);
       return;
     }
@@ -688,9 +726,11 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
       const mine = this.myFaction;
       const m = this.map.tileCenter(this.axisCol[mine], 0);
+      // frontRowFromTop: on every screen "my" army pushes upward (the
+      // guest's view is mirrored), so the marker sits on my furthest row
       this.axisMarker = {
         x: m.x,
-        y: clamp(this.map.frontRowOf(mine, this.axisCol[mine]) * TILE, 60, MAP_H - 60),
+        y: clamp(this.map.frontRowFromTop(mine, this.axisCol[mine]) * TILE, 60, MAP_H - 60),
       };
     }
 
@@ -864,8 +904,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
    * World helpers
    * ---------------------------------------------------------------- */
 
-  private placeBuilding(f: Faction, type: BuildingType, c: number, r: number): void {
-    const b = new Building(this, f, type, c, r);
+  private placeBuilding(f: Faction, type: BuildingType, c: number, r: number, instant = false): void {
+    const b = new Building(this, f, type, c, r, instant);
     b.nid = this.nextNid++;
     b.soldierLevel = this.levels[f];
     this.buildings.push(b);

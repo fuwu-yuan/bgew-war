@@ -8,6 +8,36 @@ interface Decor {
   spr: number;
 }
 
+export interface MapInitData {
+  terrain: number[];
+  owner: number[];
+  decors: number[][];
+  chests: number[];
+}
+
+/** Mirror a tile index vertically (row r → GRID_H-1-r). */
+export function flipTileIndex(i: number): number {
+  return (GRID_H - 1 - Math.floor(i / GRID_W)) * GRID_W + (i % GRID_W);
+}
+
+/**
+ * Vertical mirror of a full map payload — the multiplayer guest (red) sees
+ * the island upside down so their army sits at the bottom of the screen.
+ */
+export function flipMapData(d: MapInitData): MapInitData {
+  const flipGrid = (src: number[]) => {
+    const out = new Array<number>(src.length);
+    for (let i = 0; i < src.length; i++) out[flipTileIndex(i)] = src[i];
+    return out;
+  };
+  return {
+    terrain: flipGrid(d.terrain),
+    owner: flipGrid(d.owner),
+    decors: d.decors.map(([i, spr]) => [flipTileIndex(i), spr]),
+    chests: d.chests.map(flipTileIndex),
+  };
+}
+
 /**
  * The whole island as ONE entity (never one entity per tile): terrain mask,
  * per-tile ownership checkerboard, cliffs + sand rim, animated ocean,
@@ -92,7 +122,7 @@ export class TileMap extends Entity {
   }
 
   /** Full state for the guest (sent once by the host). */
-  getInitData(): { terrain: number[]; owner: number[]; decors: number[][]; chests: number[] } {
+  getInitData(): MapInitData {
     return {
       terrain: Array.from(this.terrain),
       owner: Array.from(this.owner),
@@ -102,7 +132,7 @@ export class TileMap extends Entity {
   }
 
   /** Replace the whole map with the host's (guest side). */
-  applyInit(data: { terrain: number[]; owner: number[]; decors: number[][]; chests: number[] }): void {
+  applyInit(data: MapInitData): void {
     this.terrain = Uint8Array.from(data.terrain);
     this.owner = Uint8Array.from(data.owner);
     this.decors = data.decors.map(([i, spr]) => ({ i, spr }));
@@ -146,6 +176,18 @@ export class TileMap extends Entity {
   blueFrontRow(c: number): number {
     for (let r = 0; r < GRID_H; r++) {
       if (this.owner[this.idx(c, r)] === BLUE) return r;
+    }
+    return GRID_H;
+  }
+
+  /**
+   * First row (from the top) owned by `f` — the front of an army that
+   * pushes upward. On the guest's mirrored view, red pushes up too, so
+   * this works for "my front" on every screen.
+   */
+  frontRowFromTop(f: Faction, c: number): number {
+    for (let r = 0; r < GRID_H; r++) {
+      if (this.owner[this.idx(c, r)] === f) return r;
     }
     return GRID_H;
   }
