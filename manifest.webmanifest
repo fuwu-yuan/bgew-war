@@ -1,0 +1,17 @@
+{
+  "name": "BGEW WAR",
+  "short_name": "BGEW WAR",
+  "description": "Guerre de territoire en tug-of-war : un auto-battler solo et multijoueur fait avec le moteur BGEW.",
+  "lang": "fr",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a1428",
+  "theme_color": "#0a1428",
+  "icons": [
+    { "src": "./assets/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "./assets/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "./assets/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

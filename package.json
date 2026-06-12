@@ -4,6 +4,7 @@
   "description": "BGEW WAR — territorial tug-of-war auto-battler built with BGEW (Baguette Game Engine Web)",
   "scripts": {
     "sounds": "node tools/generate-sounds.mjs",
+    "icons": "node tools/generate-icons.mjs",
     "build": "esbuild src/main.ts --bundle --outfile=dist/bundle.js --format=esm --sourcemap",
     "typecheck": "tsc --noEmit",
     "serve": "serve -l 5050",

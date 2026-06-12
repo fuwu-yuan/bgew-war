@@ -220,19 +220,17 @@ const errors = [];
   await page.waitForTimeout(1400);
   await page.screenshot({ path: "/tmp/bgew-war-m2-game.png" });
 
-  // Tap TOURELLE then a southern blue tile — also proves touch coords
-  // survive the HiDPI buffer (deviceScaleFactor 3 on this viewport)
+  // Tap the TOURELLE button: its HUD position is fixed (independent of the
+  // random map), so the build mode toggling on proves touch coordinates map
+  // correctly through the HiDPI buffer (deviceScaleFactor 3 here).
   await page.touchscreen.tap(...at(153, 992));
   await page.waitForTimeout(250);
+  const mode = await page.evaluate(() => window.__bgewwar.steps.play.mode);
+  if (mode !== "turret") errors.push(`MOBILE: TOURELLE tap did not select build mode (mode=${mode}, HiDPI input regression?)`);
+  // Best-effort build + a few seconds of war for the screenshot
   await page.touchscreen.tap(...at(280, 760));
   await page.waitForTimeout(5000);
   await page.screenshot({ path: "/tmp/bgew-war-m3-combat.png" });
-  const turrets = await page.evaluate(() => {
-    const play = window.__bgewwar.steps.play;
-    return play.buildings.filter((b) => b.type === "turret" && b.faction === 2 && !b.dead).length;
-  });
-  // 2 starting turrets + the tapped one
-  if (turrets < 3) errors.push(`MOBILE: turret tap did not land, ${turrets} turret(s) (HiDPI input regression?)`);
   const buf = await page.evaluate(() => {
     const c = document.querySelector("#game canvas");
     return { w: c.width, cssW: Math.round(c.getBoundingClientRect().width), dpr: window.devicePixelRatio };
