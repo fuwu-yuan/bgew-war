@@ -17,7 +17,7 @@ import {
   type LeaderboardEntry,
 } from "../firebase";
 import { track, trackScreen } from "../analytics";
-import { drawMuteIcon, isMuted, toggleMute } from "../sound";
+import { audioReady, drawMuteIcon, isMuted, toggleMute } from "../sound";
 
 /** Mute toggle — top-right corner of the menu. */
 const MUTE_R = 16;
@@ -337,6 +337,7 @@ export class MenuStep extends GameStep {
   private soundHint: Entities.Label | null = null;
   private unsubAuth: (() => void) | null = null;
   private logoutBtn: Entities.Button | null = null;
+  private musicOn = false;
 
   /* Help modal — buttons hidden while open, drag/wheel to scroll */
   private menuButtons: Entities.Button[] = [];
@@ -350,6 +351,8 @@ export class MenuStep extends GameStep {
     board.onMouseEvent("click", (_e: MouseEvent, x: number, y: number) => {
       if (board.step !== this) return;
       if (this.soundHint) this.soundHint.visible = false;
+      // First gesture unlocks audio; give Howler a beat to resume, then start.
+      if (!this.musicOn) setTimeout(() => this.startMenuMusic(), 80);
       if (this.art && !this.art.showHelp && Math.abs(x - MUTE_CX) <= MUTE_R + 4 && Math.abs(y - MUTE_CY) <= MUTE_R + 4) {
         const muted = toggleMute();
         if (!muted) this.board.playSound("click", false, 0.4);
@@ -438,6 +441,7 @@ export class MenuStep extends GameStep {
     this.camera.x = 0;
     this.camera.y = 0;
     trackScreen("menu");
+    this.startMenuMusic();
 
     this.board.addEntity(new TileMap());
     this.art = new MenuArt();
@@ -493,8 +497,21 @@ export class MenuStep extends GameStep {
   onLeave(): void {
     this.soundHint = null;
     this.helpDragging = false;
+    this.board.stopSound("menu_music", true, 400);
+    this.musicOn = false;
     this.unsubAuth?.();
     this.unsubAuth = null;
+  }
+
+  /**
+   * Start the menu loop. Browsers block audio before a gesture; Howler's
+   * autoUnlock resumes the queued track on the first tap, and the musicOn
+   * guard keeps a second visit (or the soundHint tap) from stacking voices.
+   */
+  private startMenuMusic(): void {
+    if (this.musicOn || !audioReady()) return; // wait for the first tap to unlock audio
+    this.musicOn = true;
+    this.board.playSound("menu_music", true, 0.32);
   }
 
   private refreshAccount(): void {

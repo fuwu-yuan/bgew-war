@@ -24,6 +24,15 @@ export function applyMute(): void {
   Howler.mute(muted);
 }
 
+/**
+ * True once the browser audio context is unlocked (a sound played before
+ * this is silently dropped). Used to defer the menu music to the first tap.
+ */
+export function audioReady(): boolean {
+  const ctx = (Howler as unknown as { ctx?: AudioContext }).ctx;
+  return ctx ? ctx.state === "running" : false;
+}
+
 export function setMuted(value: boolean): void {
   muted = value;
   try {

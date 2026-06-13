@@ -119,6 +119,7 @@ sfx("helico", "wav", true, 0.22);
 sfx("victory", "m4a", false, 0.6);
 sfx("defeat", "m4a", false, 0.6);
 sfx("music_battle", "m4a", true, 0.3);
+sfx("menu_music", "m4a", true, 0.32);
 
 /* Restore the saved mute preference onto the Howler bus */
 applyMute();
