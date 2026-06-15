@@ -101,12 +101,22 @@ export interface StartMsg {
 /** Guest → host: "I'm in the game step, send me the island" (retried) */
 export interface ReadyMsg {
   type: "ready";
+  /** Guest's display name, piggybacked so the host can label the enemy. */
+  name?: string;
+  /** Guest's Firebase uid (empty when not signed in) — for ranked validation. */
+  uid?: string;
 }
 
 /** Host → guest, once: the generated island */
 export interface InitMsg {
   type: "init";
   map: { terrain: number[]; owner: number[]; decors: number[][]; chests: number[] };
+  /** Host's display name, piggybacked so the guest can label the enemy. */
+  name?: string;
+  /** Host's Firebase uid (empty when not signed in) — for ranked validation. */
+  uid?: string;
+  /** Shared match id (host-generated) the Cloud Function correlates on. */
+  matchId?: string;
 }
 
 /** Host → guest, ~10 Hz */
@@ -129,6 +139,9 @@ export interface SnapMsg {
   gold: { red: number; blue: number };
   lvl: { red: number; blue: number; tankRed?: number; tankBlue?: number; turretRed?: number; turretBlue?: number };
   share: number; // blue share 0..1
+  /** Host's cumulative meaningful-action count — the guest uses it to tell
+   *  whether the host is actually playing (anti-AFK). */
+  acts?: number;
 }
 
 /** Host → guest: the war is over */
@@ -152,7 +165,21 @@ export interface CmdMsg {
   y?: number;
 }
 
-export type GameMsg = StartMsg | ReadyMsg | InitMsg | SnapMsg | EndMsg | CmdMsg;
+/** Either side → the other: a salted hash of the player's public IP, so each
+ *  client can tell if both players sit behind the same address (unranked). */
+export interface IpMsg {
+  type: "ip";
+  hash: string;
+}
+
+/** Either side → the other: the match is cancelled and must NOT be ranked
+ *  (e.g. an inactive opponent). Both clients drop to a neutral end screen. */
+export interface VoidMsg {
+  type: "void";
+  reason: string;
+}
+
+export type GameMsg = StartMsg | ReadyMsg | InitMsg | SnapMsg | EndMsg | CmdMsg | IpMsg | VoidMsg;
 
 /** Role passed to the game step via moveToStep data */
 export interface MultiData {

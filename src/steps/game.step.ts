@@ -23,7 +23,7 @@ import {
   tankUpgradeCost,
   turretUpgradeCost,
 } from "../globals";
-import { clamp, pick, rand, randInt, TAU } from "../utils";
+import { clamp, pick, rand, randInt, sha256, TAU } from "../utils";
 import { flipMapData, flipTileIndex, TileMap } from "../entities/tilemap";
 import { Bullet, Soldier, Tank, Unit } from "../entities/units";
 import { Building, BUILDING_CODE, BuildingType } from "../entities/buildings";
@@ -32,13 +32,25 @@ import { Fader, Particle, ScorePopup, Shockwave, StrikeMarker, Tracer } from "..
 import { BuildMode, Hud, HudState } from "../entities/hud";
 import { GameObject } from "../entities/gameobject";
 import { RemoteWorld } from "../entities/remote";
-import { CmdMsg, EndMsg, GameMsg, gameData, InitMsg, MultiData, SnapMsg } from "../network";
+import { CmdMsg, EndMsg, GameMsg, gameData, InitMsg, IpMsg, MultiData, SnapMsg, VoidMsg } from "../network";
 import { track, trackScreen } from "../analytics";
 import { toggleMute } from "../sound";
+import { currentUser, displayName } from "../firebase";
 
 const BRAIN_EVERY = 3; // s — red AI thinks (solo only)
 const INCOME_EVERY = 1; // s
 const SNAP_EVERY = 0.1; // s — host → guest snapshots
+/* Anti-cheat (ranked multiplayer fairness) */
+const IDLE_LIMIT = 30; // s of opponent inactivity → the match is stopped & voided
+const MIN_RANKED_DURATION = 20; // s — anything shorter can't be ranked
+const MAX_EFFECTS = 320; // hard cap on live cosmetic entities (particles, tracers…)
+
+/** A unique, shared id for one match (host-minted, sent to the guest). */
+function newMatchId(): string {
+  const c = window.crypto as Crypto | undefined;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  return `m-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
+}
 const AI_GRACE = 6; // s before the AI starts spending
 const GARRISON_COST = 50;
 const GARRISON_CD = 8; // s
@@ -96,6 +108,21 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private inited = true; // guest: received init from host
   private readyT = 0;
   private snapT = 0;
+
+  /* Anti-cheat: opponent-activity tracking + same-IP detection */
+  private oppActed = false; // opponent issued at least one real order
+  private oppLastActT = 0; // elapsed (s) at the opponent's last observed action
+  private myActs = 0; // my meaningful actions (host streams this in snapshots)
+  private lastSeenActs = 0; // guest: last host action count seen in a snapshot
+  private myIpHash: string | null = null;
+  private oppIpHash: string | null = null;
+  private sameIp = false;
+  private voided = false; // match cancelled → unranked, neutral end
+  private voidReason = "";
+  /* Ranked validation: a shared match id + both uids, sent to the Cloud Function */
+  private matchId = "";
+  private myUid = "";
+  private enemyUid = "";
   private nextNid = 1;
   private pShots: number[][] = [];
   private pBooms: number[][] = [];
@@ -114,6 +141,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   public elapsed = 0;
   public blueShare = 0.5;
   public axisMarker: { x: number; y: number } | null = null;
+  public myName = "Vous";
+  public enemyName = "Adversaire";
 
   private gold: Record<Faction, number> = { [RED]: 0, [BLUE]: 0 };
   private levels: Record<Faction, number> = { [RED]: 1, [BLUE]: 1 };
@@ -209,6 +238,19 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   onEnter(data: { multi?: MultiData }): void {
     this.role = data?.multi ? (data.multi.role === "guest" ? "guest" : "host") : "solo";
     this.myFaction = this.role === "guest" ? RED : BLUE;
+
+    // Player names shown in the HUD. Local name = signed-in pseudo, else a
+    // sensible default. The enemy name arrives over the network (ready/init)
+    // so it starts as a placeholder.
+    const u = currentUser();
+    this.myName = u && !u.isAnonymous ? displayName(u) : this.role === "solo" ? "Vous" : "Invite";
+    this.enemyName = this.role === "solo" ? "IA" : this.role === "guest" ? "Adversaire" : "Invite";
+    // Ranked identity: my uid (empty when not signed in) and a shared match id
+    // the host mints and shares so the Cloud Function can pair the two reports.
+    this.myUid = u && !u.isAnonymous ? u.uid : "";
+    this.enemyUid = "";
+    this.matchId = this.role === "host" ? newMatchId() : "";
+
     trackScreen("game");
     track("game_start", { mode: this.role, faction: this.myFaction === RED ? "red" : "blue" });
 
@@ -249,8 +291,18 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.hqDefenseUsed = { [RED]: false, [BLUE]: false };
     this.inited = this.role !== "guest";
     this.sfxLast.clear();
+    this.oppActed = false;
+    this.oppLastActT = 0;
+    this.myActs = 0;
+    this.lastSeenActs = 0;
+    this.myIpHash = null;
+    this.oppIpHash = null;
+    this.sameIp = false;
+    this.voided = false;
+    this.voidReason = "";
     this.camera.x = 0;
     this.camera.y = 0;
+    if (this.role !== "solo") this.exchangeIpHash();
 
     this.map = new TileMap();
     this.board.addEntity(this.map);
@@ -259,7 +311,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       // Passive mirror: the island and every unit come from the host
       this.remote = new RemoteWorld();
       this.board.addEntity(this.remote);
-      this.sendNet({ type: "ready" });
+      this.sendNet({ type: "ready", name: this.myName, uid: this.myUid });
     } else {
       // Symmetric starting bases (HQ + 3 barracks + 2 turrets each)
       this.placeBuilding(RED, "hq", 8, 2, true);
@@ -339,13 +391,30 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     const data = gameData(msg);
     if (!data || this.role === "solo") return;
 
+    // Anti-cheat signals handled the same way for both roles
+    if (data.type === "ip") {
+      this.onOpponentIp((data as IpMsg).hash);
+      return;
+    }
+    if (data.type === "void") {
+      this.voidMatch((data as VoidMsg).reason || "Partie annulee", false);
+      return;
+    }
+
     if (this.role === "host") {
       if (data.type === "ready") {
-        // (Re)send the island + an immediate snapshot
-        const init: InitMsg = { type: "init", map: this.map.getInitData() };
+        if (typeof data.name === "string") this.enemyName = data.name || "Invite";
+        if (typeof data.uid === "string") this.enemyUid = data.uid;
+        // (Re)send the island + an immediate snapshot, carrying our name, uid
+        // and the shared match id the guest reports under.
+        const init: InitMsg = { type: "init", map: this.map.getInitData(), name: this.myName, uid: this.myUid, matchId: this.matchId };
         this.sendNet(init);
         this.sendSnapshot();
+        this.sendNet({ type: "ip", hash: this.myIpHash ?? "" }); // (re)share our IP hash
       } else if (data.type === "cmd") {
+        // The guest issued an order → it's actively playing.
+        this.oppActed = true;
+        this.oppLastActT = this.elapsed;
         this.applyCommand(data as CmdMsg);
       }
       return;
@@ -353,9 +422,14 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
     // Guest
     if (data.type === "init") {
-      const init = (data as InitMsg).map;
+      const initMsg = data as InitMsg;
+      if (typeof initMsg.name === "string") this.enemyName = initMsg.name || "Invite";
+      if (typeof initMsg.uid === "string") this.enemyUid = initMsg.uid;
+      if (typeof initMsg.matchId === "string") this.matchId = initMsg.matchId;
+      const init = initMsg.map;
       this.map.applyInit(this.flipped ? flipMapData(init) : init);
       this.inited = true;
+      this.sendNet({ type: "ip", hash: this.myIpHash ?? "" }); // share our IP hash
     } else if (data.type === "snap") {
       this.applySnapshot(data as SnapMsg);
     } else if (data.type === "end") {
@@ -375,6 +449,51 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     if (this.board.step !== this) return;
     this.opponentGone("Connexion perdue");
   };
+
+  /* ---------------------------------------------------------------- *
+   * Anti-cheat (ranked fairness)
+   * ---------------------------------------------------------------- */
+
+  /** Fetch our public IP, hash it, and send the hash to the opponent. The
+   *  hash (never the raw IP) lets each side detect two players on one address
+   *  without leaking anything. Best-effort: any failure simply skips the check. */
+  private exchangeIpHash(): void {
+    // Needs the network anyway; off in tests / privacy mode (?firebase=off).
+    if (new URLSearchParams(window.location.search).get("firebase") === "off") return;
+    const ctrl = new AbortController();
+    const timer = window.setTimeout(() => ctrl.abort(), 4000);
+    fetch("https://api.ipify.org?format=json", { signal: ctrl.signal })
+      .then((r) => r.json())
+      .then(async (j: { ip?: string }) => {
+        window.clearTimeout(timer);
+        if (!j.ip || this.role === "solo" || this.board.step !== this) return;
+        this.myIpHash = await sha256(`bgew-war:${j.ip}`);
+        this.sendNet({ type: "ip", hash: this.myIpHash });
+        // We may already hold the opponent's hash from before ours was ready.
+        if (this.oppIpHash) this.compareIp();
+      })
+      .catch(() => window.clearTimeout(timer));
+  }
+
+  private onOpponentIp(hash: string): void {
+    if (hash) this.oppIpHash = hash;
+    this.compareIp();
+  }
+
+  private compareIp(): void {
+    if (this.myIpHash && this.oppIpHash && this.myIpHash === this.oppIpHash) this.sameIp = true;
+  }
+
+  /** Cancel the match: unranked, neutral end on both sides. */
+  private voidMatch(reason: string, notify: boolean): void {
+    if (this.ended || this.voided) return;
+    this.voided = true;
+    this.voidReason = reason;
+    if (notify && this.role !== "solo") this.sendNet({ type: "void", reason });
+    this.spawnEffect(new ScorePopup(VIEW_W / 2, MAP_H / 2, "PARTIE ANNULEE", "#ffe27a", 18));
+    // Reuse the end pipeline; the winner is irrelevant for a void.
+    this.showEnd(this.myFaction, this.elapsed, this.blueShare);
+  }
 
   private opponentGone(reason: string): void {
     if (this.role === "solo" || this.ended) return;
@@ -484,6 +603,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         turretBlue: this.turretLevels[BLUE],
       },
       share: this.map.share(BLUE),
+      acts: this.myActs,
     };
     this.pShots = [];
     this.pBooms = [];
@@ -495,22 +615,30 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   /** Guest: render what the host says (converted to the mirrored view). */
   private applySnapshot(snap: SnapMsg): void {
     if (!this.remote) return;
-    this.remote.applySnapshot(
-      snap.units.map(([nid, kind, f, x, y, hp, maxHp, level]) => [nid, kind, f, x, this.viewY(y), hp, maxHp, level]),
-      snap.buildings.map(([nid, t, f, c, r, hp, maxHp, prog]) => [nid, t, f, c, this.viewRow(r), hp, maxHp, prog])
-    );
-    // Buildings may stand where the host cleared a tree/rock — mirror that
-    // here so decor doesn't peek out from under a remote building.
+    // Pass the raw arrays + flip flag: the mirror converts inline (no per-snap
+    // array allocation, which was a big GC cost on the guest in large battles).
+    this.remote.applySnapshot(snap.units, snap.buildings, this.flipped);
+    // Buildings may stand where the host cleared a tree/rock — mirror that here
+    // so decor doesn't peek out from under a remote building.
     for (const [, , , c, r] of snap.buildings) this.map.clearDecor(this.map.idx(c, this.viewRow(r)));
     for (const [i, owner] of snap.own) {
       this.map.setOwner(this.viewIdx(i), owner);
     }
     if (snap.own.length > 0) this.sfx("capture", 0.16);
-    for (const [x, y, tx, ty, big] of snap.shots) {
+    // Cosmetics are bounded so a furious battle can't bury the guest under
+    // thousands of effect entities (the runaway cause of guest lag). Tracers
+    // and booms are capped per snapshot; spawnEffect also enforces a global cap.
+    const shots = snap.shots;
+    const shotCap = Math.min(shots.length, 14);
+    for (let k = 0; k < shotCap; k++) {
+      const [x, y, tx, ty, big] = shots[k];
       this.spawnEffect(new Tracer(x, this.viewY(y), tx, this.viewY(ty), big === 1));
       this.sfx(big === 1 ? "tankshot" : `shot${1 + (Math.abs(x + y) % 3)}`, big === 1 ? 0.2 : 0.12);
     }
-    for (const [x, y, big] of snap.booms) {
+    const booms = snap.booms;
+    const boomCap = Math.min(booms.length, 8);
+    for (let k = 0; k < boomCap; k++) {
+      const [x, y, big] = booms[k];
       this.explosionVisual(x, this.viewY(y), big === 1);
     }
     for (const [x, y] of snap.warns ?? []) {
@@ -529,6 +657,13 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.turretLevels[RED] = snap.lvl.turretRed ?? 1;
     this.turretLevels[BLUE] = snap.lvl.turretBlue ?? 1;
     this.blueShare = snap.share;
+    // Anti-AFK: the host's action counter climbing means it's actively playing.
+    const acts = snap.acts ?? 0;
+    if (acts > this.lastSeenActs) {
+      this.lastSeenActs = acts;
+      this.oppActed = true;
+      this.oppLastActT = this.elapsed;
+    }
     this.updateHeliLoop(snap.units.some((u) => u[1] === 2));
   }
 
@@ -565,6 +700,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
       this.mode = null;
       track("use_airstrike", { mode: this.role });
+      this.myActs++;
       if (this.role === "guest") {
         // back to host space: the guest's view is mirrored
         this.sendNet({ type: "cmd", cmd: "strike", x: Math.round(x), y: Math.round(this.viewY(y)) });
@@ -583,6 +719,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
       this.mode = null;
       track("use_helico", { mode: this.role });
+      this.myActs++;
       if (this.role === "guest") {
         // x n'a pas besoin de conversion : le miroir invité n'inverse que y
         this.sendNet({ type: "cmd", cmd: "helico", x: Math.round(x) });
@@ -599,6 +736,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       this.axisCol[mine] = c;
       this.mode = null;
       track("set_axis", { mode: this.role });
+      this.myActs++;
       this.board.playSound("click", false, 0.5);
       this.spawnEffect(new ScorePopup(x, y, "AXE D'ATTAQUE", "#ffe27a", 16));
       if (this.role === "guest") this.sendNet({ type: "cmd", cmd: "axis", col: c });
@@ -625,6 +763,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     }
     this.mode = null;
     track("build", { type: kind, mode: this.role });
+    this.myActs++;
     if (this.role === "guest") {
       // The host owns the truth: it validates, spends and spawns
       // (row converted back to host space — the guest's view is mirrored)
@@ -646,6 +785,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       return;
     }
     track("upgrade", { kind, level: this.upgradeLevelFor(this.myFaction, kind) + 1, mode: this.role });
+    this.myActs++;
     if (this.role === "guest") {
       this.sendNet({ type: "cmd", cmd: "upgrade", kind });
       this.board.playSound("build", false, 0.5);
@@ -931,16 +1071,27 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       if (this.role === "host") {
         this.snapT -= dt;
         if (this.snapT <= 0) {
-          this.snapT = SNAP_EVERY;
+          // Throttle the snapshot rate as the army grows: a full-state packet
+          // 10×/s with hundreds of units floods the guest's ingestion. The
+          // guest interpolates over the real gap, so motion stays smooth.
+          const n = this.units.length;
+          this.snapT = n > 280 ? 0.18 : n > 160 ? 0.14 : SNAP_EVERY;
           this.sendSnapshot();
         }
+      }
+
+      // Anti-AFK: an opponent silent for too long stops the match (unranked).
+      // The guest learns of host actions via snap.acts, the host of guest
+      // orders via cmd messages — either way oppLastActT tracks the other side.
+      if (this.role !== "solo" && this.inited && !this.voided && this.elapsed - this.oppLastActT > IDLE_LIMIT) {
+        this.voidMatch("Adversaire inactif", true);
       }
 
       if (this.role === "guest" && !this.inited) {
         this.readyT -= dt;
         if (this.readyT <= 0) {
           this.readyT = 0.6;
-          this.sendNet({ type: "ready" });
+          this.sendNet({ type: "ready", name: this.myName, uid: this.myUid });
         }
       }
 
@@ -1355,7 +1506,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   private explosionVisual(x: number, y: number, big: boolean): void {
-    const count = big ? 26 : 12;
+    // Fewer particles when the effect pool is already crowded — keeps big
+    // fights cheap (especially on the guest) without losing the punch.
+    const crowded = this.effects.length > MAX_EFFECTS * 0.6;
+    const count = crowded ? (big ? 8 : 4) : big ? 22 : 11;
     for (let k = 0; k < count; k++) {
       this.spawnEffect(
         new Particle(x, y, rand(0, TAU), rand(50, big ? 320 : 200), pick(["#ffb13d", "#ff7a3d", "#ffe27a", "#5a5a5a"]), {
@@ -1368,7 +1522,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.sfx(big ? "explosion2" : "explosion1", big ? 0.4 : 0.25);
   }
 
+  /** Add a cosmetic entity, unless the live-effect cap is reached (prevents a
+   *  runaway entity count from tanking the frame rate during huge battles). */
   private spawnEffect(e: GameObject): void {
+    if (this.effects.length >= MAX_EFFECTS) return;
     this.effects.push(e);
     this.board.addEntity(e);
   }
@@ -1439,7 +1596,36 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.updateHeliLoop(false);
     const win = winner === this.myFaction;
     this.board.stopSound("music_battle", true, 800);
-    this.board.playSound(win ? "victory" : "defeat", false, 0.6);
+
+    // Ranked-fairness verdict: a match only counts when it's a genuine, full
+    // contest between two distinct, active players.
+    const multi = this.role !== "solo";
+    let ranked = multi;
+    let reason = "";
+    if (this.voided) {
+      ranked = false;
+      reason = this.voidReason || "Partie annulee";
+    } else if (multi) {
+      if (this.sameIp) {
+        ranked = false;
+        reason = "Meme reseau";
+      } else if (time < MIN_RANKED_DURATION) {
+        ranked = false;
+        reason = "Partie trop courte";
+      } else if (!this.oppActed) {
+        ranked = false;
+        reason = "Adversaire inactif";
+      } else if (!this.enemyUid) {
+        // The Cloud Function needs both players signed in to validate a result.
+        ranked = false;
+        reason = "Adversaire non connecte";
+      }
+    }
+    if (ranked || !multi) track("match_ranked", { mode: this.role });
+    else track("match_unranked", { mode: this.role, reason });
+
+    if (this.voided) this.board.playSound("error", false, 0.4);
+    else this.board.playSound(win ? "victory" : "defeat", false, 0.6);
 
     const data = {
       win,
@@ -1447,11 +1633,16 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       share: this.myFaction === BLUE ? blueShare : 1 - blueShare,
       kills: this.killsBy[this.myFaction],
       losses: this.killsBy[enemyOf(this.myFaction)],
-      multi: this.role !== "solo",
+      multi,
       faction: this.myFaction,
+      ranked,
+      voided: this.voided,
+      reason,
+      matchId: this.matchId,
+      enemyUid: this.enemyUid,
     };
     this.addTimer(
-      2200,
+      this.voided ? 1200 : 2200,
       () => {
         const out = new Fader(0, 1, 700, "#08111f", () => {
           this.board.moveToStep("end", data);

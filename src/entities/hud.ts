@@ -22,6 +22,8 @@ export interface HudState {
   tankUpgradeCost: number;
   turretLevel: number;
   turretUpgradeCost: number;
+  myName: string; // local player's name (left, my unit color)
+  enemyName: string; // opponent's name (right, enemy unit color)
 }
 
 interface Btn {
@@ -159,6 +161,20 @@ export class Hud extends Entity {
     ctx.fillText(`${Math.round((1 - myShare) * 100)}%`, VIEW_W - 6, 11);
     ctx.textAlign = "left";
 
+    /* Player names (thin band under the territory bar) — me on the left in my
+       unit color, the enemy on the right in theirs. Names are truncated so
+       they never reach the center. */
+    const myColor = mine === BLUE ? COLORS.blueUnit : COLORS.redUnit;
+    const enemyColor = mine === BLUE ? COLORS.redUnit : COLORS.blueUnit;
+    ctx.font = `10px ${FONT}`;
+    ctx.fillStyle = myColor;
+    ctx.textAlign = "left";
+    ctx.fillText(this.trunc(s.myName), 6, 24);
+    ctx.fillStyle = enemyColor;
+    ctx.textAlign = "right";
+    ctx.fillText(this.trunc(s.enemyName), VIEW_W - 6, 24);
+    ctx.textAlign = "left";
+
     /* Bottom panel */
     ctx.fillStyle = COLORS.hudBg;
     ctx.fillRect(0, MAP_H, VIEW_W, VIEW_H - MAP_H);
@@ -230,6 +246,11 @@ export class Hud extends Entity {
       ctx.fillText(b.key, b.x + b.w - 10.5, b.y + BTN_H - 7.5);
       ctx.textAlign = "left";
     }
+  }
+
+  /** Keep names short enough to never collide with the center percentages. */
+  private trunc(name: string): string {
+    return name.length > 14 ? `${name.slice(0, 13)}.` : name;
   }
 
   private roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {

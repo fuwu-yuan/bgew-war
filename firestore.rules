@@ -2,8 +2,15 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
+
+    // ---- User profiles --------------------------------------------------
+    // Readable by anyone (leaderboard). The client may create its own profile
+    // (zeroed) and edit ONLY its pseudo. Stats (wins/losses/games/bestTime)
+    // are written exclusively by the trusted `submitMatchResult` function
+    // (Admin SDK, which bypasses these rules) — never by a client.
     match /users/{userId} {
       allow read: if true;
+
       allow create: if request.auth != null
         && request.auth.uid == userId
         && request.auth.token.firebase.sign_in_provider != 'anonymous'
@@ -12,46 +19,31 @@ service cloud.firestore {
         && request.resource.data.losses == 0
         && request.resource.data.games == 0
         && request.resource.data.needsName == true;
+
+      // Pseudo only — stats must stay untouched by the client.
       allow update: if request.auth != null
         && request.auth.uid == userId
         && request.auth.token.firebase.sign_in_provider != 'anonymous'
-        && (
-          (
-            request.resource.data.diff(resource.data).changedKeys().hasOnly(['name', 'needsName', 'updatedAt'])
-            && request.resource.data.wins == resource.data.wins
-            && request.resource.data.losses == resource.data.losses
-            && request.resource.data.games == resource.data.games
-            && request.resource.data.needsName == false
-          )
-          ||
-          (
-            request.resource.data.diff(resource.data).changedKeys().hasOnly(['wins', 'losses', 'games', 'bestTime', 'updatedAt'])
-            && request.resource.data.wins >= resource.data.wins
-            && request.resource.data.wins <= resource.data.wins + 1
-            && request.resource.data.losses >= resource.data.losses
-            && request.resource.data.losses <= resource.data.losses + 1
-            && request.resource.data.games == resource.data.games + 1
-          )
-        );
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['name', 'needsName', 'updatedAt'])
+        && request.resource.data.wins == resource.data.wins
+        && request.resource.data.losses == resource.data.losses
+        && request.resource.data.games == resource.data.games
+        && request.resource.data.bestTime == resource.data.bestTime;
+
       allow delete: if false;
 
+      // Per-user match history: readable by its owner, written only by the
+      // Cloud Function (Admin SDK). No client writes.
       match /matches/{matchId} {
         allow read: if request.auth != null && request.auth.uid == userId;
-        allow create: if request.auth != null
-          && request.auth.uid == userId
-          && request.auth.token.firebase.sign_in_provider != 'anonymous'
-          && request.resource.data.keys().hasOnly(['win', 'time', 'share', 'kills', 'losses', 'faction', 'createdAt'])
-          && request.resource.data.win is bool
-          && request.resource.data.time is int
-          && request.resource.data.time > 0
-          && request.resource.data.share is number
-          && request.resource.data.share >= 0
-          && request.resource.data.share <= 1
-          && request.resource.data.kills is int
-          && request.resource.data.losses is int
-          && request.resource.data.faction in [1, 2];
-        allow update, delete: if false;
+        allow write: if false;
       }
+    }
+
+    // ---- Match validation docs (the "match tokens") ---------------------
+    // Entirely server-side: created/updated only by the Cloud Function.
+    match /matches/{matchId} {
+      allow read, write: if false;
     }
   }
 }

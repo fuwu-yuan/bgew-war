@@ -5,19 +5,19 @@ import { TileMap } from "../entities/tilemap";
 import { Fader } from "../entities/effects";
 import { drawSprite, SPR } from "../sprites";
 import {
+  cachedMenuData,
   currentUser,
-  displayName,
   loadLeaderboard,
   loadMyRank,
   logout,
-  needsPseudo,
   onUserChange,
-  setPseudo,
-  signInGoogle,
+  profileName,
+  signInGoogleWithPseudo,
   type LeaderboardEntry,
 } from "../firebase";
 import { track, trackScreen } from "../analytics";
 import { audioReady, drawMuteIcon, isMuted, toggleMute } from "../sound";
+import { openStatsModal } from "../entities/stats-modal";
 
 /** Mute toggle — top-right corner of the menu. */
 const MUTE_R = 16;
@@ -102,6 +102,7 @@ class MenuArt extends Entity {
   public helpScroll = 0;
   public leaderboard: LeaderboardEntry[] = [];
   public authName = "";
+  public authReady = false; // hold the label blank until auth + pseudo resolve
   public authError = "";
   public soloWins = 0;
   public multiWins: number | null = null;
@@ -173,10 +174,15 @@ class MenuArt extends Entity {
     ctx.font = `15px ${FONT}`;
     ctx.fillStyle = COLORS.gold;
     ctx.fillText("CLASSEMENT MULTI", 70, 722);
-    ctx.textAlign = "right";
-    ctx.fillStyle = this.authName ? "#9fc3e4" : "#ffb13d";
-    ctx.font = `11px ${FONT}`;
-    ctx.fillText(this.authName ? this.authName : "non connecte", VIEW_W - 70, 721);
+    // Only paint the label once it's settled — no "invite → Google name →
+    // pseudo" flicker while auth restores and the pseudo loads.
+    if (this.authReady) {
+      const connected = !!this.authName && this.authName !== "invite";
+      ctx.textAlign = "right";
+      ctx.fillStyle = connected ? "#9fc3e4" : "#ffb13d";
+      ctx.font = `11px ${FONT}`;
+      ctx.fillText(connected ? this.authName : "invite", VIEW_W - 70, 721);
+    }
     ctx.textAlign = "left";
     ctx.font = `11px ${FONT}`;
     ctx.fillStyle = "#e8f2fc";
@@ -336,7 +342,10 @@ export class MenuStep extends GameStep {
   private art!: MenuArt;
   private soundHint: Entities.Label | null = null;
   private unsubAuth: (() => void) | null = null;
+  private authResolved = false; // true once onAuthStateChanged has fired once
+  private hydratedOnce = false; // boot-time preload snapshot consumed already
   private logoutBtn: Entities.Button | null = null;
+  private googleBtn: Entities.Button | null = null;
   private musicOn = false;
 
   /* Help modal — buttons hidden while open, drag/wheel to scroll */
@@ -438,6 +447,7 @@ export class MenuStep extends GameStep {
     this.helpDragging = false;
     this.helpDragged = false;
     this.menuButtons = [];
+    this.authResolved = false;
     this.camera.x = 0;
     this.camera.y = 0;
     trackScreen("menu");
@@ -447,9 +457,25 @@ export class MenuStep extends GameStep {
     this.art = new MenuArt();
     this.art.soloWins = loadBest()?.wins ?? 0;
     this.board.addEntity(this.art);
+    // Instant paint from the splash preload (no loading flash); a live refresh
+    // below keeps it honest. Only on the FIRST entry, though — the snapshot is
+    // boot-time, so later visits (e.g. after logging in) rely on the live
+    // refresh instead, which reveals the label only once resolved.
+    const cached = this.hydratedOnce ? null : cachedMenuData();
+    if (cached) {
+      this.hydratedOnce = true;
+      this.authResolved = true;
+      this.art.authReady = true;
+      this.art.authName = cached.name ?? "invite";
+      this.art.leaderboard = cached.leaderboard;
+      this.art.multiWins = cached.rank?.entry.wins ?? null;
+      this.art.myRank = cached.rank?.rank ?? null;
+      this.art.myUid = cached.rank?.entry.uid ?? "";
+    }
     this.refreshAccount();
     this.refreshLeaderboard();
     this.unsubAuth = onUserChange(() => {
+      this.authResolved = true; // auth state is now authoritative
       this.refreshAccount();
       this.refreshLeaderboard();
     });
@@ -463,14 +489,24 @@ export class MenuStep extends GameStep {
     const helpBtn = this.makeButton(VIEW_W / 2 - 140, 636, 280, 44, "COMMENT JOUER", "rgba(190, 215, 240, 0.9)", 15);
     helpBtn.onMouseEvent("click", () => this.openHelp());
 
-    const googleBtn = this.makeButton(VIEW_W / 2 - 140, 884, 280, 34, "CONNEXION GOOGLE", "#7fd1ff", 10);
+    // Bottom row: MES STATS (left) + auth (right), side by side, no overlap.
+    const statsBtn = this.makeButton(40, 884, 250, 34, "MES STATS", "#ffe27a", 12);
+    statsBtn.onMouseEvent("click", () => {
+      track("stats_opened");
+      this.board.playSound("click", false, 0.4);
+      openStatsModal();
+    });
+
+    const googleBtn = this.makeButton(350, 884, 250, 34, "CONNEXION GOOGLE", "#7fd1ff", 10);
     googleBtn.onMouseEvent("click", () => {
       track("login", { method: "google" });
       this.authAction(() => this.signInGoogleWithPseudo());
     });
-    this.menuButtons = [playBtn, multiBtn, helpBtn, googleBtn];
+    this.googleBtn = googleBtn;
+    this.menuButtons = [playBtn, multiBtn, helpBtn, statsBtn, googleBtn];
 
-    this.logoutBtn = this.makeButton(VIEW_W / 2 + 152, 884, 118, 34, "LOGOUT", "rgba(190, 215, 240, 0.9)", 11);
+    // LOGOUT shares the right slot with CONNEXION GOOGLE — only one shows.
+    this.logoutBtn = this.makeButton(350, 884, 250, 34, "LOGOUT", "rgba(190, 215, 240, 0.9)", 11);
     this.logoutBtn.onMouseEvent("click", () => {
       track("logout");
       this.authAction(() => logout());
@@ -516,13 +552,31 @@ export class MenuStep extends GameStep {
 
   private refreshAccount(): void {
     const user = currentUser();
-    this.art.authName = user ? (user.isAnonymous ? "invite" : displayName(user)) : "invite";
-    this.art.myUid = user && !user.isAnonymous ? user.uid : "";
-    if (!this.art.myUid) {
+    const loggedIn = !!user && !user.isAnonymous;
+    this.art.myUid = loggedIn ? user!.uid : "";
+    if (!loggedIn) {
       this.art.multiWins = null;
       this.art.myRank = null;
     }
-    if (this.logoutBtn) this.logoutBtn.visible = !!user && !user.isAnonymous && !this.art.showHelp;
+    // Resolve the label to its FINAL value before revealing it (no Google-name
+    // flash): connected → fetch the chosen pseudo, then show; guest → "invite",
+    // but only once auth has actually resolved (avoids a false "invite" flash
+    // while persistence is still restoring the session on first load).
+    if (loggedIn) {
+      const uid = user!.uid;
+      profileName(user!).then((n) => {
+        if (this.board.step !== this || currentUser()?.uid !== uid) return; // stale
+        this.art.authName = n;
+        this.art.authReady = true;
+      });
+    } else if (this.authResolved) {
+      this.art.authName = "invite";
+      this.art.authReady = true;
+    }
+    // Google and Logout share the bottom-right slot: exactly one is shown
+    // (and both stay hidden while the help modal covers the row).
+    if (this.logoutBtn) this.logoutBtn.visible = loggedIn && !this.art.showHelp;
+    if (this.googleBtn) this.googleBtn.visible = !loggedIn && !this.art.showHelp;
   }
 
   private refreshLeaderboard(): void {
@@ -553,11 +607,8 @@ export class MenuStep extends GameStep {
   }
 
   private async signInGoogleWithPseudo(): Promise<void> {
-    const user = await signInGoogle();
-    if (!(await needsPseudo(user))) return;
-    const chosen = window.prompt("Choisissez votre pseudo pour le classement", displayName(user));
-    await setPseudo(chosen || displayName(user), user);
-    track("set_pseudo");
+    const { asked } = await signInGoogleWithPseudo();
+    if (asked) track("set_pseudo");
   }
 
   private startGame(): void {

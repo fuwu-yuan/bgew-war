@@ -1,9 +1,11 @@
 import { Board } from "@fuwu-yuan/bgew";
 import { COLORS, GAME_NAME, GAME_VERSION, VIEW_H, VIEW_W } from "./globals";
 import { loadSprites } from "./sprites";
+import { preloadMenuData } from "./firebase";
 import { installNetwork } from "./network";
 import { track } from "./analytics";
 import { applyMute } from "./sound";
+import { SplashStep } from "./steps/splash.step";
 import { MenuStep } from "./steps/menu.step";
 import { PlayStep } from "./steps/game.step";
 import { LobbyStep } from "./steps/lobby.step";
@@ -127,17 +129,23 @@ applyMute();
 /* Network: same protocol as the official server, overridable via ?server= */
 installNetwork(board);
 
+/* Warm the menu data (auth, pseudo, leaderboard) while the splash animates. */
+preloadMenuData();
+
 /* Steps */
+const splash = new SplashStep(board);
 const menu = new MenuStep(board);
 const play = new PlayStep(board);
 const lobby = new LobbyStep(board);
 const salon = new SalonStep(board);
 const end = new EndStep(board);
-board.addSteps([menu, play, lobby, salon, end]);
-board.step = menu;
+board.addSteps([splash, menu, play, lobby, salon, end]);
+// `?splash=off` boots straight to the menu (used by the headless tests).
+const skipSplash = new URLSearchParams(window.location.search).get("splash") === "off";
+board.step = skipSplash ? menu : splash;
 
 /* Test hook for the headless smoke test (harmless in production) */
-(window as unknown as Record<string, unknown>).__bgewwar = { board, steps: { menu, play, lobby, salon, end } };
+(window as unknown as Record<string, unknown>).__bgewwar = { board, steps: { splash, menu, play, lobby, salon, end } };
 
 board.canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 

@@ -1,5 +1,5 @@
 import { Entity } from "@fuwu-yuan/bgew";
-import { BLUE, MAP_H, VIEW_W } from "../globals";
+import { BLUE, GRID_H, MAP_H, VIEW_W } from "../globals";
 import { clamp, TAU } from "../utils";
 import { drawSprite, SPR } from "../sprites";
 import { drawLevelPips } from "./units";
@@ -46,6 +46,8 @@ export class RemoteWorld extends Entity {
   private units = new Map<number, RUnit>();
   private buildings = new Map<number, RBuilding>();
   private lerpT = 0;
+  private lerpDur = LERP_TIME; // interpolation window, adapted to the real snapshot cadence
+  private sinceSnap = 0;
 
   constructor() {
     super(0, 0, VIEW_W, MAP_H);
@@ -59,32 +61,40 @@ export class RemoteWorld extends Entity {
     return false;
   }
 
-  applySnapshot(units: number[][], buildings: number[][]): void {
+  /**
+   * Ingest a host snapshot. Takes the RAW snapshot arrays plus the guest's
+   * `flipped` flag and does the view conversion inline — no per-snapshot array
+   * allocation (the guest used to `.map()` every unit twice per snapshot, which
+   * churned the GC hard during big battles).
+   */
+  applySnapshot(units: number[][], buildings: number[][], flipped: boolean): void {
     const seenU = new Set<number>();
-    for (const [nid, kind, faction, x, y, hp, maxHp, level] of units) {
+    for (const r of units) {
+      const nid = r[0];
+      const y = flipped ? MAP_H - r[4] : r[4];
       seenU.add(nid);
       const u = this.units.get(nid);
       if (u) {
         u.fromX = u.x;
         u.fromY = u.y;
-        u.toX = x;
+        u.toX = r[3];
         u.toY = y;
-        u.hp = hp;
-        u.maxHp = maxHp;
-        u.moving = Math.abs(x - u.fromX) + Math.abs(y - u.fromY) > 1.5;
+        u.hp = r[5];
+        u.maxHp = r[6];
+        u.moving = Math.abs(r[3] - u.fromX) + Math.abs(y - u.fromY) > 1.5;
       } else {
         this.units.set(nid, {
-          kind,
-          faction,
-          x,
+          kind: r[1],
+          faction: r[2],
+          x: r[3],
           y,
-          fromX: x,
+          fromX: r[3],
           fromY: y,
-          toX: x,
+          toX: r[3],
           toY: y,
-          hp,
-          maxHp,
-          level,
+          hp: r[5],
+          maxHp: r[6],
+          level: r[7],
           walkP: Math.random() * TAU,
           moving: false,
         });
@@ -95,24 +105,26 @@ export class RemoteWorld extends Entity {
     }
 
     const seenB = new Set<number>();
-    for (const [nid, typeCode, faction, col, row, hp, maxHp, prog] of buildings) {
+    for (const r of buildings) {
+      const nid = r[0];
+      const row = flipped ? GRID_H - 1 - r[4] : r[4];
       seenB.add(nid);
       const b = this.buildings.get(nid);
       if (b) {
-        b.hp = hp;
-        b.maxHp = maxHp;
-        b.prog = (prog ?? 100) / 100;
+        b.hp = r[5];
+        b.maxHp = r[6];
+        b.prog = (r[7] ?? 100) / 100;
       } else {
         this.buildings.set(nid, {
-          type: BUILDING_TYPES[typeCode],
-          faction,
-          x: col * 40 + 20,
+          type: BUILDING_TYPES[r[1]],
+          faction: r[2],
+          x: r[3] * 40 + 20,
           y: row * 40 + 20,
-          col,
+          col: r[3],
           row,
-          hp,
-          maxHp,
-          prog: (prog ?? 100) / 100,
+          hp: r[5],
+          maxHp: r[6],
+          prog: (r[7] ?? 100) / 100,
           t: Math.random() * 10,
         });
       }
@@ -121,12 +133,17 @@ export class RemoteWorld extends Entity {
       if (!seenB.has(nid)) this.buildings.delete(nid);
     }
 
+    // Interpolate over the ACTUAL gap since the last snapshot (the host throttles
+    // its snapshot rate when there are many units), so motion stays smooth.
+    this.lerpDur = clamp(this.sinceSnap || LERP_TIME, 0.08, 0.3);
+    this.sinceSnap = 0;
     this.lerpT = 0;
   }
 
   update(delta: number): void {
     const dt = Math.min(delta, 50) / 1000;
-    this.lerpT = Math.min(1, this.lerpT + dt / LERP_TIME);
+    this.sinceSnap += dt;
+    this.lerpT = Math.min(1, this.lerpT + dt / this.lerpDur);
     for (const u of this.units.values()) {
       u.x = u.fromX + (u.toX - u.fromX) * this.lerpT;
       u.y = u.fromY + (u.toY - u.fromY) * this.lerpT;
@@ -139,6 +156,10 @@ export class RemoteWorld extends Entity {
 
   draw(ctx: CanvasRenderingContext2D): void {
     super.draw(ctx);
+
+    // In a large swarm, drop the cheapest-but-numerous per-unit extras
+    // (ground shadow + level pips) to keep the guest's frame budget.
+    const lod = this.units.size > 180;
 
     for (const b of this.buildings.values()) {
       const size = BUILDING_SIZE[b.type];
@@ -165,10 +186,12 @@ export class RemoteWorld extends Entity {
         continue;
       }
       const size = u.kind === 1 ? 36 : 26;
-      ctx.fillStyle = "rgba(0,0,0,0.22)";
-      ctx.beginPath();
-      ctx.ellipse(u.x, u.y + size * 0.34, size * 0.3, size * 0.13, 0, 0, TAU);
-      ctx.fill();
+      if (!lod) {
+        ctx.fillStyle = "rgba(0,0,0,0.22)";
+        ctx.beginPath();
+        ctx.ellipse(u.x, u.y + size * 0.34, size * 0.3, size * 0.13, 0, 0, TAU);
+        ctx.fill();
+      }
       const bob = u.moving ? Math.sin(u.walkP) * 1.6 : 0;
       const spr =
         u.kind === 1
@@ -179,7 +202,7 @@ export class RemoteWorld extends Entity {
             ? SPR.B_SOLDIER
             : SPR.R_SOLDIER;
       drawSprite(ctx, spr, u.x, u.y + bob, size);
-      drawLevelPips(ctx, u.level, u.x, u.y - size * 0.72);
+      if (!lod) drawLevelPips(ctx, u.level, u.x, u.y - size * 0.72);
       if (u.hp < u.maxHp) {
         const w = size * 0.8;
         ctx.fillStyle = "rgba(0,0,0,0.5)";

@@ -9,7 +9,7 @@ export const GRID_H = 22; // 880
 export const MAP_H = GRID_H * TILE;
 
 export const GAME_NAME = "BGEW WAR";
-export const GAME_VERSION = "1.4.0";
+export const GAME_VERSION = "1.5.0";
 
 /** Factions */
 export const RED = 1;

@@ -51,7 +51,7 @@ const executablePath =
 
 const browser = await chromium.launch({ executablePath, args: ["--autoplay-policy=no-user-gesture-required"] });
 const errors = [];
-const GAME_URL = `http://localhost:${PORT}/?server=localhost:${NET_PORT}&firebase=off`;
+const GAME_URL = `http://localhost:${PORT}/?server=localhost:${NET_PORT}&firebase=off&splash=off`;
 
 async function openPage(tag) {
   const page = await browser.newPage({ viewport: { width: 700, height: 1080 } });

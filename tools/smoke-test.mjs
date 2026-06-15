@@ -54,7 +54,7 @@ const errors = [];
     if (m.type() === "error") errors.push(`DESKTOP CONSOLE: ${m.text()}`);
   });
 
-  await page.goto(`http://localhost:${PORT}/?firebase=off`, { waitUntil: "networkidle" });
+  await page.goto(`http://localhost:${PORT}/?firebase=off&splash=off`, { waitUntil: "networkidle" });
   await page.waitForTimeout(1800);
   await page.screenshot({ path: "/tmp/bgew-war-1-menu.png" });
 
@@ -251,7 +251,7 @@ const errors = [];
     if (m.type() === "error") errors.push(`MOBILE CONSOLE: ${m.text()}`);
   });
 
-  await page.goto(`http://localhost:${PORT}/?firebase=off`, { waitUntil: "networkidle" });
+  await page.goto(`http://localhost:${PORT}/?firebase=off&splash=off`, { waitUntil: "networkidle" });
   await page.waitForTimeout(1800);
   await page.screenshot({ path: "/tmp/bgew-war-m1-menu.png" });
 
