@@ -1623,6 +1623,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   /** Solo/host: authoritative end. */
   private endGame(winner: Faction): void {
     if (this.ended) return;
+    // Lockstep: the guest runs its own sim, so its local HQ kill can fire a
+    // moment before (or, on drift, disagree with) the host. The host stays
+    // authoritative for the verdict — the guest ends only via the "end" msg.
+    if (this.role === "guest") return;
     if (this.role === "host") {
       // One last snapshot so the guest sees the HQ blow up, then the verdict
       this.sendSnapshot();
