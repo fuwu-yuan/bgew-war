@@ -171,6 +171,20 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     return this.gold[this.myFaction];
   }
 
+  /** Flip-invariant gameplay signature for desync detection (host vs guest). */
+  simSignature(): { t: number; units: number; buildings: number; goldR: number; goldB: number; share: number } {
+    const units = this.role === "guest" ? this.remote?.unitCount ?? 0 : this.units.filter((u) => !u.dead).length;
+    const buildings = this.role === "guest" ? this.remote?.buildingCount ?? 0 : this.buildings.filter((b) => !b.dead).length;
+    return {
+      t: Math.round(this.elapsed),
+      units,
+      buildings,
+      goldR: Math.floor(this.gold[RED]),
+      goldB: Math.floor(this.gold[BLUE]),
+      share: Math.round(this.blueShare * 100),
+    };
+  }
+
   get soldierLevel(): number {
     return this.levels[this.myFaction];
   }

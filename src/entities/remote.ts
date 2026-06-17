@@ -64,6 +64,10 @@ export class RemoteWorld extends Entity {
     return this.units.size;
   }
 
+  get buildingCount(): number {
+    return this.buildings.size;
+  }
+
   /** Real gap (ms) between the last two snapshot arrivals — exposes network jitter. */
   get lastGapMs(): number {
     return Math.round((this.t1 - this.t0) * 1000);
