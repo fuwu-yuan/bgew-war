@@ -63,7 +63,7 @@ const launch = (x) =>
   });
 const browserA = await launch(10);
 const browserB = HEADED ? await launch(720) : browserA;
-const URLB = `http://localhost:${PORT}/?server=localhost:${NET_PORT}&firebase=off&splash=off&bot=1`;
+const URLB = `http://localhost:${PORT}/?server=localhost:${NET_PORT}&firebase=off&splash=off&bot=1&debug=1`;
 
 async function open(browser, tag) {
   const p = await browser.newPage({ viewport: HEADED ? null : { width: 640, height: 1024 } });

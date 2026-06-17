@@ -188,6 +188,28 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     };
   }
 
+  /** `?debug=1` overlay text — every comparable count, by ABSOLUTE faction
+   *  (R/B), so the host and guest screenshots can be diffed number-for-number. */
+  private debugReadout(): string {
+    const u = this.units.filter((x) => !x.dead);
+    const uR = u.filter((x) => x.faction === RED);
+    const uB = u.filter((x) => x.faction === BLUE);
+    const tk = (arr: Unit[]) => arr.filter((x) => x instanceof Tank).length;
+    const h = this.helis.filter((x) => !x.dead);
+    const b = this.buildings.filter((x) => !x.dead);
+    const bR = b.filter((x) => x.faction === RED).length;
+    const bB = b.filter((x) => x.faction === BLUE).length;
+    const corr = this.role === "guest" ? `  corr ${(this.lastSnapBytes / 1024).toFixed(1)}KB` : "";
+    return [
+      `${this.role} t${Math.round(this.elapsed)}  share B ${Math.round(this.blueShare * 100)}%${corr}`,
+      `units  R ${uR.length} (tk ${tk(uR)})  B ${uB.length} (tk ${tk(uB)})`,
+      `heli   R ${h.filter((x) => x.faction === RED).length}  B ${h.filter((x) => x.faction === BLUE).length}`,
+      `bldg   R ${bR}  B ${bB}`,
+      `gold   R ${Math.floor(this.gold[RED])}  B ${Math.floor(this.gold[BLUE])}`,
+      `lvl  s R${this.levels[RED]} B${this.levels[BLUE]}  tk R${this.tankLevels[RED]} B${this.tankLevels[BLUE]}  tu R${this.turretLevels[RED]} B${this.turretLevels[BLUE]}`,
+    ].join("\n");
+  }
+
   get soldierLevel(): number {
     return this.levels[this.myFaction];
   }
@@ -1147,11 +1169,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       };
     }
 
-    if (this.fpsMeter) {
-      const units = this.units.length;
-      const net = this.role === "guest" ? `  corr:${(this.lastSnapBytes / 1024).toFixed(1)}KB` : "";
-      this.fpsMeter.info = `${this.role} u:${units}${net}`;
-    }
+    if (this.fpsMeter) this.fpsMeter.info = this.debugReadout();
 
     this.sweepDead();
     this.bringToFront();
