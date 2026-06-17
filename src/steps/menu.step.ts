@@ -16,6 +16,7 @@ import {
   type LeaderboardEntry,
 } from "../firebase";
 import { track, trackScreen } from "../analytics";
+import { consumeJoinCode } from "../network";
 import { audioReady, drawMuteIcon, isMuted, toggleMute } from "../sound";
 import { openStatsModal } from "../entities/stats-modal";
 
@@ -443,6 +444,13 @@ export class MenuStep extends GameStep {
 
   onEnter(): void {
     this.starting = false;
+    // Arrived via a shared "?join=CODE" link → go straight to the lobby to join.
+    const joinCode = consumeJoinCode();
+    if (joinCode) {
+      this.starting = true;
+      this.board.addEntity(new Fader(0, 1, 300, "#08111f", () => this.board.moveToStep("lobby", { joinCode })));
+      return;
+    }
     this.openingHelp = false;
     this.helpDragging = false;
     this.helpDragged = false;

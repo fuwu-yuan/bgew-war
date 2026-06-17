@@ -1,5 +1,5 @@
 import { Entity } from "@fuwu-yuan/bgew";
-import { BLUE, GRID_H, MAP_H, VIEW_W } from "../globals";
+import { BLUE, GRID_H, MAP_H, RED, VIEW_W } from "../globals";
 import { clamp, TAU } from "../utils";
 import { drawSprite, SPR } from "../sprites";
 import { drawLevelPips } from "./units";
@@ -35,23 +35,43 @@ interface RBuilding {
   t: number; // horloge d'animation (ouvrier)
 }
 
-const LERP_TIME = 0.12; // s — slightly longer than the 100 ms snapshot period
+// Render the world this far in the PAST, interpolating between the two latest
+// snapshots by arrival time. Fixed (NOT adaptive: a changing buffer warps the
+// timeline) and NO extrapolation (overshoot wobbles units that stop at the
+// front). A late snapshot just holds the last position briefly.
+const INTERP_DELAY = 0.1; // s
 
 /**
- * Guest-side mirror of the host simulation: ONE entity that draws every
- * remote unit and building from the latest snapshot, interpolating unit
- * positions between snapshots. No gameplay logic lives here.
+ * Guest-side mirror of the host simulation: ONE entity that draws every remote
+ * unit/building. Unit positions are interpolated on a delayed clock between the
+ * last two snapshots (by arrival time), so jittery snapshot timing never shows.
  */
 export class RemoteWorld extends Entity {
   private units = new Map<number, RUnit>();
   private buildings = new Map<number, RBuilding>();
-  private lerpT = 0;
-  private lerpDur = LERP_TIME; // interpolation window, adapted to the real snapshot cadence
-  private sinceSnap = 0;
+  private clock = 0; // local seconds elapsed (advances every frame)
+  private t0 = 0; // arrival time of the previous snapshot
+  private t1 = 0; // arrival time of the latest snapshot
+  private spawnIndex = new Map<number, number[]>(); // reused per-snapshot static-data lookup
+  private hurtIndex = new Map<number, number>(); // reused per-snapshot damaged-units lookup
 
   constructor() {
     super(0, 0, VIEW_W, MAP_H);
     this.disabled = true;
+  }
+
+  get unitCount(): number {
+    return this.units.size;
+  }
+
+  /** Real gap (ms) between the last two snapshot arrivals — exposes network jitter. */
+  get lastGapMs(): number {
+    return Math.round((this.t1 - this.t0) * 1000);
+  }
+
+  /** Interpolation buffer (ms). */
+  get bufferMs(): number {
+    return Math.round(INTERP_DELAY * 1000);
   }
 
   buildingAtTile(c: number, r: number): boolean {
@@ -62,39 +82,55 @@ export class RemoteWorld extends Entity {
   }
 
   /**
-   * Ingest a host snapshot. Takes the RAW snapshot arrays plus the guest's
-   * `flipped` flag and does the view conversion inline — no per-snapshot array
-   * allocation (the guest used to `.map()` every unit twice per snapshot, which
-   * churned the GC hard during big battles).
+   * Ingest a host snapshot. `units` is DYNAMIC only ([nid, x, y, hp]); `spawns`
+   * ([nid, kind, faction, maxHp, level]) carries each unit's STATIC data once.
+   * View conversion is done inline (no per-snapshot array allocation).
    */
-  applySnapshot(units: number[][], buildings: number[][], flipped: boolean): void {
+  applySnapshot(units: number[][], spawns: number[][], hurt: number[][], buildings: number[][], flipped: boolean): void {
+    // Timestamp this snapshot's arrival; we interpolate between t0 and t1.
+    this.t0 = this.t1;
+    this.t1 = this.clock;
+
+    // Index this snapshot's static data so newly-seen units can be created.
+    const stat = this.spawnIndex;
+    stat.clear();
+    for (const s of spawns) stat.set(s[0], s);
+    // Index the damaged units (everyone else is full-health).
+    const hurtById = this.hurtIndex;
+    hurtById.clear();
+    for (const h of hurt) hurtById.set(h[0], h[1]);
+
     const seenU = new Set<number>();
     for (const r of units) {
       const nid = r[0];
-      const y = flipped ? MAP_H - r[4] : r[4];
+      const x = r[1];
+      const y = flipped ? MAP_H - r[2] : r[2];
       seenU.add(nid);
       const u = this.units.get(nid);
       if (u) {
-        u.fromX = u.x;
-        u.fromY = u.y;
-        u.toX = r[3];
+        // Previous AUTHORITATIVE position becomes the from-point (not the
+        // currently-rendered position) so timing jitter never causes a snap.
+        u.fromX = u.toX;
+        u.fromY = u.toY;
+        u.toX = x;
         u.toY = y;
-        u.hp = r[5];
-        u.maxHp = r[6];
-        u.moving = Math.abs(r[3] - u.fromX) + Math.abs(y - u.fromY) > 1.5;
+        u.hp = hurtById.has(nid) ? (hurtById.get(nid) as number) : u.maxHp;
+        u.moving = Math.abs(x - u.fromX) + Math.abs(y - u.fromY) > 1.5;
       } else {
+        const s = stat.get(nid);
+        const maxHp = s ? s[3] : 1;
         this.units.set(nid, {
-          kind: r[1],
-          faction: r[2],
-          x: r[3],
+          kind: s ? s[1] : 0,
+          faction: s ? s[2] : RED,
+          x,
           y,
-          fromX: r[3],
+          fromX: x,
           fromY: y,
-          toX: r[3],
+          toX: x,
           toY: y,
-          hp: r[5],
-          maxHp: r[6],
-          level: r[7],
+          hp: hurtById.has(nid) ? (hurtById.get(nid) as number) : maxHp,
+          maxHp,
+          level: s ? s[4] : 1,
           walkP: Math.random() * TAU,
           moving: false,
         });
@@ -132,21 +168,19 @@ export class RemoteWorld extends Entity {
     for (const nid of this.buildings.keys()) {
       if (!seenB.has(nid)) this.buildings.delete(nid);
     }
-
-    // Interpolate over the ACTUAL gap since the last snapshot (the host throttles
-    // its snapshot rate when there are many units), so motion stays smooth.
-    this.lerpDur = clamp(this.sinceSnap || LERP_TIME, 0.08, 0.3);
-    this.sinceSnap = 0;
-    this.lerpT = 0;
   }
 
   update(delta: number): void {
     const dt = Math.min(delta, 50) / 1000;
-    this.sinceSnap += dt;
-    this.lerpT = Math.min(1, this.lerpT + dt / this.lerpDur);
+    this.clock += dt;
+    // Interpolate on a clock running INTERP_DELAY in the past, between the two
+    // latest snapshots' arrival times. Clamped, so a late snapshot just holds
+    // the last position instead of snapping/overshooting.
+    const span = this.t1 - this.t0;
+    const a = span > 0 ? clamp((this.clock - INTERP_DELAY - this.t0) / span, 0, 1) : 1;
     for (const u of this.units.values()) {
-      u.x = u.fromX + (u.toX - u.fromX) * this.lerpT;
-      u.y = u.fromY + (u.toY - u.fromY) * this.lerpT;
+      u.x = u.fromX + (u.toX - u.fromX) * a;
+      u.y = u.fromY + (u.toY - u.fromY) * a;
       if (u.moving || u.kind === 2) u.walkP += dt * 11; // l'hélico anime toujours son rotor
     }
     for (const b of this.buildings.values()) {

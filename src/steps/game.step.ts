@@ -28,7 +28,7 @@ import { flipMapData, flipTileIndex, TileMap } from "../entities/tilemap";
 import { Bullet, Soldier, Tank, Unit } from "../entities/units";
 import { Building, BUILDING_CODE, BuildingType } from "../entities/buildings";
 import { Helicopter } from "../entities/helicopter";
-import { Fader, Particle, ScorePopup, Shockwave, StrikeMarker, Tracer } from "../entities/effects";
+import { Fader, FpsMeter, Particle, ScorePopup, Shockwave, StrikeMarker, Tracer } from "../entities/effects";
 import { BuildMode, Hud, HudState } from "../entities/hud";
 import { GameObject } from "../entities/gameobject";
 import { RemoteWorld } from "../entities/remote";
@@ -108,10 +108,13 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private inited = true; // guest: received init from host
   private readyT = 0;
   private snapT = 0;
+  private sentStatic = new Set<number>(); // host: unit nids whose static data the guest already has
+  private fpsMeter: FpsMeter | null = null; // ?debug=1 diagnostic overlay
+  private debug = false;
+  private lastSnapBytes = 0; // approx wire size of the last received snapshot (debug)
 
   /* Anti-cheat: opponent-activity tracking + same-IP detection */
   private oppActed = false; // opponent issued at least one real order
-  private oppLastActT = 0; // elapsed (s) at the opponent's last observed action
   private myActs = 0; // my meaningful actions (host streams this in snapshots)
   private lastSeenActs = 0; // guest: last host action count seen in a snapshot
   private myIpHash: string | null = null;
@@ -291,8 +294,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.hqDefenseUsed = { [RED]: false, [BLUE]: false };
     this.inited = this.role !== "guest";
     this.sfxLast.clear();
+    this.sentStatic.clear();
     this.oppActed = false;
-    this.oppLastActT = 0;
     this.myActs = 0;
     this.lastSeenActs = 0;
     this.myIpHash = null;
@@ -340,6 +343,16 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.hud = new Hud(this);
     this.board.addEntity(this.hud);
     this.topEntities = [this.hud];
+
+    // ?debug=1 → on-screen FPS meter (to tell a CPU stall from snapshot jitter).
+    this.fpsMeter = null;
+    this.debug = new URLSearchParams(window.location.search).get("debug") === "1";
+    this.lastSnapBytes = 0;
+    if (this.debug) {
+      this.fpsMeter = new FpsMeter();
+      this.board.addEntity(this.fpsMeter);
+      this.topEntities.push(this.fpsMeter);
+    }
 
     const fadeIn = new Fader(1, 0, 500);
     this.board.addEntity(fadeIn);
@@ -409,12 +422,13 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         // and the shared match id the guest reports under.
         const init: InitMsg = { type: "init", map: this.map.getInitData(), name: this.myName, uid: this.myUid, matchId: this.matchId };
         this.sendNet(init);
+        // The (re)joined guest knows no units yet → resend every unit's static data.
+        this.sentStatic.clear();
         this.sendSnapshot();
         this.sendNet({ type: "ip", hash: this.myIpHash ?? "" }); // (re)share our IP hash
       } else if (data.type === "cmd") {
-        // The guest issued an order → it's actively playing.
+        // The guest issued an order → it has played at least once.
         this.oppActed = true;
-        this.oppLastActT = this.elapsed;
         this.applyCommand(data as CmdMsg);
       }
       return;
@@ -556,26 +570,39 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   /** Host: world state → guest, ~10 Hz. */
-  private sendSnapshot(): void {
+  private sendSnapshot(period: number = SNAP_EVERY): void {
+    // Split each unit into DYNAMIC state (sent every snapshot) and STATIC data
+    // (sent once, the first time the guest sees it). This roughly halves the
+    // per-snapshot payload — the guest's main cost.
+    const dyn: number[][] = [];
+    const spawns: number[][] = [];
+    const hurt: number[][] = [];
+    const live = new Set<number>();
+    const add = (nid: number, kind: number, faction: number, x: number, y: number, hp: number, maxHp: number, level: number): void => {
+      live.add(nid);
+      dyn.push([nid, x, y]);
+      if (hp < maxHp) hurt.push([nid, hp]); // full-health units cost nothing extra
+      if (!this.sentStatic.has(nid)) {
+        spawns.push([nid, kind, faction, maxHp, level]);
+        this.sentStatic.add(nid);
+      }
+    };
+    for (const u of this.units) {
+      if (!u.dead) add(u.nid, u instanceof Tank ? 1 : 0, u.faction, Math.round(u.cx), Math.round(u.cy), Math.ceil(u.hp), u.maxHp, u.level);
+    }
+    for (const h of this.helis) {
+      if (!h.dead) add(h.nid, 2, h.faction, Math.round(h.cx), Math.round(h.cy), Math.ceil(h.hp), h.maxHp, 1);
+    }
+    // Forget dead units so the static set can't grow unbounded over a long game.
+    if (this.sentStatic.size > live.size) {
+      for (const nid of this.sentStatic) if (!live.has(nid)) this.sentStatic.delete(nid);
+    }
+
     const snap: SnapMsg = {
       type: "snap",
-      units: [
-        ...this.units
-          .filter((u) => !u.dead)
-          .map((u) => [
-            u.nid,
-            u instanceof Tank ? 1 : 0,
-            u.faction,
-            Math.round(u.cx),
-            Math.round(u.cy),
-            Math.ceil(u.hp),
-            u.maxHp,
-            u.level,
-          ]),
-        ...this.helis
-          .filter((h) => !h.dead)
-          .map((h) => [h.nid, 2, h.faction, Math.round(h.cx), Math.round(h.cy), Math.ceil(h.hp), h.maxHp, 1]),
-      ],
+      units: dyn,
+      hurt,
+      spawns,
       buildings: this.buildings
         .filter((b) => !b.dead)
         .map((b) => [
@@ -604,6 +631,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       },
       share: this.map.share(BLUE),
       acts: this.myActs,
+      period,
     };
     this.pShots = [];
     this.pBooms = [];
@@ -615,9 +643,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   /** Guest: render what the host says (converted to the mirrored view). */
   private applySnapshot(snap: SnapMsg): void {
     if (!this.remote) return;
-    // Pass the raw arrays + flip flag: the mirror converts inline (no per-snap
-    // array allocation, which was a big GC cost on the guest in large battles).
-    this.remote.applySnapshot(snap.units, snap.buildings, this.flipped);
+    if (this.debug) this.lastSnapBytes = JSON.stringify(snap).length;
+    // Pass raw arrays + flip flag: the mirror converts inline (no per-snap array
+    // allocation). `spawns` carries static data once.
+    this.remote.applySnapshot(snap.units, snap.spawns ?? [], snap.hurt ?? [], snap.buildings, this.flipped);
     // Buildings may stand where the host cleared a tree/rock — mirror that here
     // so decor doesn't peek out from under a remote building.
     for (const [, , , c, r] of snap.buildings) this.map.clearDecor(this.map.idx(c, this.viewRow(r)));
@@ -662,7 +691,6 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     if (acts > this.lastSeenActs) {
       this.lastSeenActs = acts;
       this.oppActed = true;
-      this.oppLastActT = this.elapsed;
     }
     this.updateHeliLoop(snap.units.some((u) => u[1] === 2));
   }
@@ -1071,19 +1099,23 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       if (this.role === "host") {
         this.snapT -= dt;
         if (this.snapT <= 0) {
-          // Throttle the snapshot rate as the army grows: a full-state packet
-          // 10×/s with hundreds of units floods the guest's ingestion. The
-          // guest interpolates over the real gap, so motion stays smooth.
+          // Mild throttle as the army grows (payload is already ~halved by the
+          // static/dynamic split). The guest interpolates over this exact
+          // period, so motion stays smooth at any rate.
+          // Bandwidth is tiny (~3 KB/snap), so prioritise LOW LATENCY: send
+          // often. The cost is CPU only, negligible at this payload size.
           const n = this.units.length;
-          this.snapT = n > 280 ? 0.18 : n > 160 ? 0.14 : SNAP_EVERY;
-          this.sendSnapshot();
+          const period = n > 320 ? 0.1 : n > 180 ? 0.08 : 0.067; // ~10–15 Hz
+          this.snapT = period;
+          this.sendSnapshot(period);
         }
       }
 
-      // Anti-AFK: an opponent silent for too long stops the match (unranked).
-      // The guest learns of host actions via snap.acts, the host of guest
-      // orders via cmd messages — either way oppLastActT tracks the other side.
-      if (this.role !== "solo" && this.inited && !this.voided && this.elapsed - this.oppLastActT > IDLE_LIMIT) {
+      // Anti-AFK: cancel ONLY when the opponent never plays at all (AFK from
+      // the start). Once they've issued a single order, going quiet later is a
+      // legitimate choice and must NOT void the match. The guest learns of host
+      // actions via snap.acts, the host of guest orders via cmd messages.
+      if (this.role !== "solo" && this.inited && !this.voided && !this.oppActed && this.elapsed > IDLE_LIMIT) {
         this.voidMatch("Adversaire inactif", true);
       }
 
@@ -1103,6 +1135,15 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         x: m.x,
         y: clamp(this.map.frontRowFromTop(mine, this.axisCol[mine]) * TILE, 60, MAP_H - 60),
       };
+    }
+
+    if (this.fpsMeter) {
+      const units = this.role === "guest" ? this.remote?.unitCount ?? 0 : this.units.length;
+      const net =
+        this.role === "guest"
+          ? `  ${(this.lastSnapBytes / 1024).toFixed(1)}KB gap:${this.remote?.lastGapMs ?? 0}ms buf:${this.remote?.bufferMs ?? 0}ms`
+          : "";
+      this.fpsMeter.info = `${this.role} u:${units}${net}`;
     }
 
     this.sweepDead();

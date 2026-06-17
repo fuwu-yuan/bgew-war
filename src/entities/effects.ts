@@ -2,6 +2,38 @@ import { GameObject } from "./gameobject";
 import { FONT, VIEW_W, VIEW_H } from "../globals";
 import { rand, TAU } from "../utils";
 
+/** Tiny on-screen FPS + info readout, toggled with `?debug=1`. Diagnostic only. */
+export class FpsMeter extends GameObject {
+  public info = "";
+  private acc = 0;
+  private frames = 0;
+  private fps = 0;
+
+  constructor() {
+    super(0, 0, 1);
+  }
+
+  update(delta: number): void {
+    this.acc += delta;
+    this.frames++;
+    if (this.acc >= 400) {
+      this.fps = Math.round((this.frames * 1000) / this.acc);
+      this.acc = 0;
+      this.frames = 0;
+    }
+  }
+
+  draw(ctx: CanvasRenderingContext2D): void {
+    super.draw(ctx);
+    ctx.font = "12px monospace";
+    ctx.textAlign = "left";
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(2, 2, 168, 18);
+    ctx.fillStyle = this.fps >= 50 ? "#5dde6a" : this.fps >= 30 ? "#ffd95e" : "#ff5b4d";
+    ctx.fillText(`FPS ${this.fps}  ${this.info}`, 7, 15);
+  }
+}
+
 /** Small square debris/spark — the ad's orange explosions are made of these. */
 export class Particle extends GameObject {
   private vx: number;

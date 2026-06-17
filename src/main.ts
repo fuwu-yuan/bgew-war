@@ -140,8 +140,10 @@ const lobby = new LobbyStep(board);
 const salon = new SalonStep(board);
 const end = new EndStep(board);
 board.addSteps([splash, menu, play, lobby, salon, end]);
-// `?splash=off` boots straight to the menu (used by the headless tests).
-const skipSplash = new URLSearchParams(window.location.search).get("splash") === "off";
+// `?splash=off` (tests) or a `?join=CODE` deep-link skip the splash and boot
+// straight to the menu (which forwards to the lobby for a join link).
+const params = new URLSearchParams(window.location.search);
+const skipSplash = params.get("splash") === "off" || !!params.get("join");
 board.step = skipSplash ? menu : splash;
 
 /* Test hook for the headless smoke test (harmless in production) */

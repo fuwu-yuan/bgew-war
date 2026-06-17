@@ -30,11 +30,6 @@ try {
 }
 const SECURE = window.location.protocol === "https:";
 
-/** Shown in the lobby so players know which backend they are on. */
-export function serverLabel(): string {
-  return OVERRIDE ?? "bgew.stevecohen.fr (officiel)";
-}
-
 /**
  * Extract the game payload from a broadcast SocketMessage.
  * The official server relays the WHOLE client packet ({id, msg}) in
@@ -93,9 +88,11 @@ export function installNetwork(board: Board): void {
  * Game protocol (inside SocketMessage.data)
  * ------------------------------------------------------------------ */
 
-/** Lobby: host → guest when the room is complete */
+/** Lobby: creator → joiner when the room is complete. `creatorHosts` carries
+ *  the random host draw so both sides agree on who runs the simulation. */
 export interface StartMsg {
   type: "start";
+  creatorHosts?: boolean;
 }
 
 /** Guest → host: "I'm in the game step, send me the island" (retried) */
@@ -122,8 +119,16 @@ export interface InitMsg {
 /** Host → guest, ~10 Hz */
 export interface SnapMsg {
   type: "snap";
-  /** [nid, kind(0 soldier/1 tank/2 helico), faction, x, y, hp, maxHp, level] */
+  /** DYNAMIC per-unit state, every snapshot: [nid, x, y]. `hp` is omitted for
+   *  full-health units (the majority) and carried in `hurt` instead. Static
+   *  fields (kind/faction/maxHp/level) are sent ONCE in `spawns`. */
   units: number[][];
+  /** [nid, hp] only for units below full health since last snap. The guest
+   *  treats any live unit not listed here as full-health. */
+  hurt?: number[][];
+  /** Units first seen since the last snapshot: [nid, kind, faction, maxHp, level].
+   *  Sent once per unit (WebSocket/TCP is reliable + ordered, so it can't be lost). */
+  spawns: number[][];
   /** [nid, typeCode, faction, col, row, hp, maxHp, buildPct(0-100)] */
   buildings: number[][];
   /** [tileIndex, owner] since last snap */
@@ -142,6 +147,9 @@ export interface SnapMsg {
   /** Host's cumulative meaningful-action count — the guest uses it to tell
    *  whether the host is actually playing (anti-AFK). */
   acts?: number;
+  /** The host's current snapshot interval (s). The guest interpolates over
+   *  exactly this, so motion stays smooth at any (adaptive) send rate. */
+  period?: number;
 }
 
 /** Host → guest: the war is over */
@@ -184,4 +192,65 @@ export type GameMsg = StartMsg | ReadyMsg | InitMsg | SnapMsg | EndMsg | CmdMsg 
 /** Role passed to the game step via moveToStep data */
 export interface MultiData {
   role: "host" | "guest";
+}
+
+/* ------------------------------------------------------------------ *
+ * Matchmaking / private rooms — encoded in the relay room NAME so no
+ * extra backend is needed. Quick-match rooms carry the creator's win
+ * count (for level grouping); private rooms carry a short join code.
+ * ------------------------------------------------------------------ */
+
+/** `MM|<wins>|<nonce>` — a quick-match room advertising the host's level. */
+export function mmRoomName(wins: number): string {
+  const w = Math.max(0, Math.min(99999, Math.floor(wins || 0)));
+  return `MM|${w}|${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** True for a quick-match room. */
+export function isMatchmakingRoom(name: string): boolean {
+  return !!name && name.startsWith("MM|");
+}
+
+/** The advertised win count of a quick-match room (0 if unparseable). */
+export function mmWins(name: string): number {
+  const w = parseInt((name || "").split("|")[1], 10);
+  return Number.isFinite(w) ? w : 0;
+}
+
+// Unambiguous alphabet (no O/0/I/1) for human-readable join codes.
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/** A fresh 4-character private-room code. */
+export function genJoinCode(): string {
+  let s = "";
+  for (let i = 0; i < 4; i++) s += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
+  return s;
+}
+
+/** `PV|<CODE>` — a private room joinable by code or shared link. */
+export function pvRoomName(code: string): string {
+  return `PV|${code.toUpperCase()}`;
+}
+
+/** The join code of a private room, or null. */
+export function pvCode(name: string): string | null {
+  if (!name || !name.startsWith("PV|")) return null;
+  return name.split("|")[1] || null;
+}
+
+/**
+ * Read (and clear) a `?join=CODE` deep-link param. Cleared from the URL so a
+ * refresh or back-navigation doesn't try to re-join a finished game.
+ */
+export function consumeJoinCode(): string | null {
+  const c = new URLSearchParams(window.location.search).get("join");
+  if (!c) return null;
+  try {
+    const u = new URL(window.location.href);
+    u.searchParams.delete("join");
+    history.replaceState(null, "", u.pathname + u.search + u.hash);
+  } catch {
+    /* history API unavailable — harmless */
+  }
+  return /^[A-Za-z0-9]{4}$/.test(c) ? c.toUpperCase() : null;
 }

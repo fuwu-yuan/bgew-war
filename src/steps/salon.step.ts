@@ -1,23 +1,38 @@
 import { Board, Entities, Entity, GameStep, Network } from "@fuwu-yuan/bgew";
-import { FONT, VIEW_H, VIEW_W } from "../globals";
-import { gameData, serverLabel } from "../network";
+import { COLORS, FONT, VIEW_H, VIEW_W } from "../globals";
+import { gameData } from "../network";
 import { TileMap } from "../entities/tilemap";
 import { Fader } from "../entities/effects";
 import { drawSprite, SPR } from "../sprites";
 import { trackScreen } from "../analytics";
 
 interface SalonData {
-  role: "host" | "guest";
-  roomName: string;
+  seat: "creator" | "joiner";
+  mode: "quick" | "private";
+  code?: string;
+  /** Host (blue) draw, decided at room creation. The joiner reads it from room data. */
+  creatorHosts?: boolean;
 }
 
-/** Waiting-room art: title, room name, the two player slots, status. */
+const BLUE_UI = "#7fd1ff";
+const RED_UI = "#ff8b7a";
+
+/** Waiting-room art: title, (private) code, the two player slots, status. */
 class SalonArt extends Entity {
-  public roomName = "";
-  public isHost = true;
+  public mode: "quick" | "private" = "quick";
+  public isCreator = true;
+  public code = "";
   public opponentIn = false;
   public status = "";
   public statusColor = "#bfd9f2";
+  public copied = false;
+  // Real camp colours, known once the host draw is resolved.
+  public colorsReady = false;
+  public myColor = "#9fc3e4";
+  public enemyColor = "#9fc3e4";
+  public myCamp = "?";
+  public enemyCamp = "?";
+  public myBlue = true;
   private t = 0;
 
   constructor() {
@@ -38,70 +53,82 @@ class SalonArt extends Entity {
     ctx.font = `54px ${FONT}`;
     ctx.lineWidth = 8;
     ctx.strokeStyle = "rgba(0,0,0,0.6)";
-    ctx.strokeText("SALON", VIEW_W / 2, 130);
+    const title = this.mode === "private" ? "PARTIE PRIVEE" : "PARTIE RAPIDE";
+    ctx.strokeText(title, VIEW_W / 2, 122);
     ctx.fillStyle = "#ffffff";
-    ctx.fillText("SALON", VIEW_W / 2, 130);
+    ctx.fillText(title, VIEW_W / 2, 122);
 
-    ctx.font = `22px ${FONT}`;
-    ctx.fillStyle = "#ffe27a";
-    ctx.fillText(this.roomName, VIEW_W / 2, 174);
-    ctx.font = `11px ${FONT}`;
-    ctx.fillStyle = "rgba(159, 195, 228, 0.7)";
-    ctx.fillText(`Serveur : ${serverLabel()}`, VIEW_W / 2, 198);
-
-    // Player slots
-    const dots = ".".repeat(1 + (Math.floor(this.t * 2) % 3));
-    const slot = (
-      y: number,
-      flag: number,
-      title: string,
-      color: string,
-      filled: boolean,
-      who: string
-    ) => {
+    // Private creator: show the code prominently + sharing hint.
+    if (this.mode === "private" && this.isCreator && this.code) {
       ctx.fillStyle = "rgba(10, 25, 45, 0.85)";
-      ctx.fillRect(110, y, VIEW_W - 220, 64);
+      ctx.fillRect(VIEW_W / 2 - 150, 168, 300, 78);
+      ctx.strokeStyle = "rgba(255, 226, 122, 0.7)";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(VIEW_W / 2 - 150, 168, 300, 78);
+      ctx.font = `12px ${FONT}`;
+      ctx.fillStyle = "#9fc3e4";
+      ctx.fillText("CODE DE LA PARTIE", VIEW_W / 2, 192);
+      ctx.font = `40px ${FONT}`;
+      ctx.fillStyle = COLORS.gold;
+      ctx.fillText(this.code.split("").join(" "), VIEW_W / 2, 232);
+      ctx.font = `11px ${FONT}`;
+      ctx.fillStyle = this.copied ? "#5dde6a" : "#bfd9f2";
+      ctx.fillText(this.copied ? "Lien copie !" : "Partage le code ou le lien avec ton ami", VIEW_W / 2, 262);
+    }
+
+    // Player slots — coloured by the player's real camp once known.
+    const dots = ".".repeat(1 + (Math.floor(this.t * 2) % 3));
+    const slotY = this.mode === "private" && this.isCreator ? 296 : 236;
+    const slot = (y: number, label: string, color: string, camp: string, filled: boolean, blue: boolean) => {
+      ctx.fillStyle = "rgba(10, 25, 45, 0.85)";
+      ctx.fillRect(110, y, VIEW_W - 220, 60);
       ctx.strokeStyle = filled ? color : "rgba(120, 140, 160, 0.4)";
       ctx.lineWidth = 2;
-      ctx.strokeRect(110, y, VIEW_W - 220, 64);
-      drawSprite(ctx, flag, 146, y + 32, 34);
+      ctx.strokeRect(110, y, VIEW_W - 220, 60);
+      drawSprite(ctx, this.colorsReady ? (blue ? SPR.B_FLAG : SPR.R_FLAG) : SPR.HEDGEHOG, 144, y + 30, 30);
       ctx.textAlign = "left";
-      ctx.font = `16px ${FONT}`;
+      ctx.font = `15px ${FONT}`;
       ctx.fillStyle = color;
-      ctx.fillText(title, 175, y + 28);
-      ctx.font = `13px ${FONT}`;
+      ctx.fillText(label, 172, y + 26);
+      ctx.font = `12px ${FONT}`;
       ctx.fillStyle = filled ? "#e8f2fc" : "rgba(190, 215, 240, 0.55)";
-      ctx.fillText(filled ? who : `En attente d'un joueur${dots}`, 175, y + 50);
+      const sub = this.colorsReady ? `Camp ${camp}` : "Camp tire au sort…";
+      ctx.fillText(filled ? sub : `En attente d'un joueur${dots}`, 172, y + 46);
       if (filled) {
         ctx.textAlign = "right";
         ctx.fillStyle = "#5dde6a";
         ctx.font = `18px ${FONT}`;
-        ctx.fillText("✓", VIEW_W - 132, y + 40);
+        ctx.fillText("✓", VIEW_W - 132, y + 38);
       }
       ctx.textAlign = "center";
     };
-    slot(252, SPR.B_FLAG, "LES BLEUS", "#7fd1ff", true, this.isHost ? "Vous (hote)" : "L'hote");
-    slot(336, SPR.R_FLAG, "LES ROUGES", "#ff8b7a", this.isHost ? this.opponentIn : true, this.isHost ? "Adversaire connecte" : "Vous");
+    slot(slotY, "VOUS", this.colorsReady ? this.myColor : "#9fc3e4", this.myCamp, true, this.myBlue);
+    slot(slotY + 72, "ADVERSAIRE", this.colorsReady ? this.enemyColor : "#9fc3e4", this.enemyCamp, this.opponentIn, !this.myBlue);
 
     if (this.status) {
       ctx.font = `15px ${FONT}`;
       ctx.fillStyle = this.statusColor;
-      ctx.fillText(this.status, VIEW_W / 2, 452);
+      ctx.fillText(this.status, VIEW_W / 2, slotY + 184);
     }
     ctx.textAlign = "left";
   }
 }
 
 /**
- * The waiting room. The host creates it from the lobby and launches the war
- * when the red player has joined; the guest waits for the launch here.
+ * The waiting room. The host (blue) is drawn at random at room creation so
+ * both sides can show their real colours here. The room CREATOR presses
+ * COMMENCER to launch (quick or private) once the opponent has joined.
  */
 export class SalonStep extends GameStep {
   name = "salon";
 
   private art!: SalonArt;
-  private role: "host" | "guest" = "host";
+  private seat: "creator" | "joiner" = "creator";
+  private mode: "quick" | "private" = "quick";
+  private code = "";
+  private creatorHosts: boolean | null = null;
   private launchBtn: Entities.Button | null = null;
+  private copyBtn: Entities.Button | null = null;
   private leaving = false;
   private pollTimer: ReturnType<GameStep["addTimer"]> | null = null;
 
@@ -109,8 +136,15 @@ export class SalonStep extends GameStep {
     super(board);
   }
 
+  private get nm(): Network.NetworkManager {
+    return this.board.networkManager as Network.NetworkManager;
+  }
+
   onEnter(data: SalonData): void {
-    this.role = data.role;
+    this.seat = data.seat;
+    this.mode = data.mode;
+    this.code = data.code ?? "";
+    this.creatorHosts = typeof data.creatorHosts === "boolean" ? data.creatorHosts : null;
     this.leaving = false;
     this.camera.x = 0;
     this.camera.y = 0;
@@ -118,46 +152,54 @@ export class SalonStep extends GameStep {
 
     this.board.addEntity(new TileMap());
     this.art = new SalonArt();
-    this.art.roomName = data.roomName;
-    this.art.isHost = this.role === "host";
-    this.art.opponentIn = false;
+    this.art.mode = this.mode;
+    this.art.isCreator = this.seat === "creator";
+    this.art.code = this.code;
+    this.art.opponentIn = this.seat === "joiner"; // a joiner already sees both seats filled
     this.board.addEntity(this.art);
+    this.applyColors();
 
-    if (this.role === "host") {
-      this.art.status = "Votre ami doit ouvrir le jeu, MULTIJOUEUR, et rejoindre ce salon";
-      this.launchBtn = this.makeButton(VIEW_W / 2 - 150, 492, "LANCER LA PARTIE", "#ffe27a");
+    // The launch button (creator only), revealed once the opponent is present.
+    if (this.seat === "creator") {
+      if (this.mode === "private") {
+        this.art.status = "Ton ami doit ouvrir le jeu, MULTIJOUEUR, REJOINDRE avec le code";
+        this.copyBtn = this.makeButton(VIEW_W / 2 - 150, 502, "COPIER LE LIEN", "#7fd1ff");
+        this.copyBtn.onMouseEvent("click", () => this.copyLink());
+        this.launchBtn = this.makeButton(VIEW_W / 2 - 150, 564, "COMMENCER LA PARTIE", "#ffe27a");
+      } else {
+        this.art.status = "Recherche d'un adversaire de ton niveau…";
+        this.launchBtn = this.makeButton(VIEW_W / 2 - 150, 470, "COMMENCER LA PARTIE", "#ffe27a");
+      }
       this.launchBtn.visible = false;
       this.launchBtn.onMouseEvent("click", () => this.launch());
-      // The guest may have joined while we were fading in from the lobby
-      const nm = this.board.networkManager as Network.NetworkManager;
-      nm.getOpenedRooms()
+      // Make sure the host draw is stored for the joiner to read.
+      if (this.creatorHosts === null) this.creatorHosts = Math.random() < 0.5;
+      this.applyColors();
+      this.nm.setRoomData({ creatorHosts: this.creatorHosts }, true).catch(() => undefined);
+      // The opponent may have joined while we were fading in.
+      this.nm
+        .getOpenedRooms()
         .then(({ servers }) => {
-          const mine = (servers || []).find((r) => r.uid === nm.roomuid);
-          if (mine && mine.clients.length >= 2) this.onPlayerJoin();
+          const mine = (servers || []).find((r) => r.uid === this.nm.roomuid);
+          if (mine && (mine.clients?.length ?? 0) >= 2) this.onPlayerJoin();
         })
         .catch(() => undefined);
     } else {
-      this.art.opponentIn = true; // guest sees both slots filled
       this.art.status = "En attente du lancement par l'hote…";
-      this.launchBtn = null;
-      // Safety net: if the "start" broadcast gets lost (proxy hiccup…),
-      // the room data flag set by the host still gets us into the war.
-      const nm = this.board.networkManager as Network.NetworkManager;
+      // Learn the host draw (for colours) right away, and keep polling as a
+      // fallback for both the colours and the launch signal.
+      this.refreshFromRoomData();
       this.pollTimer = this.addTimer(
-        2500,
+        2000,
         () => {
           if (this.leaving || this.board.step !== this) return;
-          nm.getRoomData()
-            .then((res) => {
-              if (res.status === "success" && res.data?.started) this.startAsGuest();
-            })
-            .catch(() => undefined);
+          this.refreshFromRoomData();
         },
         true
       );
     }
 
-    const quit = this.makeButton(VIEW_W / 2 - 150, VIEW_H - 130, "QUITTER LE SALON", "rgba(190, 215, 240, 0.6)");
+    const quit = this.makeButton(VIEW_W / 2 - 150, VIEW_H - 120, this.mode === "quick" ? "ANNULER" : "QUITTER LE SALON", "rgba(190, 215, 240, 0.6)");
     quit.onMouseEvent("click", () => this.quit());
 
     this.board.addEntity(new Fader(1, 0, 400));
@@ -165,10 +207,42 @@ export class SalonStep extends GameStep {
 
   onLeave(): void {
     this.launchBtn = null;
+    this.copyBtn = null;
     if (this.pollTimer) {
       this.removeTimer(this.pollTimer);
       this.pollTimer = null;
     }
+  }
+
+  /** Resolve the real camp colours from the host draw + seat. */
+  private applyColors(): void {
+    if (this.creatorHosts === null) {
+      this.art.colorsReady = false;
+      return;
+    }
+    const myBlue = this.seat === "creator" ? this.creatorHosts : !this.creatorHosts;
+    this.art.myBlue = myBlue;
+    this.art.myColor = myBlue ? BLUE_UI : RED_UI;
+    this.art.enemyColor = myBlue ? RED_UI : BLUE_UI;
+    this.art.myCamp = myBlue ? "BLEU" : "ROUGE";
+    this.art.enemyCamp = myBlue ? "ROUGE" : "BLEU";
+    this.art.colorsReady = true;
+  }
+
+  /** Joiner: read room data for the host draw (colours) and the launch flag. */
+  private refreshFromRoomData(): void {
+    this.nm
+      .getRoomData()
+      .then((res) => {
+        if (this.leaving || this.board.step !== this) return;
+        const d = res.status === "success" ? res.data : null;
+        if (d && typeof d.creatorHosts === "boolean" && this.creatorHosts === null) {
+          this.creatorHosts = d.creatorHosts;
+          this.applyColors();
+        }
+        if (d && d.started) this.startAsJoiner(d.creatorHosts === true);
+      })
+      .catch(() => undefined);
   }
 
   /* ------------------------------------------------------------ *
@@ -176,81 +250,97 @@ export class SalonStep extends GameStep {
    * ------------------------------------------------------------ */
 
   onPlayerJoin(): void {
-    if (this.role !== "host") return;
+    if (this.seat !== "creator" || this.leaving) return;
     this.art.opponentIn = true;
-    this.art.status = "Adversaire trouve — a vous de lancer la guerre !";
+    this.board.playSound("coin", false, 0.5);
+    this.art.status = "Adversaire connecte — clique sur COMMENCER !";
     this.art.statusColor = "#7fd1ff";
     if (this.launchBtn) this.launchBtn.visible = true;
-    this.board.playSound("coin", false, 0.5);
   }
 
   onPlayerLeave(): void {
     if (this.leaving) return;
-    if (this.role === "host") {
-      // The guest walked out: back to waiting
+    if (this.seat === "creator") {
       this.art.opponentIn = false;
-      this.art.status = "L'adversaire a quitte le salon…";
-      this.art.statusColor = "#ff8b7a";
+      this.art.status = this.mode === "quick" ? "Recherche d'un adversaire de ton niveau…" : "L'adversaire a quitte le salon…";
+      this.art.statusColor = this.mode === "quick" ? "#bfd9f2" : "#ff8b7a";
       if (this.launchBtn) this.launchBtn.visible = false;
       this.board.playSound("error", false, 0.4);
     } else {
-      // The host is gone: this room is dead
       this.board.playSound("error", false, 0.4);
       this.exitTo("lobby");
     }
   }
 
   onNetworkMessage(msg: Network.SocketMessage): void {
-    if (this.role === "guest" && gameData(msg)?.type === "start") {
-      this.startAsGuest();
+    if (this.seat !== "joiner") return;
+    const d = gameData(msg);
+    if (d?.type === "start") {
+      this.startAsJoiner((d as { creatorHosts?: boolean }).creatorHosts === true);
     }
   }
 
-  private startAsGuest(): void {
-    if (this.leaving) return;
-    this.leaving = true;
-    this.board.playSound("click", false, 0.5);
-    this.board.addEntity(
-      new Fader(0, 1, 450, "#08111f", () => {
-        this.board.moveToStep("game", { multi: { role: "guest" } });
-      })
-    );
-  }
-
-  // Arrow property: the engine passes this handler UNBOUND to rxjs as the
-  // websocket complete-callback (see lobby.step.ts).
+  // Arrow property: the engine passes this UNBOUND to rxjs as the websocket
+  // complete-callback (a plain method would lose `this`).
   onConnectionClosed = (): void => {
     if (this.board.step !== this || this.leaving) return;
     this.exitTo("lobby");
   };
 
   /* ------------------------------------------------------------ *
-   * Actions
+   * Launch
    * ------------------------------------------------------------ */
 
   private launch(): void {
-    if (this.leaving || !this.art.opponentIn) return;
+    if (this.leaving || this.seat !== "creator" || !this.art.opponentIn) return;
     this.leaving = true;
     this.board.playSound("click", false, 0.5);
-    const nm = this.board.networkManager as Network.NetworkManager;
-    nm.closeRoom(nm.roomuid, true).catch(() => undefined);
-    // Flag in room data first: the guest polls it as a fallback in case
-    // the broadcast below never reaches them
-    nm.setRoomData({ started: true }, true).catch(() => undefined);
-    this.board.networkManager.sendMessage({ type: "start" }).catch(() => undefined);
+    const creatorHosts = this.creatorHosts ?? Math.random() < 0.5;
+    this.nm.closeRoom(this.nm.roomuid, true).catch(() => undefined);
+    // Flag in room data first (poll fallback), then broadcast.
+    this.nm.setRoomData({ started: true, creatorHosts }, true).catch(() => undefined);
+    this.board.networkManager.sendMessage({ type: "start", creatorHosts }).catch(() => undefined);
+    this.gotoGame(creatorHosts ? "host" : "guest");
+  }
+
+  private startAsJoiner(creatorHosts: boolean): void {
+    if (this.leaving) return;
+    this.leaving = true;
+    this.board.playSound("click", false, 0.5);
+    this.gotoGame(creatorHosts ? "guest" : "host");
+  }
+
+  private gotoGame(role: "host" | "guest"): void {
     this.board.addEntity(
       new Fader(0, 1, 450, "#08111f", () => {
-        this.board.moveToStep("game", { multi: { role: "host" } });
+        this.board.moveToStep("game", { multi: { role } });
       })
     );
+  }
+
+  /* ------------------------------------------------------------ *
+   * Actions
+   * ------------------------------------------------------------ */
+
+  private copyLink(): void {
+    this.board.playSound("click", false, 0.4);
+    const link = `${window.location.origin}${window.location.pathname}?join=${this.code}`;
+    const done = () => {
+      this.art.copied = true;
+      this.addTimer(2500, () => (this.art.copied = false), false);
+    };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(link).then(done).catch(() => window.prompt("Copie ce lien :", link));
+    } else {
+      window.prompt("Copie ce lien :", link);
+    }
   }
 
   private quit(): void {
     if (this.leaving) return;
     this.board.playSound("click", false, 0.4);
-    if (this.role === "host") {
-      const nm = this.board.networkManager as Network.NetworkManager;
-      nm.closeRoom(nm.roomuid, true).catch(() => undefined);
+    if (this.seat === "creator") {
+      this.nm.closeRoom(this.nm.roomuid, true).catch(() => undefined);
     }
     this.board.networkManager.leaveRoom();
     this.exitTo("lobby");
@@ -267,7 +357,7 @@ export class SalonStep extends GameStep {
   }
 
   private makeButton(x: number, y: number, text: string, color: string): Entities.Button {
-    const btn = new Entities.Button(x, y, 300, 56, text);
+    const btn = new Entities.Button(x, y, 300, 52, text);
     btn.fontFamily = FONT;
     btn.fontSize = 16;
     btn.fontColor = "#ffffff";

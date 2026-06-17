@@ -67,34 +67,45 @@ async function openPage(tag) {
   return { page, at };
 }
 
-const host = await openPage("HOST");
-const guest = await openPage("GUEST");
+const a = await openPage("A");
+const b = await openPage("B");
 
-// Host: MULTIJOUEUR → CREER UNE PARTIE → waiting room (salon)
-await host.page.mouse.click(...host.at(320, 599));
-await host.page.waitForTimeout(900);
-await host.page.mouse.click(...host.at(320, 308));
-await host.page.waitForTimeout(1200);
-await host.page.screenshot({ path: "/tmp/bgew-war-mp-1-host-salon.png" });
-const hostStep = await host.page.evaluate(() => window.__bgewwar.board.step.name);
-if (hostStep !== "salon") errors.push(`FLOW: host should be in the salon, got "${hostStep}"`);
+// Quick match: A searches first (creates a room), B searches ~1.5s later and
+// auto-joins it. The creator (A) then presses COMMENCER to launch. The host
+// (blue) was drawn at room creation, so we detect roles afterwards.
+await a.page.mouse.click(...a.at(320, 599)); // MULTIJOUEUR
+await a.page.waitForTimeout(700);
+await a.page.mouse.click(...a.at(320, 348)); // PARTIE RAPIDE
+await a.page.waitForTimeout(1600);
+await a.page.screenshot({ path: "/tmp/bgew-war-mp-1-search.png" });
 
-// Guest: MULTIJOUEUR → list shows the room → join it → salon too
-await guest.page.mouse.click(...guest.at(320, 599));
-await guest.page.waitForTimeout(900);
-await guest.page.mouse.click(...guest.at(320, 380)); // ACTUALISER
-await guest.page.waitForTimeout(700);
-await guest.page.screenshot({ path: "/tmp/bgew-war-mp-2-guest-list.png" });
-await guest.page.mouse.click(...guest.at(320, 464)); // first room button
-await guest.page.waitForTimeout(1500);
-await guest.page.screenshot({ path: "/tmp/bgew-war-mp-2b-guest-salon.png" });
-const guestStep = await guest.page.evaluate(() => window.__bgewwar.board.step.name);
-if (guestStep !== "salon") errors.push(`FLOW: guest should be in the salon, got "${guestStep}"`);
-await host.page.screenshot({ path: "/tmp/bgew-war-mp-2c-host-salon-full.png" });
+await b.page.mouse.click(...b.at(320, 599)); // MULTIJOUEUR
+await b.page.waitForTimeout(700);
+await b.page.mouse.click(...b.at(320, 348)); // PARTIE RAPIDE
 
-// Host launches the war from the salon
-await host.page.mouse.click(...host.at(320, 520)); // LANCER LA PARTIE
-await host.page.waitForTimeout(1800);
+// They pair up — A (creator) should now be in the salon with the opponent.
+await a.page.waitForTimeout(2800);
+const salonA = await a.page.evaluate(() => window.__bgewwar.board.step.name);
+if (salonA !== "salon") errors.push(`FLOW: creator A should be in salon, got "${salonA}"`);
+await a.page.screenshot({ path: "/tmp/bgew-war-mp-2-salon.png" });
+
+// Creator launches the match manually (no auto-start).
+await a.page.mouse.click(...a.at(320, 496)); // COMMENCER LA PARTIE
+await a.page.waitForTimeout(2500);
+const stepA = await a.page.evaluate(() => window.__bgewwar.board.step.name);
+const stepB = await b.page.evaluate(() => window.__bgewwar.board.step.name);
+if (stepA !== "game") errors.push(`FLOW: page A should be in game, got "${stepA}"`);
+if (stepB !== "game") errors.push(`FLOW: page B should be in game, got "${stepB}"`);
+
+// Random host draw → figure out which page is the game host / guest.
+const roleA = await a.page.evaluate(() => window.__bgewwar.steps.play.role);
+const roleB = await b.page.evaluate(() => window.__bgewwar.steps.play.role);
+console.log(`roles: A=${roleA} B=${roleB}`);
+if (!((roleA === "host" && roleB === "guest") || (roleA === "guest" && roleB === "host"))) {
+  errors.push(`FLOW: expected one host + one guest, got A=${roleA} B=${roleB}`);
+}
+const host = roleA === "host" ? a : b;
+const guest = roleA === "host" ? b : a;
 
 await host.page.screenshot({ path: "/tmp/bgew-war-mp-3-host-game.png" });
 await guest.page.screenshot({ path: "/tmp/bgew-war-mp-4-guest-game.png" });

@@ -206,23 +206,20 @@ class EndArt extends Entity {
     }
     ctx.globalAlpha = 1;
 
-    // The HQ itself — leaning, sunk into the ground, scorched dark
+    // The HQ + its flames share ONE tilted/wobbling transform, so the fire at
+    // the base follows the building's orientation instead of staying flat.
     ctx.save();
     ctx.translate(cx, cy + 14);
     ctx.rotate(((8 + Math.sin(t * 2) * 1.2) * Math.PI) / 180);
     drawSprite(ctx, mineBlue ? SPR.B_HQ : SPR.R_HQ, 0, 0, 104);
     ctx.fillStyle = "rgba(20, 12, 8, 0.42)"; // scorch
     ctx.fillRect(-52, -52, 104, 104);
-    ctx.restore();
-
-    // Flames licking the base
-    ctx.save();
+    // Flames licking the base, in LOCAL space → they tilt with the wreck.
     ctx.globalCompositeOperation = "lighter";
-    const baseY = cy + 58;
     for (let i = 0; i < 8; i++) {
-      const fx = cx - 56 + i * 16;
+      const fx = -56 + i * 16;
       const h = 20 + Math.sin(t * 11 + i * 1.5) * 10 + Math.sin(t * 23 + i) * 4;
-      this.flame(ctx, fx, baseY, 16, h);
+      this.flame(ctx, fx, 46, 16, h);
     }
     ctx.restore();
   }

@@ -186,7 +186,7 @@ export class Hud extends Entity {
     ctx.font = `13px ${FONT}`;
     ctx.fillStyle = COLORS.gold;
     const g = Math.floor(s.myGold);
-    ctx.fillText(g > 999 ? "999+" : `${g}`, 33, MAP_H + 49);
+    ctx.fillText(g > 99999 ? "99999+" : `${g}`, 33, MAP_H + 49);
     // My flag under the gold
     drawSprite(ctx, mine === BLUE ? SPR.B_FLAG : SPR.R_FLAG, 18, MAP_H + 74, 18);
     ctx.font = `9px ${FONT}`;
