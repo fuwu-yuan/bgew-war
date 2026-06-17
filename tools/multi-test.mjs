@@ -132,12 +132,11 @@ console.log(`share host=${(hostShare * 100).toFixed(1)}% guest=${(guestShare * 1
 if (Math.abs(hostShare - guestShare) > 0.03) {
   errors.push(`SYNC: share mismatch host=${hostShare} guest=${guestShare}`);
 }
-const guestUnits = await guest.page.evaluate(() => {
-  const play = window.__bgewwar.steps.play;
-  return play.remote ? play.remote.units.size : -1;
-});
-console.log(`guest sees ${guestUnits} remote units`);
-if (guestUnits < 5) errors.push(`SYNC: guest only sees ${guestUnits} units`);
+// Lockstep: the guest now runs its OWN sim (no `remote` mirror), so it has
+// real units/buildings just like the host.
+const guestUnits = await guest.page.evaluate(() => window.__bgewwar.steps.play.units.filter((u) => !u.dead).length);
+console.log(`guest sim units: ${guestUnits}`);
+if (guestUnits < 5) errors.push(`SYNC: guest only has ${guestUnits} units`);
 
 // Mirror check: the red HQ sits near the top for the host and near the
 // bottom for the guest (rows must be vertical mirrors of each other)
@@ -145,7 +144,7 @@ const hostHqRow = await host.page.evaluate(
   () => window.__bgewwar.steps.play.buildings.find((b) => b.type === "hq" && b.faction === 1)?.row
 );
 const guestHqRow = await guest.page.evaluate(
-  () => [...window.__bgewwar.steps.play.remote.buildings.values()].find((b) => b.type === "hq" && b.faction === 1)?.row
+  () => window.__bgewwar.steps.play.buildings.find((b) => b.type === "hq" && b.faction === 1)?.row
 );
 const gridH = await host.page.evaluate(() => window.__bgewwar.steps.play.map.owner.length / 16);
 const mirrorRow = gridH - 1 - hostHqRow;
