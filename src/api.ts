@@ -11,6 +11,9 @@ export interface GameAPI {
   map: TileMap;
   /** X (px) of the attack axis the faction converges on. */
   axisX(f: Faction): number;
+  /** Vertical orientation: +1 in host space, -1 when the view is mirrored
+   *  (guest). Multiply any "RED goes down / BLUE goes up" direction by this. */
+  flipY(): number;
   /** Closest living enemy unit or building within `range` px. */
   nearestEnemy(x: number, y: number, f: Faction, range: number): Target | null;
   /** Closest living enemy helicopter within `range` px (anti-air : tourelles/QG). */

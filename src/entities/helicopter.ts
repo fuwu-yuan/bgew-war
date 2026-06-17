@@ -77,7 +77,7 @@ export class Helicopter extends GameObject {
     this.t += dt;
     this.fireCd -= dt;
 
-    const dir = this.faction === RED ? 1 : -1; // vers l'ennemi
+    const dir = (this.faction === RED ? 1 : -1) * this.game.flipY(); // vers l'ennemi (miroir-safe)
     this.cy += (this.returning ? -dir : dir) * HELI_SPEED * dt;
     this.cx = clamp(this.cx + Math.sin(this.t * 1.6) * 16 * dt, 18, VIEW_W - 18);
     if (!this.returning && (dir > 0 ? this.cy >= MAP_H - 64 : this.cy <= 64)) {

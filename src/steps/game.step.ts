@@ -354,8 +354,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
       // First squads so the front moves right away
       for (let i = 0; i < 10; i++) {
-        this.spawnSoldier(RED, srand(60, VIEW_W - 60), srand(5, 7) * TILE);
-        this.spawnSoldier(BLUE, srand(60, VIEW_W - 60), srand(GRID_H - 7, GRID_H - 5) * TILE);
+        this.spawnSoldier(RED, srand(60, VIEW_W - 60), this.mirrorY(srand(5, 7) * TILE));
+        this.spawnSoldier(BLUE, srand(60, VIEW_W - 60), this.mirrorY(srand(GRID_H - 7, GRID_H - 5) * TILE));
       }
       // Initial claims are already part of the init payload the guest gets
       this.map.flushDirty();
@@ -885,6 +885,16 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     return this.axisCol[f] * TILE + TILE / 2;
   }
 
+  /** +1 in host space, -1 when the view is mirrored (guest). */
+  flipY(): number {
+    return this.flipped ? -1 : 1;
+  }
+
+  /** Mirror a Y/px coordinate into this client's space (identity on the host). */
+  private mirrorY(y: number): number {
+    return this.flipped ? MAP_H - y : y;
+  }
+
   nearestEnemy(x: number, y: number, f: Faction, range: number): Target | null {
     const seek = enemyOf(f);
     const c0 = Math.floor(x / TILE);
@@ -1202,7 +1212,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   private spawnHqDefenseWave(hq: Building): void {
-    const dir = hq.faction === RED ? 1 : -1;
+    const dir = (hq.faction === RED ? 1 : -1) * this.flipY();
     const enemy = enemyOf(hq.faction);
     const attackers = this.units.filter(
       (u) => !u.dead && u.faction === enemy && u.distTo(hq.cx, hq.cy) <= HQ_DEFENSE_RADIUS

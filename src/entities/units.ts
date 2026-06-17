@@ -67,7 +67,7 @@ export abstract class Unit extends GameObject {
     this.sprSize = o.sprSize;
     this.fireSfx = o.fireSfx;
     this.fireSfxVol = o.fireSfxVol;
-    this.aimY = faction === RED ? 1 : -1;
+    this.aimY = (faction === RED ? 1 : -1) * game.flipY();
   }
 
   get isTank(): boolean {
@@ -111,7 +111,7 @@ export abstract class Unit extends GameObject {
   }
 
   private move(dt: number): void {
-    const dirY = this.faction === RED ? 1 : -1;
+    const dirY = (this.faction === RED ? 1 : -1) * this.game.flipY();
     const desiredX = this.game.axisX(this.faction) + this.lane;
     let vx = clamp((desiredX - this.cx) * 1.4, -this.moveSpd, this.moveSpd) + Math.sin(this.walkT * 2.6) * 9;
     let vy = dirY * this.moveSpd;

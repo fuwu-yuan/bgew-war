@@ -218,7 +218,7 @@ export class Building extends GameObject {
       if (this.waveLeft > 0 && this.waveT <= 0) {
         this.waveLeft--;
         this.waveT = this.stats.waveSpacing ?? 0.25;
-        const dir = this.faction === RED ? 1 : -1;
+        const dir = (this.faction === RED ? 1 : -1) * this.game.flipY();
         const x = this.cx + srand(-14, 14); // sim: spawn position jitter
         const y = this.cy + dir * (TILE * 0.8);
         if (this.type === "barracks") this.game.spawnSoldier(this.faction, x, y, this.soldierLevel);
