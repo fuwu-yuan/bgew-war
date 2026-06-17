@@ -29,16 +29,32 @@ stays tiny (1 snapshot/s vs ~12/s today).
 
 ## Phases (each verified headless: 2 sims, same seed+inputs, compare a state hash)
 - [x] **0. Foundation** — `makeRng` PRNG + share `seed` in `init`. (non-breaking)
-- [ ] **1. Fixed timestep** — accumulator loop; render interpolation; sim no
-      longer reads wall-clock `delta`.
-- [ ] **2. Seed the sim** — route ALL sim random (units/buildings/game.step
-      spawns+combat timing) through the match RNG, in a fixed draw order.
-- [ ] **3. Commands at a tick** — both sides buffer commands by target tick and
-      apply them at the same tick (small input delay).
-- [ ] **4. Guest runs the sim** — drop the `role !== "guest"` gates; the guest
-      simulates locally instead of mirroring.
-- [ ] **5. Correction** — host sends a full snapshot ~1×/s; the guest reconciles
-      (snap buildings, ease unit positions). Detect drift via a cheap checksum.
+- [~] **1. Fixed timestep** — NOT done. Sim still reads wall-clock `delta`
+      (capped per frame). Best-effort determinism instead of bit-exact; the
+      correction channel (below) absorbs the residual drift.
+- [x] **2. Seed the sim** — all sim random (units/buildings/game.step
+      spawns+combat timing) routed through the match RNG via `sim-rng`.
+- [~] **3. Commands at a tick** — NOT done. Commands apply on arrival (apply
+      local + broadcast), not at a shared tick. This is the source of the
+      per-unit drift: the same order lands at a different sim-frame on each
+      client, so the srand stream diverges from that point.
+- [x] **4. Guest runs the sim** — the guest simulates locally in its mirrored
+      view space (`flipY`), no longer mirroring the host frame-by-frame.
+- [~] **5. Correction** — host sends a LEAN snapshot ~2×/s: economy, upgrade
+      levels, anti-AFK action count, and the FULL territory grid (the guest
+      adopts it wholesale, mirrored). Buildings stay synced via the command
+      path. **Unit positions are deliberately NOT reconciled** (decision,
+      2026-06-17): doing so needs a ~1×/s full-unit resync the guest snaps onto,
+      which risks visible jumps; the unit-count drift is purely cosmetic
+      (soldier density) since territory/economy/verdict are authoritative.
+
+## Status (feat/lockstep)
+Functional. Authoritative + corrected each snapshot: territory, economy, upgrade
+levels, and the match verdict (host-authoritative). Verified by the bot-driven
+desync harness (`?bot=1`, two clients, real 90s game): Δterritory ≤3pts, Δgold
+≤10, Δbuildings ≤1 throughout; unit COUNT drifts (cosmetic, bounded). Smoke +
+multi tests green. NOT a bit-exact lockstep — phases 1 & 3 were intentionally
+skipped in favour of best-effort determinism + the correction channel.
 
 ## Rollback
 All of this lives on `feat/lockstep`. `main` keeps the working host-authoritative
