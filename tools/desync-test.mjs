@@ -14,6 +14,7 @@
 import http from "http";
 import { spawn } from "child_process";
 import { readFile } from "fs/promises";
+import { existsSync, readdirSync } from "fs";
 import { extname, join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { chromium } from "playwright-core";
@@ -36,23 +37,45 @@ await new Promise((r) => server.listen(PORT, r));
 const net = spawn(process.execPath, [join(ROOT, "tools", "server.mjs"), String(NET_PORT)], { stdio: ["ignore", "inherit", "inherit"] });
 await new Promise((r) => setTimeout(r, 700));
 
-const exe = process.argv[2] || `${process.env.HOME}/Library/Caches/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-mac-arm64/chrome-headless-shell`;
-const browser = await chromium.launch({ executablePath: exe, args: ["--autoplay-policy=no-user-gesture-required"] });
+// HEADED=1 → real visible windows (needs a FULL chromium, not the headless shell).
+const HEADED = process.env.HEADED === "1";
+function findFullChromium() {
+  const base = `${process.env.HOME}/Library/Caches/ms-playwright`;
+  for (const d of readdirSync(base).filter((x) => x.startsWith("chromium-")).sort().reverse()) {
+    for (const sub of ["chrome-mac-arm64", "chrome-mac"]) {
+      const p = `${base}/${d}/${sub}/Chromium.app/Contents/MacOS/Chromium`;
+      if (existsSync(p)) return p;
+    }
+  }
+  return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+}
+const exe = process.argv[2] || (HEADED ? findFullChromium() : `${process.env.HOME}/Library/Caches/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-mac-arm64/chrome-headless-shell`);
 const errors = [];
+// One browser per player so headed mode shows two side-by-side windows.
+const launch = (x) =>
+  chromium.launch({
+    executablePath: exe,
+    headless: !HEADED,
+    args: ["--autoplay-policy=no-user-gesture-required", ...(HEADED ? [`--window-position=${x},20`, "--window-size=700,940"] : [])],
+  });
+const browserA = await launch(10);
+const browserB = HEADED ? await launch(720) : browserA;
 const URLB = `http://localhost:${PORT}/?server=localhost:${NET_PORT}&firebase=off&splash=off`;
 
-async function open(tag) {
-  const p = await browser.newPage({ viewport: { width: 640, height: 1024 } });
+async function open(browser, tag) {
+  const p = await browser.newPage({ viewport: HEADED ? null : { width: 640, height: 1024 } });
   p.on("pageerror", (e) => errors.push(`${tag} ${e.message}`));
-  const box = await (async () => { await p.goto(URLB, { waitUntil: "networkidle" }); await p.waitForTimeout(1000); return p.locator("#game canvas").boundingBox(); })();
+  await p.goto(URLB, { waitUntil: "networkidle" });
+  await p.waitForTimeout(1000);
+  const box = await p.locator("#game canvas").boundingBox();
   const scale = box.width / 640;
   return { p, at: (x, y) => [box.x + x * scale, box.y + y * scale] };
 }
 const sig = (pg) => pg.evaluate(() => window.__bgewwar.steps.play.simSignature());
 const step = (pg) => pg.evaluate(() => window.__bgewwar.board.step.name);
 
-const A = await open("A");
-const B = await open("B");
+const A = await open(browserA, "A");
+const B = await open(browserB, "B");
 
 // Quick match: A searches & creates, B joins, A presses COMMENCER.
 await A.p.mouse.click(...A.at(320, 599)); await A.p.waitForTimeout(700);
@@ -86,4 +109,7 @@ for (const t of samples) {
 }
 
 console.log(errors.length ? "ERRORS:\n" + errors.join("\n") : "run ok ✓ (screenshots in /tmp/desync-*.png)");
-await browser.close(); server.close(); net.kill();
+if (HEADED) { console.log("watch the two windows… closing in 40s"); await A.p.waitForTimeout(40000); }
+await browserA.close();
+if (HEADED) await browserB.close();
+server.close(); net.kill();
