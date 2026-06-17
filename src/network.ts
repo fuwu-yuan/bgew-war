@@ -114,6 +114,9 @@ export interface InitMsg {
   uid?: string;
   /** Shared match id (host-generated) the Cloud Function correlates on. */
   matchId?: string;
+  /** Shared RNG seed (host-generated) so both clients' sims draw the same
+   *  random sequence — foundation for the lockstep branch. */
+  seed?: number;
 }
 
 /** Host → guest, ~10 Hz */

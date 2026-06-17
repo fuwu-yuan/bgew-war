@@ -37,6 +37,33 @@ export function formatTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+/**
+ * Deterministic PRNG (mulberry32). Same seed → same sequence on any machine
+ * (integer math only, no transcendental drift). The lockstep simulation draws
+ * ALL its randomness from one of these so both clients stay in sync; cosmetic
+ * randomness keeps using Math.random (it never touches sim state).
+ */
+export function makeRng(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Seeded equivalents of rand/randInt/pick, drawing from a makeRng() function. */
+export function rngRange(rng: () => number, min: number, max: number): number {
+  return min + rng() * (max - min);
+}
+export function rngInt(rng: () => number, min: number, max: number): number {
+  return Math.floor(min + rng() * (max - min + 1));
+}
+export function rngPick<T>(rng: () => number, arr: T[]): T {
+  return arr[Math.floor(rng() * arr.length)];
+}
+
 /** SHA-256 hex digest (Web Crypto). Used to compare IPs without sharing them. */
 export async function sha256(text: string): Promise<string> {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));

@@ -126,6 +126,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private matchId = "";
   private myUid = "";
   private enemyUid = "";
+  /* Lockstep foundation: shared RNG seed (host-minted, sent in init). */
+  private matchSeed = 0;
   private nextNid = 1;
   private pShots: number[][] = [];
   private pBooms: number[][] = [];
@@ -253,6 +255,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.myUid = u && !u.isAnonymous ? u.uid : "";
     this.enemyUid = "";
     this.matchId = this.role === "host" ? newMatchId() : "";
+    this.matchSeed = this.role === "host" ? (Math.floor(Math.random() * 0xffffffff) >>> 0) : 0;
 
     trackScreen("game");
     track("game_start", { mode: this.role, faction: this.myFaction === RED ? "red" : "blue" });
@@ -420,7 +423,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         if (typeof data.uid === "string") this.enemyUid = data.uid;
         // (Re)send the island + an immediate snapshot, carrying our name, uid
         // and the shared match id the guest reports under.
-        const init: InitMsg = { type: "init", map: this.map.getInitData(), name: this.myName, uid: this.myUid, matchId: this.matchId };
+        const init: InitMsg = { type: "init", map: this.map.getInitData(), name: this.myName, uid: this.myUid, matchId: this.matchId, seed: this.matchSeed };
         this.sendNet(init);
         // The (re)joined guest knows no units yet → resend every unit's static data.
         this.sentStatic.clear();
@@ -440,6 +443,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       if (typeof initMsg.name === "string") this.enemyName = initMsg.name || "Invite";
       if (typeof initMsg.uid === "string") this.enemyUid = initMsg.uid;
       if (typeof initMsg.matchId === "string") this.matchId = initMsg.matchId;
+      if (typeof initMsg.seed === "number") this.matchSeed = initMsg.seed;
       const init = initMsg.map;
       this.map.applyInit(this.flipped ? flipMapData(init) : init);
       this.inited = true;
