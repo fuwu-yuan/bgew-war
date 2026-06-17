@@ -2,6 +2,7 @@ import { GameObject } from "./gameobject";
 import { GameAPI, Target } from "../api";
 import { BLUE, COLORS, Faction, MAP_H, RED, VIEW_W } from "../globals";
 import { clamp, rand, TAU } from "../utils";
+import { srand } from "../sim-rng";
 import { drawSprite, SPR } from "../sprites";
 
 /**
@@ -27,10 +28,10 @@ export abstract class Unit extends GameObject {
   protected fireSfx: string;
   protected fireSfxVol: number;
 
-  private cd = rand(0.2, 1);
-  private convertCd = rand(0.05, 0.3);
-  private lane = rand(-100, 100);
-  private walkT = rand(0, TAU);
+  private cd = srand(0.2, 1); // sim: fire cooldown
+  private convertCd = srand(0.05, 0.3); // sim: tile-conversion timing
+  private lane = srand(-100, 100); // sim: movement lane offset
+  private walkT = rand(0, TAU); // cosmetic — keeps Math.random
   private walking = false;
   private muzzleT = 0;
   private aimX = 0;
@@ -86,7 +87,7 @@ export abstract class Unit extends GameObject {
       this.aimX = target.cx - this.cx;
       this.aimY = target.cy - this.cy;
       if (this.cd <= 0) {
-        this.cd = this.firePeriod * rand(0.85, 1.15);
+        this.cd = this.firePeriod * srand(0.85, 1.15);
         this.muzzleT = 0.06;
         this.game.fireBullet(this.cx, this.cy, target, this.dmgVal, this.faction, this.isTank);
         this.game.sfx(this.fireSfx, this.fireSfxVol);
@@ -183,7 +184,7 @@ export class Soldier extends Unit {
       dmg: 1 + 0.5 * (level - 1),
       range: 90 + 5 * (level - 1),
       firePeriod: 1 * Math.pow(0.95, level - 1),
-      speed: rand(48, 62) + 5 * (level - 1),
+      speed: srand(48, 62) + 5 * (level - 1),
       spr: faction === BLUE ? SPR.B_SOLDIER : SPR.R_SOLDIER,
       sprSize: 26,
       fireSfx: `shot${1 + Math.floor(Math.random() * 3)}`,

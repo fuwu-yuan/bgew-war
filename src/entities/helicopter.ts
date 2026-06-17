@@ -13,6 +13,7 @@ import {
   VIEW_W,
 } from "../globals";
 import { clamp, rand, TAU } from "../utils";
+import { srand } from "../sim-rng";
 import { drawSprite, SPR } from "../sprites";
 
 /** Rendu partagé hôte/invité : ombre décalée au sol, sprite qui plane, rotor animé. */
@@ -90,7 +91,7 @@ export class Helicopter extends GameObject {
     if (this.fireCd <= 0) {
       const target = this.game.nearestEnemy(this.cx, this.cy, this.faction, HELI_RANGE);
       if (target) {
-        this.fireCd = HELI_FIRE_PERIOD * rand(0.85, 1.15);
+        this.fireCd = HELI_FIRE_PERIOD * srand(0.85, 1.15);
         this.game.fireBullet(this.cx, this.cy, target, HELI_DMG, this.faction, false);
         this.game.sfx("shot2", 0.1);
       }

@@ -24,6 +24,7 @@ import {
   turretUpgradeCost,
 } from "../globals";
 import { clamp, pick, rand, randInt, sha256, TAU } from "../utils";
+import { seedSim, srand } from "../sim-rng";
 import { flipMapData, flipTileIndex, TileMap } from "../entities/tilemap";
 import { Bullet, Soldier, Tank, Unit } from "../entities/units";
 import { Building, BUILDING_CODE, BuildingType } from "../entities/buildings";
@@ -256,6 +257,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.enemyUid = "";
     this.matchId = this.role === "host" ? newMatchId() : "";
     this.matchSeed = this.role === "host" ? (Math.floor(Math.random() * 0xffffffff) >>> 0) : 0;
+    // Seed the sim RNG now for the host/solo (which run the sim). The guest
+    // reseeds when it receives the host's seed in `init`.
+    if (this.role !== "guest") seedSim(this.role === "solo" ? (Math.floor(Math.random() * 0xffffffff) >>> 0) : this.matchSeed);
 
     trackScreen("game");
     track("game_start", { mode: this.role, faction: this.myFaction === RED ? "red" : "blue" });
@@ -336,8 +340,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
       // First squads so the front moves right away
       for (let i = 0; i < 10; i++) {
-        this.spawnSoldier(RED, rand(60, VIEW_W - 60), rand(5, 7) * TILE);
-        this.spawnSoldier(BLUE, rand(60, VIEW_W - 60), rand(GRID_H - 7, GRID_H - 5) * TILE);
+        this.spawnSoldier(RED, srand(60, VIEW_W - 60), srand(5, 7) * TILE);
+        this.spawnSoldier(BLUE, srand(60, VIEW_W - 60), srand(GRID_H - 7, GRID_H - 5) * TILE);
       }
       // Initial claims are already part of the init payload the guest gets
       this.map.flushDirty();
@@ -443,7 +447,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       if (typeof initMsg.name === "string") this.enemyName = initMsg.name || "Invite";
       if (typeof initMsg.uid === "string") this.enemyUid = initMsg.uid;
       if (typeof initMsg.matchId === "string") this.matchId = initMsg.matchId;
-      if (typeof initMsg.seed === "number") this.matchSeed = initMsg.seed;
+      if (typeof initMsg.seed === "number") {
+        this.matchSeed = initMsg.seed;
+        seedSim(this.matchSeed); // align the guest's sim RNG with the host
+      }
       const init = initMsg.map;
       this.map.applyInit(this.flipped ? flipMapData(init) : init);
       this.inited = true;
@@ -1205,13 +1212,13 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       const spread = i % 2 === 0 ? -1 : 1;
       this.spawnSoldier(
         hq.faction,
-        hq.cx + spread * rand(18, 150),
-        hq.cy + dir * rand(35, 165),
+        hq.cx + spread * srand(18, 150),
+        hq.cy + dir * srand(35, 165),
         this.levels[hq.faction]
       );
     }
     for (let i = 0; i < tanks; i++) {
-      this.spawnTank(hq.faction, hq.cx + rand(-130, 130), hq.cy + dir * rand(55, 150));
+      this.spawnTank(hq.faction, hq.cx + srand(-130, 130), hq.cy + dir * srand(55, 150));
     }
     this.popup(hq.cx, hq.cy - 54, `DEFENSE QG +${soldiers}`, hq.faction === RED ? 1 : 0);
     this.spawnEffect(new Shockwave(hq.cx, hq.cy, 150, "#ffffff", 0.55));
