@@ -113,6 +113,31 @@ export class TileMap extends Entity {
     return out;
   }
 
+  /** The whole ownership grid as a compact digit string (0 none, 1 red, 2 blue). */
+  ownerString(): string {
+    const a = new Array<number>(this.owner.length);
+    for (let i = 0; i < this.owner.length; i++) a[i] = this.owner[i];
+    return a.join("");
+  }
+
+  /**
+   * Adopt an authoritative ownership grid wholesale (lockstep correction).
+   * `flip` mirrors it vertically for the guest's flipped view. Changed tiles
+   * flash like a conquest so the resync reads as natural front-line movement.
+   */
+  applyOwnerString(grid: string, flip: boolean): void {
+    if (grid.length !== this.owner.length) return;
+    for (let i = 0; i < grid.length; i++) {
+      const v = grid.charCodeAt(i) - 48; // '0' → 0
+      const j = flip ? flipTileIndex(i) : i;
+      if (this.owner[j] !== v) {
+        this.owner[j] = v;
+        this.flash[j] = 1;
+        this.chests.delete(j);
+      }
+    }
+  }
+
   /** Apply a remote owner change (guest side) — flashes like a conquest. */
   setOwner(i: number, owner: number, flash = true): void {
     if (i < 0 || i >= this.owner.length || this.owner[i] === owner) return;

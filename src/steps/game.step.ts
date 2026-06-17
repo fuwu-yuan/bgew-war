@@ -163,6 +163,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private ended = false;
   private brainT = BRAIN_EVERY;
   private aiPosture: AiPosture = "counter";
+  /** `?bot=1` — auto-play MY faction through the command path (desync tests). */
+  private botMode = false;
+  private botT = BRAIN_EVERY;
   private incomeT = INCOME_EVERY;
   private buckets: Target[][] = [];
   private sfxLast = new Map<string, number>();
@@ -346,7 +349,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
     // ?debug=1 → on-screen FPS meter (to tell a CPU stall from snapshot jitter).
     this.fpsMeter = null;
-    this.debug = new URLSearchParams(window.location.search).get("debug") === "1";
+    const qs = new URLSearchParams(window.location.search);
+    this.debug = qs.get("debug") === "1";
+    this.botMode = qs.get("bot") === "1";
+    this.botT = BRAIN_EVERY;
     this.lastSnapBytes = 0;
     if (this.debug) {
       this.fpsMeter = new FpsMeter();
@@ -617,57 +623,35 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     }
   }
 
-  /** Host: world state → guest, ~10 Hz. */
+  /**
+   * Host → guest authoritative correction (~2 Hz). Lockstep: the guest runs
+   * its OWN sim, so this is deliberately LEAN — no per-unit stream, no effects.
+   * It carries only what the guest can't derive on its own and must not be left
+   * to drift: the faction economy, upgrade levels, the action counter (anti-AFK)
+   * and the FULL territory grid (the scoreboard + win-condition surface). A few
+   * hundred bytes instead of the old multi-kilobyte world snapshot.
+   */
   private sendSnapshot(period: number = SNAP_EVERY): void {
-    // Split each unit into DYNAMIC state (sent every snapshot) and STATIC data
-    // (sent once, the first time the guest sees it). This roughly halves the
-    // per-snapshot payload — the guest's main cost.
-    const dyn: number[][] = [];
-    const spawns: number[][] = [];
-    const hurt: number[][] = [];
-    const live = new Set<number>();
-    const add = (nid: number, kind: number, faction: number, x: number, y: number, hp: number, maxHp: number, level: number): void => {
-      live.add(nid);
-      dyn.push([nid, x, y]);
-      if (hp < maxHp) hurt.push([nid, hp]); // full-health units cost nothing extra
-      if (!this.sentStatic.has(nid)) {
-        spawns.push([nid, kind, faction, maxHp, level]);
-        this.sentStatic.add(nid);
-      }
-    };
-    for (const u of this.units) {
-      if (!u.dead) add(u.nid, u instanceof Tank ? 1 : 0, u.faction, Math.round(u.cx), Math.round(u.cy), Math.ceil(u.hp), u.maxHp, u.level);
-    }
-    for (const h of this.helis) {
-      if (!h.dead) add(h.nid, 2, h.faction, Math.round(h.cx), Math.round(h.cy), Math.ceil(h.hp), h.maxHp, 1);
-    }
-    // Forget dead units so the static set can't grow unbounded over a long game.
-    if (this.sentStatic.size > live.size) {
-      for (const nid of this.sentStatic) if (!live.has(nid)) this.sentStatic.delete(nid);
-    }
+    // Drain the per-snapshot effect/dirty queues so they can't grow unbounded
+    // (the guest produces its own effects locally; they're not transmitted).
+    this.pShots = [];
+    this.pBooms = [];
+    this.pPops = [];
+    this.pWarns = [];
+    this.map.flushDirty();
 
     const snap: SnapMsg = {
       type: "snap",
-      units: dyn,
-      hurt,
-      spawns,
-      buildings: this.buildings
-        .filter((b) => !b.dead)
-        .map((b) => [
-          b.nid,
-          BUILDING_CODE[b.type],
-          b.faction,
-          b.col,
-          b.row,
-          Math.ceil(b.hp),
-          b.maxHp,
-          Math.round(b.buildProgress * 100),
-        ]),
-      own: this.map.flushDirty(),
-      shots: this.pShots,
-      booms: this.pBooms,
-      pops: this.pPops,
-      warns: this.pWarns,
+      units: [],
+      hurt: [],
+      spawns: [],
+      buildings: [],
+      own: [],
+      grid: this.map.ownerString(),
+      shots: [],
+      booms: [],
+      pops: [],
+      warns: [],
       gold: { red: this.gold[RED], blue: this.gold[BLUE] },
       lvl: {
         red: this.levels[RED],
@@ -681,10 +665,6 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       acts: this.myActs,
       period,
     };
-    this.pShots = [];
-    this.pBooms = [];
-    this.pPops = [];
-    this.pWarns = [];
     this.sendNet(snap);
   }
 
@@ -699,6 +679,13 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     // Light authoritative correction: the guest runs its own sim for smooth,
     // network-independent unit motion; we only reconcile the faction-wide
     // economy + upgrade levels (units/territory drift is tiny and self-similar).
+    // Territory is authoritative: adopt the host's full ownership grid wholesale
+    // (mirrored for our flipped view). This snaps the scoreboard + front line back
+    // every snapshot, so per-unit drift can never accumulate into a wrong map.
+    if (snap.grid) {
+      this.map.applyOwnerString(snap.grid, this.flipped);
+      this.blueShare = this.map.share(BLUE);
+    }
     this.gold[RED] = snap.gold.red;
     this.gold[BLUE] = snap.gold.blue;
     this.levels[RED] = snap.lvl.red;
@@ -1105,6 +1092,17 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
             this.redBrain();
           }
           this.redPanic(dt);
+        }
+
+        // `?bot=1`: drive MY faction with the solo AI's reflexes, but route
+        // every order through the command path (apply local + broadcast) so
+        // both clients play a real, escalating game — the lockstep desync test.
+        if (this.botMode) {
+          this.botT -= dt;
+          if (this.botT <= 0) {
+            this.botT = BRAIN_EVERY;
+            this.playerBot();
+          }
         }
 
         this.updateHqDefense(dt);
@@ -1518,6 +1516,176 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
     }
     return best;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Test bot (`?bot=1`) — plays MY faction via the command path
+   *
+   * The mirror means that, on every screen, "my faction" sits at the
+   * bottom and pushes upward, so one faction-generic brain works for the
+   * host (blue) and the guest (red) alike. Decisions use Math.random/
+   * randInt (NOT the sim RNG), so the bot's thinking never perturbs the
+   * deterministic srand stream — only the orders it emits do, exactly as
+   * a human tap would. Every order goes through bot* emitters that apply
+   * locally AND broadcast, so both sims run the same escalating game.
+   * ---------------------------------------------------------------- */
+
+  private playerBot(): void {
+    if (this.elapsed < AI_GRACE) return;
+    const me = this.myFaction;
+    const foe = enemyOf(me);
+    const g = this.gold[me];
+    const reserve = AI_MIN_RESERVE;
+
+    // Keep the attack axis on the hottest column (free, like the solo AI).
+    this.botAxis(this.contestedCol());
+
+    const alive = this.buildings.filter((b) => !b.dead);
+    const myB = (t: BuildingType) => alive.filter((b) => b.faction === me && b.type === t).length;
+    const myUnits = this.units.filter((u) => !u.dead && u.faction === me).length;
+    const foeUnits = this.units.filter((u) => !u.dead && u.faction === foe).length;
+
+    // 1) Airstrike a dense enemy pack.
+    if (g >= COST.strike + reserve) {
+      const pack = this.densestPack(foe, 4);
+      if (pack) {
+        this.botStrike(pack.x, pack.y);
+        return;
+      }
+    }
+    // 2) Helico raid now and then, down a contested column.
+    if (g >= COST.helico + reserve && Math.random() < 0.32) {
+      this.botHeli(this.columnCenter(this.contestedCol()));
+      return;
+    }
+    // 3) Upgrade to answer the current pressure.
+    if (Math.random() < 0.4) {
+      const kind: UpgradeKind = foeUnits > myUnits + 8 ? "turret" : Math.random() < 0.5 ? "soldier" : "tank";
+      if (g >= this.upgradeCostFor(me, kind) + reserve) {
+        this.botUpgrade(kind);
+        return;
+      }
+    }
+    // 4) Otherwise expand production / defense behind the front.
+    const maxBarracks = Math.min(6, 4 + Math.floor(this.elapsed / 90));
+    let want: "barracks" | "factory" | "turret" | null = null;
+    if (foeUnits > myUnits + 10 && myB("turret") < 5 && g >= COST.turret + reserve) want = "turret";
+    else if (myB("barracks") < maxBarracks && g >= COST.barracks + reserve * 0.4) want = "barracks";
+    else if (myB("factory") < 2 && g >= COST.factory + reserve) want = "factory";
+    else if (myB("turret") < 4 && g >= COST.turret + reserve) want = "turret";
+    else if (g >= COST.barracks + reserve + 30) want = "barracks";
+    if (want) this.botTryBuild(want);
+  }
+
+  /** Centre of mass of the densest cluster of `f`'s units (≥ minUnits within a strike radius). */
+  private densestPack(f: Faction, minUnits: number): { x: number; y: number } | null {
+    const us = this.units.filter((u) => !u.dead && u.faction === f);
+    let best: { x: number; y: number } | null = null;
+    let bestCount = minUnits;
+    for (const u of us) {
+      let count = 0;
+      let sx = 0;
+      let sy = 0;
+      for (const o of us) {
+        if (Math.hypot(o.cx - u.cx, o.cy - u.cy) <= STRIKE_RADIUS) {
+          count++;
+          sx += o.cx;
+          sy += o.cy;
+        }
+      }
+      if (count > bestCount) {
+        bestCount = count;
+        best = { x: sx / count, y: sy / count };
+      }
+    }
+    return best;
+  }
+
+  /** The column where my front and the enemy's are closest — the live battle line. */
+  private contestedCol(): number {
+    const me = this.myFaction;
+    const foe = enemyOf(me);
+    let best = 8;
+    let bestGap = Infinity;
+    for (let c = 0; c < GRID_W; c++) {
+      if (!this.map.isLand(c, 1) && !this.map.isLand(c, GRID_H - 2)) continue;
+      const gap = this.map.frontRowFromTop(me, c) - this.map.frontRowFromTop(foe, c);
+      if (gap < bestGap) {
+        bestGap = gap;
+        best = c;
+      }
+    }
+    return clamp(best + randInt(-1, 1), 0, GRID_W - 1);
+  }
+
+  /** Find an owned, buildable tile just behind my front and raise `kind` there. */
+  private botTryBuild(kind: "barracks" | "factory" | "turret"): void {
+    const me = this.myFaction;
+    const axis = this.axisCol[me];
+    for (let tries = 0; tries < 20; tries++) {
+      const c = clamp(axis + randInt(-4, 4), 0, GRID_W - 1);
+      const front = this.map.frontRowFromTop(me, c); // smallest row I own (toward the enemy)
+      const r = clamp(front + randInt(0, 3), 1, GRID_H - 2); // a touch behind it
+      if (this.canBotBuildAt(me, c, r)) {
+        this.botBuild(kind, c, r);
+        return;
+      }
+    }
+    // Fallback: spread out around my HQ so saved gold still becomes useful.
+    const hq = this.buildings.find((b) => !b.dead && b.type === "hq" && b.faction === me);
+    if (!hq) return;
+    for (let tries = 0; tries < 12; tries++) {
+      const c = clamp(hq.col + randInt(-4, 4), 0, GRID_W - 1);
+      const r = clamp(hq.row + randInt(-5, -1), 1, GRID_H - 2); // toward the enemy = up = smaller row
+      if (this.canBotBuildAt(me, c, r)) {
+        this.botBuild(kind, c, r);
+        return;
+      }
+    }
+  }
+
+  private canBotBuildAt(f: Faction, c: number, r: number): boolean {
+    const i = this.map.idx(c, r);
+    return this.map.isLand(c, r) && this.map.owner[i] === f && !this.buildingAt.has(i) && !this.map.hasChest(i);
+  }
+
+  /* Bot order emitters — mirror handleTap's network path, minus the UI. */
+  private botBuild(kind: "barracks" | "factory" | "turret", c: number, r: number): void {
+    const me = this.myFaction;
+    this.gold[me] -= COST[kind];
+    this.myActs++;
+    this.placeBuilding(me, kind, c, r);
+    this.sendNet({ type: "cmd", cmd: "build", kind, c, r: this.viewRow(r) });
+  }
+
+  private botStrike(x: number, y: number): void {
+    const me = this.myFaction;
+    this.gold[me] -= COST.strike;
+    this.myActs++;
+    this.scheduleStrike(x, y, me);
+    this.sendNet({ type: "cmd", cmd: "strike", x: Math.round(x), y: Math.round(this.viewY(y)) });
+  }
+
+  private botHeli(x: number): void {
+    const me = this.myFaction;
+    this.gold[me] -= COST.helico;
+    this.myActs++;
+    this.spawnHeli(me, x);
+    this.sendNet({ type: "cmd", cmd: "helico", x: Math.round(x) });
+  }
+
+  private botAxis(c: number): void {
+    const me = this.myFaction;
+    if (this.axisCol[me] === c) return;
+    this.axisCol[me] = c;
+    this.myActs++;
+    this.sendNet({ type: "cmd", cmd: "axis", col: c });
+  }
+
+  private botUpgrade(kind: UpgradeKind): void {
+    this.myActs++;
+    this.buyUpgrade(this.myFaction, kind); // pays internally
+    this.sendNet({ type: "cmd", cmd: "upgrade", kind });
   }
 
   /* ---------------------------------------------------------------- *

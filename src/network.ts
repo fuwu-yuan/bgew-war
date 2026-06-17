@@ -134,8 +134,11 @@ export interface SnapMsg {
   spawns: number[][];
   /** [nid, typeCode, faction, col, row, hp, maxHp, buildPct(0-100)] */
   buildings: number[][];
-  /** [tileIndex, owner] since last snap */
+  /** [tileIndex, owner] since last snap (legacy delta path) */
   own: number[][];
+  /** Lockstep: the FULL ownership grid as a digit string (0/1/2), so the guest
+   *  resyncs territory wholesale each snapshot — territory is authoritative. */
+  grid?: string;
   /** [x, y, tx, ty, big] tracers fired since last snap */
   shots: number[][];
   /** [x, y, big] explosions since last snap */

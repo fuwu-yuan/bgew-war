@@ -1,13 +1,16 @@
 /**
- * Desync harness: two Chromium clients play one quick match. At fixed moments
- * it (a) dumps each side's flip-invariant state signature (units/buildings/gold/
+ * Desync harness: two Chromium clients play one REAL quick match, both driven
+ * by the in-game bot (`?bot=1`) — the solo AI's reflexes wired through the
+ * command path. So the army grows, airstrikes land, helicos raid and upgrades
+ * stack on both sides, exactly like two humans playing. At fixed moments it
+ * (a) dumps each side's flip-invariant state signature (units/buildings/gold/
  * share) for a PRECISE divergence check, and (b) screenshots BOTH sides into
  * /tmp/desync-*.png for visual (AI) analysis — pixel diff is meaningless since
  * the guest's view is vertically mirrored and cosmetics are random.
  *
- * Baseline (host-authoritative): host & guest signatures should match closely
- * (the guest mirrors the host). Once the guest runs its own sim, this is the
- * gate that tells us whether the two simulations stay in sync.
+ * The lockstep gate: buildings, territory (share) and gold are authoritative /
+ * corrected, so they must stay tight; unit COUNT is allowed to drift a little
+ * (cosmetic per-unit RNG), but must stay bounded, not diverge.
  *
  * Usage: node tools/desync-test.mjs [path-to-chromium]
  */
@@ -60,7 +63,7 @@ const launch = (x) =>
   });
 const browserA = await launch(10);
 const browserB = HEADED ? await launch(720) : browserA;
-const URLB = `http://localhost:${PORT}/?server=localhost:${NET_PORT}&firebase=off&splash=off`;
+const URLB = `http://localhost:${PORT}/?server=localhost:${NET_PORT}&firebase=off&splash=off&bot=1`;
 
 async function open(browser, tag) {
   const p = await browser.newPage({ viewport: HEADED ? null : { width: 640, height: 1024 } });
@@ -89,23 +92,34 @@ const host = rA === "host" ? A : B;
 const guest = rA === "host" ? B : A;
 if ((await step(host.p)) !== "game" || (await step(guest.p)) !== "game") errors.push("not both in game");
 
-// BOTH players issue an AXE order periodically — keeps each "active" (so the
-// anti-AFK rule doesn't void the match) and exercises the command path.
-const axis = async (c) => { await c.p.mouse.click(...c.at(587, 992)); await c.p.waitForTimeout(200); await c.p.mouse.click(...c.at(320, 360)); };
-
-// Sample at synced moments: signatures + screenshots from BOTH sides.
-const samples = [12, 25, 40, 55];
+// Both sides play themselves via `?bot=1` — nothing to drive from here, just
+// sample at synced moments: signatures + screenshots from BOTH sides.
+const samples = [15, 30, 45, 60, 75, 90];
 let prev = 8;
+let last = null;
 for (const t of samples) {
-  await axis(host); await axis(guest); // stay active on both sides
   await host.p.waitForTimeout((t - prev) * 1000); prev = t;
+  if ((await step(host.p)) !== "game" || (await step(guest.p)) !== "game") {
+    console.log(`t≈${t}s  match ended early (a HQ fell) — stopping samples`);
+    break;
+  }
   const [sh, sg] = await Promise.all([sig(host.p), sig(guest.p)]);
   await Promise.all([
     host.p.screenshot({ path: `/tmp/desync-${t}s-host.png` }),
     guest.p.screenshot({ path: `/tmp/desync-${t}s-guest.png` }),
   ]);
-  const dU = Math.abs(sh.units - sg.units), dB = Math.abs(sh.buildings - sg.buildings), dS = Math.abs(sh.share - sg.share);
-  console.log(`t≈${t}s  HOST ${JSON.stringify(sh)}  GUEST ${JSON.stringify(sg)}  Δunits=${dU} Δbuild=${dB} Δshare=${dS}`);
+  const dU = Math.abs(sh.units - sg.units), dB = Math.abs(sh.buildings - sg.buildings);
+  const dS = Math.abs(sh.share - sg.share), dG = Math.abs((sh.goldR + sh.goldB) - (sg.goldR + sg.goldB));
+  last = { dU, dB, dS, dG, units: Math.max(sh.units, sg.units) };
+  console.log(`t≈${t}s  HOST ${JSON.stringify(sh)}  GUEST ${JSON.stringify(sg)}  Δunits=${dU} Δbuild=${dB} Δshare=${dS}pts Δgold=${dG}`);
+}
+
+// Gate on the authoritative quantities; unit count may drift but must stay sane.
+if (last) {
+  if (last.dB > 4) errors.push(`buildings diverged: Δ=${last.dB}`);
+  if (last.dS > 8) errors.push(`territory diverged: Δshare=${last.dS}pts`);
+  if (last.dU > last.units * 0.5) errors.push(`unit count diverged: Δ=${last.dU} of ${last.units}`);
+  if (last.units < 20) errors.push(`bots barely played: only ${last.units} units — check ?bot=1`);
 }
 
 console.log(errors.length ? "ERRORS:\n" + errors.join("\n") : "run ok ✓ (screenshots in /tmp/desync-*.png)");
@@ -113,3 +127,4 @@ if (HEADED) { console.log("watch the two windows… closing in 40s"); await A.p.
 await browserA.close();
 if (HEADED) await browserB.close();
 server.close(); net.kill();
+process.exit(errors.length ? 1 : 0);
