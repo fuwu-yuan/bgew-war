@@ -696,6 +696,17 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
    */
   private applySnapshot(snap: SnapMsg): void {
     if (this.debug) this.lastSnapBytes = JSON.stringify(snap).length;
+    // Light authoritative correction: the guest runs its own sim for smooth,
+    // network-independent unit motion; we only reconcile the faction-wide
+    // economy + upgrade levels (units/territory drift is tiny and self-similar).
+    this.gold[RED] = snap.gold.red;
+    this.gold[BLUE] = snap.gold.blue;
+    this.levels[RED] = snap.lvl.red;
+    this.levels[BLUE] = snap.lvl.blue;
+    this.tankLevels[RED] = snap.lvl.tankRed ?? 1;
+    this.tankLevels[BLUE] = snap.lvl.tankBlue ?? 1;
+    this.turretLevels[RED] = snap.lvl.turretRed ?? 1;
+    this.turretLevels[BLUE] = snap.lvl.turretBlue ?? 1;
     const acts = snap.acts ?? 0;
     if (acts > this.lastSeenActs) {
       this.lastSeenActs = acts;
@@ -1104,15 +1115,11 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       if (this.role === "host") {
         this.snapT -= dt;
         if (this.snapT <= 0) {
-          // Mild throttle as the army grows (payload is already ~halved by the
-          // static/dynamic split). The guest interpolates over this exact
-          // period, so motion stays smooth at any rate.
-          // Bandwidth is tiny (~3 KB/snap), so prioritise LOW LATENCY: send
-          // often. The cost is CPU only, negligible at this payload size.
-          const n = this.units.length;
-          const period = n > 320 ? 0.1 : n > 180 ? 0.08 : 0.067; // ~10–15 Hz
-          this.snapT = period;
-          this.sendSnapshot(period);
+          // Lockstep: the guest runs its own sim, so the snapshot is only a
+          // periodic authoritative correction (economy/levels). 2 Hz is plenty
+          // — unit motion is fully local and never waits on the network.
+          this.snapT = 0.5;
+          this.sendSnapshot(0.5);
         }
       }
 
