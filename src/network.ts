@@ -114,6 +114,9 @@ export interface InitMsg {
   uid?: string;
   /** Shared match id (host-generated) the Cloud Function correlates on. */
   matchId?: string;
+  /** Shared RNG seed (host-generated) so both clients' sims draw the same
+   *  random sequence — foundation for the lockstep branch. */
+  seed?: number;
 }
 
 /** Host → guest, ~10 Hz */
@@ -131,8 +134,11 @@ export interface SnapMsg {
   spawns: number[][];
   /** [nid, typeCode, faction, col, row, hp, maxHp, buildPct(0-100)] */
   buildings: number[][];
-  /** [tileIndex, owner] since last snap */
+  /** [tileIndex, owner] since last snap (legacy delta path) */
   own: number[][];
+  /** Lockstep: the FULL ownership grid as a digit string (0/1/2), so the guest
+   *  resyncs territory wholesale each snapshot — territory is authoritative. */
+  grid?: string;
   /** [x, y, tx, ty, big] tracers fired since last snap */
   shots: number[][];
   /** [x, y, big] explosions since last snap */
@@ -161,9 +167,12 @@ export interface EndMsg {
   kills: { red: number; blue: number };
 }
 
-/** Guest → host: an order for the red side */
+/** One player's order. In lockstep these ride inside a FrameMsg and execute at
+ *  a shared tick on both clients. `faction` is ABSOLUTE (host space); coords are
+ *  host space too (each client converts to its own view). */
 export interface CmdMsg {
   type: "cmd";
+  faction: number; // RED | BLUE — whose order this is
   cmd: "build" | "axis" | "upgrade" | "strike" | "helico";
   kind?: "barracks" | "turret" | "factory" | "soldier" | "tank";
   c?: number;
@@ -171,6 +180,18 @@ export interface CmdMsg {
   col?: number;
   x?: number;
   y?: number;
+}
+
+/**
+ * Lockstep turn message, sent EVERY sim tick by each client (deterministic
+ * lockstep). `tick` is the issuing tick — it doubles as a heartbeat so the
+ * other side knows it may advance — and `cmds` (often empty) are the orders
+ * issued that tick. Both clients buffer them to execute at `tick + INPUT_DELAY`.
+ */
+export interface FrameMsg {
+  type: "frame";
+  tick: number;
+  cmds: CmdMsg[];
 }
 
 /** Either side → the other: a salted hash of the player's public IP, so each
@@ -187,7 +208,7 @@ export interface VoidMsg {
   reason: string;
 }
 
-export type GameMsg = StartMsg | ReadyMsg | InitMsg | SnapMsg | EndMsg | CmdMsg | IpMsg | VoidMsg;
+export type GameMsg = StartMsg | ReadyMsg | InitMsg | SnapMsg | EndMsg | CmdMsg | FrameMsg | IpMsg | VoidMsg;
 
 /** Role passed to the game step via moveToStep data */
 export interface MultiData {

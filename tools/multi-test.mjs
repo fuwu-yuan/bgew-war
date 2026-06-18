@@ -132,26 +132,23 @@ console.log(`share host=${(hostShare * 100).toFixed(1)}% guest=${(guestShare * 1
 if (Math.abs(hostShare - guestShare) > 0.03) {
   errors.push(`SYNC: share mismatch host=${hostShare} guest=${guestShare}`);
 }
-const guestUnits = await guest.page.evaluate(() => {
-  const play = window.__bgewwar.steps.play;
-  return play.remote ? play.remote.units.size : -1;
-});
-console.log(`guest sees ${guestUnits} remote units`);
-if (guestUnits < 5) errors.push(`SYNC: guest only sees ${guestUnits} units`);
+// Lockstep: the guest now runs its OWN sim (no `remote` mirror), so it has
+// real units/buildings just like the host.
+const guestUnits = await guest.page.evaluate(() => window.__bgewwar.steps.play.units.filter((u) => !u.dead).length);
+console.log(`guest sim units: ${guestUnits}`);
+if (guestUnits < 5) errors.push(`SYNC: guest only has ${guestUnits} units`);
 
-// Mirror check: the red HQ sits near the top for the host and near the
-// bottom for the guest (rows must be vertical mirrors of each other)
+// Lockstep: the SIM is now identical (host space) on both clients — the mirror
+// is render-only. So the red HQ row must MATCH (the guest just draws it flipped).
 const hostHqRow = await host.page.evaluate(
   () => window.__bgewwar.steps.play.buildings.find((b) => b.type === "hq" && b.faction === 1)?.row
 );
 const guestHqRow = await guest.page.evaluate(
-  () => [...window.__bgewwar.steps.play.remote.buildings.values()].find((b) => b.type === "hq" && b.faction === 1)?.row
+  () => window.__bgewwar.steps.play.buildings.find((b) => b.type === "hq" && b.faction === 1)?.row
 );
-const gridH = await host.page.evaluate(() => window.__bgewwar.steps.play.map.owner.length / 16);
-const mirrorRow = gridH - 1 - hostHqRow;
-console.log(`red HQ row: host=${hostHqRow} guest=${guestHqRow} (mirror of ${hostHqRow} is ${mirrorRow})`);
-if (guestHqRow !== mirrorRow) {
-  errors.push(`FLIP: red HQ should be mirrored (host row ${hostHqRow}, guest row ${guestHqRow})`);
+console.log(`red HQ row: host=${hostHqRow} guest=${guestHqRow} (identical sim, render-only mirror)`);
+if (guestHqRow !== hostHqRow) {
+  errors.push(`SIM: red HQ row should match host-space on both (host ${hostHqRow}, guest ${guestHqRow})`);
 }
 
 // Host leaves → the guest must win by forfeit

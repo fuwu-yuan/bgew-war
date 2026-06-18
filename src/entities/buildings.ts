@@ -2,6 +2,7 @@ import { GameObject } from "./gameobject";
 import { GameAPI } from "../api";
 import { BLUE, Faction, RED, TILE } from "../globals";
 import { clamp, rand, TAU } from "../utils";
+import { srand } from "../sim-rng";
 import { drawSprite, SPR } from "../sprites";
 
 export type BuildingType = "hq" | "barracks" | "factory" | "turret";
@@ -180,7 +181,7 @@ export class Building extends GameObject {
       this.buildTotal = this.buildLeft = this.stats.buildTime;
       this.hp = this.maxHp * 0.3; // un chantier est fragile
     }
-    this.spawnT = (this.stats.spawnEvery ?? 0) * rand(0.3, 1);
+    this.spawnT = (this.stats.spawnEvery ?? 0) * srand(0.3, 1); // sim: first-spawn offset
     // a building stands on owned ground
     game.map.claim(col, row, faction);
   }
@@ -217,8 +218,8 @@ export class Building extends GameObject {
       if (this.waveLeft > 0 && this.waveT <= 0) {
         this.waveLeft--;
         this.waveT = this.stats.waveSpacing ?? 0.25;
-        const dir = this.faction === RED ? 1 : -1;
-        const x = this.cx + rand(-14, 14);
+        const dir = (this.faction === RED ? 1 : -1) * this.game.flipY();
+        const x = this.cx + srand(-14, 14); // sim: spawn position jitter
         const y = this.cy + dir * (TILE * 0.8);
         if (this.type === "barracks") this.game.spawnSoldier(this.faction, x, y, this.soldierLevel);
         else this.game.spawnTank(this.faction, x, y, this.tankLevel);

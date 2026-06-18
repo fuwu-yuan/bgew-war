@@ -24,7 +24,8 @@ import {
   turretUpgradeCost,
 } from "../globals";
 import { clamp, pick, rand, randInt, sha256, TAU } from "../utils";
-import { flipMapData, flipTileIndex, TileMap } from "../entities/tilemap";
+import { seedSim, srand } from "../sim-rng";
+import { TileMap } from "../entities/tilemap";
 import { Bullet, Soldier, Tank, Unit } from "../entities/units";
 import { Building, BUILDING_CODE, BuildingType } from "../entities/buildings";
 import { Helicopter } from "../entities/helicopter";
@@ -32,14 +33,24 @@ import { Fader, FpsMeter, Particle, ScorePopup, Shockwave, StrikeMarker, Tracer 
 import { BuildMode, Hud, HudState } from "../entities/hud";
 import { GameObject } from "../entities/gameobject";
 import { RemoteWorld } from "../entities/remote";
-import { CmdMsg, EndMsg, GameMsg, gameData, InitMsg, IpMsg, MultiData, SnapMsg, VoidMsg } from "../network";
+import { CmdMsg, EndMsg, FrameMsg, GameMsg, gameData, InitMsg, IpMsg, MultiData, SnapMsg, VoidMsg } from "../network";
 import { track, trackScreen } from "../analytics";
 import { toggleMute } from "../sound";
 import { currentUser, displayName } from "../firebase";
 
 const BRAIN_EVERY = 3; // s — red AI thinks (solo only)
 const INCOME_EVERY = 1; // s
-const SNAP_EVERY = 0.1; // s — host → guest snapshots
+const SNAP_EVERY = 0.1; // s — host → guest snapshots (legacy; unused under lockstep)
+
+/* Deterministic lockstep (phases 1 & 3): a fixed sim tick + input delay. */
+const TICK_HZ = 60;
+const TICK_MS = 1000 / TICK_HZ;
+const TICK_DT = 1 / TICK_HZ; // s — every sim step integrates exactly this
+/** Ticks between issuing an order and executing it. Both clients buffer orders
+ *  to this shared tick, so they run in identical RNG order. ~200ms covers the
+ *  relay round-trip; under worse latency the sim micro-stalls (never desyncs). */
+const INPUT_DELAY = 12;
+const MAX_STEPS_PER_UPDATE = 6; // anti-spiral: never simulate more than this per frame
 /* Anti-cheat (ranked multiplayer fairness) */
 const IDLE_LIMIT = 30; // s of opponent inactivity → the match is stopped & voided
 const MIN_RANKED_DURATION = 20; // s — anything shorter can't be ranked
@@ -126,11 +137,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private matchId = "";
   private myUid = "";
   private enemyUid = "";
+  /* Lockstep foundation: shared RNG seed (host-minted, sent in init). */
+  private matchSeed = 0;
   private nextNid = 1;
-  private pShots: number[][] = [];
-  private pBooms: number[][] = [];
-  private pPops: [number, number, string, number][] = [];
-  private pWarns: number[][] = [];
 
   /* Airstrikes in flight + solo-AI panic state */
   private strikes: { x: number; y: number; t: number; faction: Faction }[] = [];
@@ -160,12 +169,71 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private ended = false;
   private brainT = BRAIN_EVERY;
   private aiPosture: AiPosture = "counter";
+  /** `?bot=1` — auto-play MY faction through the command path (desync tests). */
+  private botMode = false;
+  private botT = BRAIN_EVERY;
+
+  /* Deterministic lockstep state */
+  private simTick = 0; // ticks executed locally
+  private remoteTick = 0; // highest tick the opponent has reached (from frames)
+  private acc = 0; // ms accumulated toward the next fixed step
+  private pendingCmds = new Map<number, CmdMsg[]>(); // executeTick → orders
+  private outgoing: CmdMsg[] = []; // orders issued this tick, flushed in a frame
   private incomeT = INCOME_EVERY;
   private buckets: Target[][] = [];
   private sfxLast = new Map<string, number>();
 
   get myGold(): number {
     return this.gold[this.myFaction];
+  }
+
+  /** Flip-invariant gameplay signature for desync detection (host vs guest). */
+  simSignature(): { tick: number; t: number; units: number; helis: number; buildings: number; goldR: number; goldB: number; share: number } {
+    const units = this.units.filter((u) => !u.dead).length;
+    const helis = this.helis.filter((h) => !h.dead).length;
+    const buildings = this.buildings.filter((b) => !b.dead).length;
+    return {
+      tick: this.simTick, // exact sim tick — lets a comparer separate skew from drift
+      t: Math.round(this.elapsed),
+      units,
+      helis,
+      buildings,
+      goldR: Math.floor(this.gold[RED]),
+      goldB: Math.floor(this.gold[BLUE]),
+      share: Math.round(this.blueShare * 100),
+    };
+  }
+
+  /** Determinism probe: every unit (host space — identical on both clients now),
+   *  sorted by nid, so the host and guest dumps can be diffed directly. */
+  dumpUnits(): string {
+    const rows = this.units
+      .filter((u) => !u.dead)
+      .map((u) => `${u.nid},${u.faction},${Math.round(u.cx)},${Math.round(u.cy)},${Math.round(u.hp)}`)
+      .sort();
+    return rows.join("|");
+  }
+
+  /** `?debug=1` overlay text — every comparable count, by ABSOLUTE faction
+   *  (R/B), so the host and guest screenshots can be diffed number-for-number. */
+  private debugReadout(): string {
+    const u = this.units.filter((x) => !x.dead);
+    const uR = u.filter((x) => x.faction === RED);
+    const uB = u.filter((x) => x.faction === BLUE);
+    const tk = (arr: Unit[]) => arr.filter((x) => x instanceof Tank).length;
+    const h = this.helis.filter((x) => !x.dead);
+    const b = this.buildings.filter((x) => !x.dead);
+    const bR = b.filter((x) => x.faction === RED).length;
+    const bB = b.filter((x) => x.faction === BLUE).length;
+    const corr = this.role === "guest" ? `  corr ${(this.lastSnapBytes / 1024).toFixed(1)}KB` : "";
+    return [
+      `${this.role} t${Math.round(this.elapsed)}  share B ${Math.round(this.blueShare * 100)}%${corr}`,
+      `units  R ${uR.length} (tk ${tk(uR)})  B ${uB.length} (tk ${tk(uB)})`,
+      `heli   R ${h.filter((x) => x.faction === RED).length}  B ${h.filter((x) => x.faction === BLUE).length}`,
+      `bldg   R ${bR}  B ${bB}`,
+      `gold   R ${Math.floor(this.gold[RED])}  B ${Math.floor(this.gold[BLUE])}`,
+      `lvl  s R${this.levels[RED]} B${this.levels[BLUE]}  tk R${this.tankLevels[RED]} B${this.tankLevels[BLUE]}  tu R${this.turretLevels[RED]} B${this.turretLevels[BLUE]}`,
+    ].join("\n");
   }
 
   get soldierLevel(): number {
@@ -253,6 +321,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.myUid = u && !u.isAnonymous ? u.uid : "";
     this.enemyUid = "";
     this.matchId = this.role === "host" ? newMatchId() : "";
+    this.matchSeed = this.role === "host" ? (Math.floor(Math.random() * 0xffffffff) >>> 0) : 0;
+    // Seed the sim RNG now for the host/solo (which run the sim). The guest
+    // reseeds when it receives the host's seed in `init`.
+    if (this.role !== "guest") seedSim(this.role === "solo" ? (Math.floor(Math.random() * 0xffffffff) >>> 0) : this.matchSeed);
 
     trackScreen("game");
     track("game_start", { mode: this.role, faction: this.myFaction === RED ? "red" : "blue" });
@@ -282,11 +354,12 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.incomeT = INCOME_EVERY;
     this.snapT = 0;
     this.readyT = 0;
+    this.simTick = 0;
+    this.remoteTick = 0;
+    this.acc = 0;
+    this.pendingCmds.clear();
+    this.outgoing = [];
     this.nextNid = 1;
-    this.pShots = [];
-    this.pBooms = [];
-    this.pPops = [];
-    this.pWarns = [];
     this.strikes = [];
     this.garrisonCd = 0;
     this.alertT = 0;
@@ -305,39 +378,18 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.voidReason = "";
     this.camera.x = 0;
     this.camera.y = 0;
+    this.remote = null; // lockstep: the guest runs its own sim, no passive mirror
     if (this.role !== "solo") this.exchangeIpHash();
 
     this.map = new TileMap();
     this.board.addEntity(this.map);
 
     if (this.role === "guest") {
-      // Passive mirror: the island and every unit come from the host
-      this.remote = new RemoteWorld();
-      this.board.addEntity(this.remote);
+      // Lockstep: the guest builds the SAME initial state from the host's seed
+      // (in setupInitialState, once `init` brings the map). Until then, wait.
       this.sendNet({ type: "ready", name: this.myName, uid: this.myUid });
     } else {
-      // Symmetric starting bases (HQ + 3 barracks + 2 turrets each)
-      this.placeBuilding(RED, "hq", 8, 2, true);
-      this.placeBuilding(RED, "barracks", 4, 4, true);
-      this.placeBuilding(RED, "barracks", 8, 4, true);
-      this.placeBuilding(RED, "barracks", 12, 4, true);
-      this.placeBuilding(RED, "turret", 6, 3, true);
-      this.placeBuilding(RED, "turret", 10, 3, true);
-
-      this.placeBuilding(BLUE, "hq", 8, GRID_H - 3, true);
-      this.placeBuilding(BLUE, "barracks", 4, GRID_H - 5, true);
-      this.placeBuilding(BLUE, "barracks", 8, GRID_H - 5, true);
-      this.placeBuilding(BLUE, "barracks", 12, GRID_H - 5, true);
-      this.placeBuilding(BLUE, "turret", 6, GRID_H - 4, true);
-      this.placeBuilding(BLUE, "turret", 10, GRID_H - 4, true);
-
-      // First squads so the front moves right away
-      for (let i = 0; i < 10; i++) {
-        this.spawnSoldier(RED, rand(60, VIEW_W - 60), rand(5, 7) * TILE);
-        this.spawnSoldier(BLUE, rand(60, VIEW_W - 60), rand(GRID_H - 7, GRID_H - 5) * TILE);
-      }
-      // Initial claims are already part of the init payload the guest gets
-      this.map.flushDirty();
+      this.setupInitialState();
     }
 
     this.hud = new Hud(this);
@@ -346,7 +398,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
     // ?debug=1 → on-screen FPS meter (to tell a CPU stall from snapshot jitter).
     this.fpsMeter = null;
-    this.debug = new URLSearchParams(window.location.search).get("debug") === "1";
+    const qs = new URLSearchParams(window.location.search);
+    this.debug = qs.get("debug") === "1";
+    this.botMode = qs.get("bot") === "1";
+    this.botT = BRAIN_EVERY;
     this.lastSnapBytes = 0;
     if (this.debug) {
       this.fpsMeter = new FpsMeter();
@@ -359,6 +414,36 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.topEntities.push(fadeIn);
 
     this.board.playSound("music_battle", true, 0.3);
+  }
+
+  /**
+   * Build the symmetric starting state. Both clients run this identically right
+   * after seeding (same seed → same RNG draws in the same order), so their sims
+   * start in lockstep. Identical host-space layout on every client (the guest
+   * only flips its VIEW). MUST be the first srand-drawing call after seedSim,
+   * with no random draws in between, or the sequences diverge.
+   */
+  private setupInitialState(): void {
+    const mr = (row: number): number => row; // host space on every client
+    this.placeBuilding(RED, "hq", 8, mr(2), true);
+    this.placeBuilding(RED, "barracks", 4, mr(4), true);
+    this.placeBuilding(RED, "barracks", 8, mr(4), true);
+    this.placeBuilding(RED, "barracks", 12, mr(4), true);
+    this.placeBuilding(RED, "turret", 6, mr(3), true);
+    this.placeBuilding(RED, "turret", 10, mr(3), true);
+
+    this.placeBuilding(BLUE, "hq", 8, mr(GRID_H - 3), true);
+    this.placeBuilding(BLUE, "barracks", 4, mr(GRID_H - 5), true);
+    this.placeBuilding(BLUE, "barracks", 8, mr(GRID_H - 5), true);
+    this.placeBuilding(BLUE, "barracks", 12, mr(GRID_H - 5), true);
+    this.placeBuilding(BLUE, "turret", 6, mr(GRID_H - 4), true);
+    this.placeBuilding(BLUE, "turret", 10, mr(GRID_H - 4), true);
+
+    for (let i = 0; i < 10; i++) {
+      this.spawnSoldier(RED, srand(60, VIEW_W - 60), this.mirrorY(srand(5, 7) * TILE));
+      this.spawnSoldier(BLUE, srand(60, VIEW_W - 60), this.mirrorY(srand(GRID_H - 7, GRID_H - 5) * TILE));
+    }
+    this.map.flushDirty();
   }
 
   onLeave(): void {
@@ -378,26 +463,14 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   /* ------------------------------------------------------------------
-   * Guest view mirror: the red player sees the island flipped vertically
-   * so THEIR army sits at the bottom of the screen. Everything coming
-   * from the host is converted to view space here, and every command
-   * sent back is converted to host space. No-ops for solo/host.
+   * Guest view mirror: the red player sees the island flipped vertically so
+   * THEIR army sits at the bottom of the screen. The SIMULATION is identical
+   * (host space) on every client; the mirror is applied ONLY at render (draw)
+   * and input (handleTap). So float math is bit-symmetric → deterministic.
    * ------------------------------------------------------------------ */
 
   private get flipped(): boolean {
     return this.role === "guest";
-  }
-
-  private viewY(y: number): number {
-    return this.flipped ? MAP_H - y : y;
-  }
-
-  private viewRow(r: number): number {
-    return this.flipped ? GRID_H - 1 - r : r;
-  }
-
-  private viewIdx(i: number): number {
-    return this.flipped ? flipTileIndex(i) : i;
   }
 
   onNetworkMessage(msg: Network.SocketMessage): void {
@@ -414,22 +487,29 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       return;
     }
 
+    // Lockstep turn: advance our view of the opponent's tick (so we may step)
+    // and buffer their orders to the shared execute tick. Flows both ways.
+    if (data.type === "frame") {
+      const fr = data as FrameMsg;
+      if (fr.tick > this.remoteTick) this.remoteTick = fr.tick;
+      if (fr.cmds && fr.cmds.length) {
+        this.oppActed = true;
+        const ex = fr.tick + INPUT_DELAY;
+        const slot = this.pendingCmds.get(ex);
+        if (slot) slot.push(...fr.cmds);
+        else this.pendingCmds.set(ex, fr.cmds.slice());
+      }
+      return;
+    }
+
     if (this.role === "host") {
       if (data.type === "ready") {
         if (typeof data.name === "string") this.enemyName = data.name || "Invite";
         if (typeof data.uid === "string") this.enemyUid = data.uid;
-        // (Re)send the island + an immediate snapshot, carrying our name, uid
-        // and the shared match id the guest reports under.
-        const init: InitMsg = { type: "init", map: this.map.getInitData(), name: this.myName, uid: this.myUid, matchId: this.matchId };
+        // (Re)send the island + seed so the guest builds the SAME initial state.
+        const init: InitMsg = { type: "init", map: this.map.getInitData(), name: this.myName, uid: this.myUid, matchId: this.matchId, seed: this.matchSeed };
         this.sendNet(init);
-        // The (re)joined guest knows no units yet → resend every unit's static data.
-        this.sentStatic.clear();
-        this.sendSnapshot();
         this.sendNet({ type: "ip", hash: this.myIpHash ?? "" }); // (re)share our IP hash
-      } else if (data.type === "cmd") {
-        // The guest issued an order → it has played at least once.
-        this.oppActed = true;
-        this.applyCommand(data as CmdMsg);
       }
       return;
     }
@@ -440,12 +520,16 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       if (typeof initMsg.name === "string") this.enemyName = initMsg.name || "Invite";
       if (typeof initMsg.uid === "string") this.enemyUid = initMsg.uid;
       if (typeof initMsg.matchId === "string") this.matchId = initMsg.matchId;
-      const init = initMsg.map;
-      this.map.applyInit(this.flipped ? flipMapData(init) : init);
-      this.inited = true;
+      // First init only: seed, apply the map, then build the SAME initial state
+      // as the host (lockstep). Re-sent inits (ready retries) are ignored.
+      if (!this.inited) {
+        if (typeof initMsg.seed === "number") this.matchSeed = initMsg.seed;
+        seedSim(this.matchSeed);
+        this.map.applyInit(initMsg.map); // host space on both — the guest flips only its view
+        this.setupInitialState(); // first srand draw after seedSim — order matches host
+        this.inited = true;
+      }
       this.sendNet({ type: "ip", hash: this.myIpHash ?? "" }); // share our IP hash
-    } else if (data.type === "snap") {
-      this.applySnapshot(data as SnapMsg);
     } else if (data.type === "end") {
       const end = data as EndMsg;
       this.killsBy = { [RED]: end.kills.red, [BLUE]: end.kills.blue };
@@ -520,28 +604,34 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     }
   }
 
-  /** Host: a validated order from the red (guest) player. */
-  private applyCommand(cmd: CmdMsg): void {
+  /**
+   * Execute ONE order at its scheduled tick (lockstep) — mine or the opponent's,
+   * identical on both clients. Orders travel in host space + an absolute faction;
+   * each client converts coords to its own space (viewRow/viewY — identity on the
+   * host, mirrored on the guest) and applies them to that faction.
+   */
+  private executeCommand(cmd: CmdMsg): void {
     if (this.ended) return;
+    const f: Faction = cmd.faction === RED ? RED : BLUE;
     if (cmd.cmd === "axis" && typeof cmd.col === "number") {
-      this.axisCol[RED] = clamp(Math.round(cmd.col), 0, GRID_W - 1);
+      this.axisCol[f] = clamp(Math.round(cmd.col), 0, GRID_W - 1); // col is X — no mirror
       return;
     }
     if (cmd.cmd === "upgrade") {
-      this.buyUpgrade(RED, (cmd.kind === "tank" || cmd.kind === "turret" ? cmd.kind : "soldier") as UpgradeKind);
+      this.buyUpgrade(f, (cmd.kind === "tank" || cmd.kind === "turret" ? cmd.kind : "soldier") as UpgradeKind);
       return;
     }
     if (cmd.cmd === "strike" && typeof cmd.x === "number" && typeof cmd.y === "number") {
-      if (this.gold[RED] >= COST.strike) {
-        this.gold[RED] -= COST.strike;
-        this.scheduleStrike(clamp(cmd.x, 0, VIEW_W), clamp(cmd.y, 0, MAP_H), RED);
+      if (this.gold[f] >= COST.strike) {
+        this.gold[f] -= COST.strike;
+        this.scheduleStrike(clamp(cmd.x, 0, VIEW_W), clamp(cmd.y, 0, MAP_H), f);
       }
       return;
     }
     if (cmd.cmd === "helico" && typeof cmd.x === "number") {
-      if (this.gold[RED] >= COST.helico) {
-        this.gold[RED] -= COST.helico;
-        this.spawnHeli(RED, clamp(cmd.x, 0, VIEW_W));
+      if (this.gold[f] >= COST.helico) {
+        this.gold[f] -= COST.helico;
+        this.spawnHeli(f, clamp(cmd.x, 0, VIEW_W));
       }
       return;
     }
@@ -551,148 +641,24 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       typeof cmd.c === "number" &&
       typeof cmd.r === "number"
     ) {
+      const c = cmd.c;
+      const r = cmd.r; // host space on every client
       const cost = COST[cmd.kind];
-      const i = this.map.idx(cmd.c, cmd.r);
+      const i = this.map.idx(c, r);
       if (
-        this.gold[RED] >= cost &&
-        this.map.isLand(cmd.c, cmd.r) &&
-        this.map.owner[i] === RED &&
+        this.gold[f] >= cost &&
+        this.map.isLand(c, r) &&
+        this.map.owner[i] === f &&
         !this.buildingAt.has(i) &&
         !this.map.hasChest(i)
       ) {
-        this.gold[RED] -= cost;
-        this.placeBuilding(RED, cmd.kind, cmd.c, cmd.r);
-        const center = this.map.tileCenter(cmd.c, cmd.r);
+        this.gold[f] -= cost;
+        this.placeBuilding(f, cmd.kind, c, r);
+        const center = this.map.tileCenter(c, r);
         this.spawnEffect(new Shockwave(center.x, center.y, 50, "#ffffff", 0.35));
         this.sfx("build", 0.5);
       }
     }
-  }
-
-  /** Host: world state → guest, ~10 Hz. */
-  private sendSnapshot(period: number = SNAP_EVERY): void {
-    // Split each unit into DYNAMIC state (sent every snapshot) and STATIC data
-    // (sent once, the first time the guest sees it). This roughly halves the
-    // per-snapshot payload — the guest's main cost.
-    const dyn: number[][] = [];
-    const spawns: number[][] = [];
-    const hurt: number[][] = [];
-    const live = new Set<number>();
-    const add = (nid: number, kind: number, faction: number, x: number, y: number, hp: number, maxHp: number, level: number): void => {
-      live.add(nid);
-      dyn.push([nid, x, y]);
-      if (hp < maxHp) hurt.push([nid, hp]); // full-health units cost nothing extra
-      if (!this.sentStatic.has(nid)) {
-        spawns.push([nid, kind, faction, maxHp, level]);
-        this.sentStatic.add(nid);
-      }
-    };
-    for (const u of this.units) {
-      if (!u.dead) add(u.nid, u instanceof Tank ? 1 : 0, u.faction, Math.round(u.cx), Math.round(u.cy), Math.ceil(u.hp), u.maxHp, u.level);
-    }
-    for (const h of this.helis) {
-      if (!h.dead) add(h.nid, 2, h.faction, Math.round(h.cx), Math.round(h.cy), Math.ceil(h.hp), h.maxHp, 1);
-    }
-    // Forget dead units so the static set can't grow unbounded over a long game.
-    if (this.sentStatic.size > live.size) {
-      for (const nid of this.sentStatic) if (!live.has(nid)) this.sentStatic.delete(nid);
-    }
-
-    const snap: SnapMsg = {
-      type: "snap",
-      units: dyn,
-      hurt,
-      spawns,
-      buildings: this.buildings
-        .filter((b) => !b.dead)
-        .map((b) => [
-          b.nid,
-          BUILDING_CODE[b.type],
-          b.faction,
-          b.col,
-          b.row,
-          Math.ceil(b.hp),
-          b.maxHp,
-          Math.round(b.buildProgress * 100),
-        ]),
-      own: this.map.flushDirty(),
-      shots: this.pShots,
-      booms: this.pBooms,
-      pops: this.pPops,
-      warns: this.pWarns,
-      gold: { red: this.gold[RED], blue: this.gold[BLUE] },
-      lvl: {
-        red: this.levels[RED],
-        blue: this.levels[BLUE],
-        tankRed: this.tankLevels[RED],
-        tankBlue: this.tankLevels[BLUE],
-        turretRed: this.turretLevels[RED],
-        turretBlue: this.turretLevels[BLUE],
-      },
-      share: this.map.share(BLUE),
-      acts: this.myActs,
-      period,
-    };
-    this.pShots = [];
-    this.pBooms = [];
-    this.pPops = [];
-    this.pWarns = [];
-    this.sendNet(snap);
-  }
-
-  /** Guest: render what the host says (converted to the mirrored view). */
-  private applySnapshot(snap: SnapMsg): void {
-    if (!this.remote) return;
-    if (this.debug) this.lastSnapBytes = JSON.stringify(snap).length;
-    // Pass raw arrays + flip flag: the mirror converts inline (no per-snap array
-    // allocation). `spawns` carries static data once.
-    this.remote.applySnapshot(snap.units, snap.spawns ?? [], snap.hurt ?? [], snap.buildings, this.flipped);
-    // Buildings may stand where the host cleared a tree/rock — mirror that here
-    // so decor doesn't peek out from under a remote building.
-    for (const [, , , c, r] of snap.buildings) this.map.clearDecor(this.map.idx(c, this.viewRow(r)));
-    for (const [i, owner] of snap.own) {
-      this.map.setOwner(this.viewIdx(i), owner);
-    }
-    if (snap.own.length > 0) this.sfx("capture", 0.16);
-    // Cosmetics are bounded so a furious battle can't bury the guest under
-    // thousands of effect entities (the runaway cause of guest lag). Tracers
-    // and booms are capped per snapshot; spawnEffect also enforces a global cap.
-    const shots = snap.shots;
-    const shotCap = Math.min(shots.length, 14);
-    for (let k = 0; k < shotCap; k++) {
-      const [x, y, tx, ty, big] = shots[k];
-      this.spawnEffect(new Tracer(x, this.viewY(y), tx, this.viewY(ty), big === 1));
-      this.sfx(big === 1 ? "tankshot" : `shot${1 + (Math.abs(x + y) % 3)}`, big === 1 ? 0.2 : 0.12);
-    }
-    const booms = snap.booms;
-    const boomCap = Math.min(booms.length, 8);
-    for (let k = 0; k < boomCap; k++) {
-      const [x, y, big] = booms[k];
-      this.explosionVisual(x, this.viewY(y), big === 1);
-    }
-    for (const [x, y] of snap.warns ?? []) {
-      this.spawnEffect(new StrikeMarker(x, this.viewY(y), STRIKE_RADIUS, STRIKE_DELAY));
-      this.sfx("click", 0.5);
-    }
-    for (const [x, y, text, colorIdx] of snap.pops) {
-      this.spawnEffect(new ScorePopup(x, this.viewY(y), text, colorIdx === 1 ? "#ff8b7a" : COLORS.gold, 15));
-    }
-    this.gold[RED] = snap.gold.red;
-    this.gold[BLUE] = snap.gold.blue;
-    this.levels[RED] = snap.lvl.red;
-    this.levels[BLUE] = snap.lvl.blue;
-    this.tankLevels[RED] = snap.lvl.tankRed ?? 1;
-    this.tankLevels[BLUE] = snap.lvl.tankBlue ?? 1;
-    this.turretLevels[RED] = snap.lvl.turretRed ?? 1;
-    this.turretLevels[BLUE] = snap.lvl.turretBlue ?? 1;
-    this.blueShare = snap.share;
-    // Anti-AFK: the host's action counter climbing means it's actively playing.
-    const acts = snap.acts ?? 0;
-    if (acts > this.lastSeenActs) {
-      this.lastSeenActs = acts;
-      this.oppActed = true;
-    }
-    this.updateHeliLoop(snap.units.some((u) => u[1] === 2));
   }
 
   /* ---------------------------------------------------------------- *
@@ -721,6 +687,15 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
     if (!this.mode) return;
 
+    // The map is rendered vertically flipped for the guest, so un-flip the tap
+    // into host-space WORLD coords. The sim is identical on both clients, so the
+    // command carries plain host-space coords (no per-client conversion).
+    const wx = x;
+    const wy = this.flipped ? MAP_H - y : y;
+
+    // Orders are scheduled, not applied now: they execute at simTick+INPUT_DELAY
+    // on BOTH clients (lockstep). The gold check here is just UX — the real
+    // spend happens deterministically at execution (re-checked there).
     if (this.mode === "strike") {
       if (this.myGold < COST.strike) {
         this.board.playSound("error", false, 0.4);
@@ -728,15 +703,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
       this.mode = null;
       track("use_airstrike", { mode: this.role });
-      this.myActs++;
-      if (this.role === "guest") {
-        // back to host space: the guest's view is mirrored
-        this.sendNet({ type: "cmd", cmd: "strike", x: Math.round(x), y: Math.round(this.viewY(y)) });
-        this.board.playSound("click", false, 0.5);
-        return;
-      }
-      this.gold[mine] -= COST.strike;
-      this.scheduleStrike(x, y, mine);
+      this.queueCmd({ type: "cmd", faction: mine, cmd: "strike", x: Math.round(wx), y: Math.round(wy) });
+      this.board.playSound("click", false, 0.5);
       return;
     }
 
@@ -747,63 +715,50 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
       this.mode = null;
       track("use_helico", { mode: this.role });
-      this.myActs++;
-      if (this.role === "guest") {
-        // x n'a pas besoin de conversion : le miroir invité n'inverse que y
-        this.sendNet({ type: "cmd", cmd: "helico", x: Math.round(x) });
-        this.board.playSound("click", false, 0.5);
-        return;
-      }
-      this.gold[mine] -= COST.helico;
-      this.spawnHeli(mine, x);
+      this.queueCmd({ type: "cmd", faction: mine, cmd: "helico", x: Math.round(wx) });
+      this.board.playSound("click", false, 0.5);
       return;
     }
 
     if (this.mode === "axis") {
-      const c = clamp(Math.floor(x / TILE), 0, GRID_W - 1);
-      this.axisCol[mine] = c;
+      const c = clamp(Math.floor(wx / TILE), 0, GRID_W - 1);
       this.mode = null;
       track("set_axis", { mode: this.role });
-      this.myActs++;
       this.board.playSound("click", false, 0.5);
-      this.spawnEffect(new ScorePopup(x, y, "AXE D'ATTAQUE", "#ffe27a", 16));
-      if (this.role === "guest") this.sendNet({ type: "cmd", cmd: "axis", col: c });
+      this.spawnEffect(new ScorePopup(wx, wy, "AXE D'ATTAQUE", "#ffe27a", 16));
+      this.queueCmd({ type: "cmd", faction: mine, cmd: "axis", col: c });
       return;
     }
 
     // Build
-    const c = Math.floor(x / TILE);
-    const r = Math.floor(y / TILE);
+    const c = Math.floor(wx / TILE);
+    const r = Math.floor(wy / TILE);
     const kind = this.mode;
     const cost = COST[kind];
     const i = this.map.idx(c, r);
-    const occupied = this.role === "guest" ? this.remote?.buildingAtTile(c, r) ?? false : this.buildingAt.has(i);
+    const occupied = this.buildingAt.has(i);
     const buildable = this.map.isLand(c, r) && this.map.owner[i] === mine && !occupied && !this.map.hasChest(i);
     if (!buildable) {
       this.board.playSound("error", false, 0.4);
-      this.spawnEffect(new ScorePopup(x, y, "CASE INVALIDE", "#ff8b7a", 14));
+      this.spawnEffect(new ScorePopup(wx, wy, "CASE INVALIDE", "#ff8b7a", 14));
       return;
     }
     if (this.myGold < cost) {
       this.board.playSound("error", false, 0.4);
-      this.spawnEffect(new ScorePopup(x, y, "PAS ASSEZ D'OR", "#ff8b7a", 14));
+      this.spawnEffect(new ScorePopup(wx, wy, "PAS ASSEZ D'OR", "#ff8b7a", 14));
       return;
     }
     this.mode = null;
     track("build", { type: kind, mode: this.role });
-    this.myActs++;
-    if (this.role === "guest") {
-      // The host owns the truth: it validates, spends and spawns
-      // (row converted back to host space — the guest's view is mirrored)
-      this.sendNet({ type: "cmd", cmd: "build", kind, c, r: this.viewRow(r) });
-      this.board.playSound("build", false, 0.5);
-      return;
-    }
-    this.gold[mine] -= cost;
-    this.placeBuilding(mine, kind, c, r);
     this.board.playSound("build", false, 0.5);
-    const center = this.map.tileCenter(c, r);
-    this.spawnEffect(new Shockwave(center.x, center.y, 50, "#ffffff", 0.35));
+    this.queueCmd({ type: "cmd", faction: mine, cmd: "build", kind, c, r });
+  }
+
+  /** Queue one of MY orders. It rides this tick's frame and executes at
+   *  simTick+INPUT_DELAY on both clients. Counts as a meaningful action. */
+  private queueCmd(cmd: CmdMsg): void {
+    this.outgoing.push(cmd);
+    this.myActs++;
   }
 
   private requestUpgrade(kind: UpgradeKind): void {
@@ -813,13 +768,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       return;
     }
     track("upgrade", { kind, level: this.upgradeLevelFor(this.myFaction, kind) + 1, mode: this.role });
-    this.myActs++;
-    if (this.role === "guest") {
-      this.sendNet({ type: "cmd", cmd: "upgrade", kind });
-      this.board.playSound("build", false, 0.5);
-      return;
-    }
-    this.buyUpgrade(this.myFaction, kind);
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "upgrade", kind });
   }
 
   private upgradeLevelFor(f: Faction, kind: UpgradeKind): number {
@@ -860,6 +809,19 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     return this.axisCol[f] * TILE + TILE / 2;
   }
 
+  /** +1 in host space, -1 when the view is mirrored (guest). */
+  /** Lockstep: the SIM is identical (host space) on every client now — the
+   *  guest's mirror is applied at RENDER + INPUT only, so float math stays
+   *  bit-symmetric. Always +1. (Kept as a method so entities need no change.) */
+  flipY(): number {
+    return 1;
+  }
+
+  /** Sim is host-space on both clients — no mirror in the simulation. */
+  private mirrorY(y: number): number {
+    return y;
+  }
+
   nearestEnemy(x: number, y: number, f: Faction, range: number): Target | null {
     const seek = enemyOf(f);
     const c0 = Math.floor(x / TILE);
@@ -876,7 +838,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         for (const t of cell) {
           if (t.dead || t.faction !== seek) continue;
           const d = Math.hypot(t.cx - x, t.cy - y) - t.radius;
-          if (d <= range && d < bestD) {
+          // Tie-break by nid: bucket scan order is mirror-flipped on the guest,
+          // so on an exact-distance tie the two sims would otherwise pick
+          // different targets and slowly desync. nid is mirror-invariant.
+          if (d <= range && (d < bestD || (d === bestD && best !== null && t.nid < best.nid))) {
             bestD = d;
             best = t;
           }
@@ -890,9 +855,6 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     const b = new Bullet(this, x, y, target, dmg, f, big);
     this.bullets.push(b);
     this.board.addEntity(b);
-    if (this.role === "host") {
-      this.pShots.push([Math.round(x), Math.round(y), Math.round(target.cx), Math.round(target.cy), big ? 1 : 0]);
-    }
   }
 
   spawnSoldier(f: Faction, x: number, y: number, level?: number): void {
@@ -933,7 +895,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     for (const h of this.helis) {
       if (h.dead || h.faction !== seek) continue;
       const d = Math.hypot(h.cx - x, h.cy - y) - h.radius;
-      if (d <= range && d < bestD) {
+      if (d <= range && (d < bestD || (d === bestD && best !== null && h.nid < best.nid))) {
         bestD = d;
         best = h;
       }
@@ -1003,10 +965,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.board.playSound(name, false, volume);
   }
 
-  /** Popup visible on both sides (recorded for the guest in multi). */
+  /** Popup — each client spawns its own (the sim is deterministic). */
   private popup(x: number, y: number, text: string, colorIdx: 0 | 1): void {
     this.spawnEffect(new ScorePopup(x, y, text, colorIdx === 1 ? "#ff8b7a" : COLORS.gold, 15));
-    if (this.role === "host") this.pPops.push([Math.round(x), Math.round(y), text, colorIdx]);
   }
 
   /* ---------------------------------------------------------------- *
@@ -1017,7 +978,6 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.strikes.push({ x, y, t: STRIKE_DELAY, faction: f });
     this.spawnEffect(new StrikeMarker(x, y, STRIKE_RADIUS, STRIKE_DELAY));
     this.popup(x, y - STRIKE_RADIUS - 8, "FRAPPE !", 1);
-    if (this.role === "host") this.pWarns.push([Math.round(x), Math.round(y)]);
     this.sfx("click", 0.5);
   }
 
@@ -1055,99 +1015,143 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
    * ---------------------------------------------------------------- */
 
   update(delta: number): void {
-    const dt = Math.min(delta, 50) / 1000;
-    this.elapsed += dt;
-
-    if (this.role !== "guest") {
-      this.rebuildBuckets();
-      // Buildings spawn/fire at their faction's current upgrade levels.
-      for (const b of this.buildings) {
-        b.soldierLevel = this.levels[b.faction];
-        b.tankLevel = this.tankLevels[b.faction];
-        b.turretLevel = this.turretLevels[b.faction];
+    // Real-time (not part of the deterministic sim): the join handshake retry
+    // runs off wall-clock, before the sim even exists.
+    if (this.role === "guest" && !this.inited) {
+      this.readyT -= Math.min(delta, 50) / 1000;
+      if (this.readyT <= 0) {
+        this.readyT = 0.6;
+        this.sendNet({ type: "ready", name: this.myName, uid: this.myUid });
       }
     }
 
-    super.update(delta); // updates every entity + timers
-
-    if (!this.ended) {
-      if (this.role !== "guest") {
-        this.updateStrikes(dt);
-
-        this.incomeT -= dt;
-        if (this.incomeT <= 0) {
-          this.incomeT = INCOME_EVERY;
-          this.gold[BLUE] += 2;
-          // Solo: the AI's war chest grows with time — stall and it buries you
-          this.gold[RED] += this.role === "solo" ? 2 + Math.min(2, (this.elapsed / 60) * 0.5) : 2;
-        }
-
-        if (this.role === "solo") {
-          this.brainT -= dt;
-          if (this.brainT <= 0) {
-            this.brainT = BRAIN_EVERY;
-            this.redBrain();
-          }
-          this.redPanic(dt);
-        }
-
-        this.updateHqDefense(dt);
-        this.blueShare = this.map.share(BLUE);
-        this.updateHeliLoop(this.helis.some((h) => !h.dead));
+    // Fixed-timestep sim (phase 1): accumulate wall-clock time and run whole
+    // ticks of EXACTLY TICK_DT. The sim never reads `delta`, so it's identical
+    // on every machine given the same inputs.
+    if (this.inited && !this.ended) {
+      this.acc += Math.min(delta, MAX_STEPS_PER_UPDATE * TICK_MS);
+      let steps = 0;
+      while (this.acc >= TICK_MS && steps < MAX_STEPS_PER_UPDATE) {
+        // Lockstep stall (phase 3): don't execute a tick whose opponent orders
+        // may not have arrived. Safe once the opponent reached simTick-DELAY.
+        if (this.role !== "solo" && this.simTick > this.remoteTick + INPUT_DELAY) break;
+        this.acc -= TICK_MS;
+        this.simStep();
+        steps++;
       }
-
-      if (this.role === "host") {
-        this.snapT -= dt;
-        if (this.snapT <= 0) {
-          // Mild throttle as the army grows (payload is already ~halved by the
-          // static/dynamic split). The guest interpolates over this exact
-          // period, so motion stays smooth at any rate.
-          // Bandwidth is tiny (~3 KB/snap), so prioritise LOW LATENCY: send
-          // often. The cost is CPU only, negligible at this payload size.
-          const n = this.units.length;
-          const period = n > 320 ? 0.1 : n > 180 ? 0.08 : 0.067; // ~10–15 Hz
-          this.snapT = period;
-          this.sendSnapshot(period);
-        }
-      }
-
-      // Anti-AFK: cancel ONLY when the opponent never plays at all (AFK from
-      // the start). Once they've issued a single order, going quiet later is a
-      // legitimate choice and must NOT void the match. The guest learns of host
-      // actions via snap.acts, the host of guest orders via cmd messages.
-      if (this.role !== "solo" && this.inited && !this.voided && !this.oppActed && this.elapsed > IDLE_LIMIT) {
-        this.voidMatch("Adversaire inactif", true);
-      }
-
-      if (this.role === "guest" && !this.inited) {
-        this.readyT -= dt;
-        if (this.readyT <= 0) {
-          this.readyT = 0.6;
-          this.sendNet({ type: "ready", name: this.myName, uid: this.myUid });
-        }
-      }
-
-      const mine = this.myFaction;
-      const m = this.map.tileCenter(this.axisCol[mine], 0);
-      // frontRowFromTop: on every screen "my" army pushes upward (the
-      // guest's view is mirrored), so the marker sits on my furthest row
-      this.axisMarker = {
-        x: m.x,
-        y: clamp(this.map.frontRowFromTop(mine, this.axisCol[mine]) * TILE, 60, MAP_H - 60),
-      };
     }
 
-    if (this.fpsMeter) {
-      const units = this.role === "guest" ? this.remote?.unitCount ?? 0 : this.units.length;
-      const net =
-        this.role === "guest"
-          ? `  ${(this.lastSnapBytes / 1024).toFixed(1)}KB gap:${this.remote?.lastGapMs ?? 0}ms buf:${this.remote?.bufferMs ?? 0}ms`
-          : "";
-      this.fpsMeter.info = `${this.role} u:${units}${net}`;
+    // Anti-AFK: void ONLY if the opponent never acts from the start (elapsed is
+    // sim time). Going quiet mid-match after acting is legitimate.
+    if (this.role !== "solo" && this.inited && !this.ended && !this.voided && !this.oppActed && this.elapsed > IDLE_LIMIT) {
+      this.voidMatch("Adversaire inactif", true);
     }
 
-    this.sweepDead();
+    if (this.fpsMeter) this.fpsMeter.info = this.debugReadout();
     this.bringToFront();
+  }
+
+  /**
+   * One deterministic simulation tick (fixed dt). Both clients run identical
+   * ticks, apply each order at the same shared tick, and draw from one seeded
+   * RNG in the same order → bit-exact state (mod the guest's vertical mirror).
+   */
+  private simStep(): void {
+    const T = this.simTick;
+
+    // 1. Execute orders scheduled for this tick. Each client issues only its
+    //    OWN faction, so sorting by faction yields the same sequence on both.
+    const due = this.pendingCmds.get(T);
+    if (due) {
+      this.pendingCmds.delete(T);
+      due.sort((a, b) => a.faction - b.faction);
+      for (const c of due) this.executeCommand(c);
+    }
+
+    // 2. Advance the world by exactly one tick.
+    this.rebuildBuckets();
+    for (const b of this.buildings) {
+      b.soldierLevel = this.levels[b.faction];
+      b.tankLevel = this.tankLevels[b.faction];
+      b.turretLevel = this.turretLevels[b.faction];
+    }
+    super.update(TICK_MS); // every entity + timers, fixed dt
+    this.updateStrikes(TICK_DT);
+
+    this.incomeT -= TICK_DT;
+    if (this.incomeT <= 0) {
+      this.incomeT = INCOME_EVERY;
+      this.gold[BLUE] += 2;
+      // Solo: the AI's war chest grows with time — stall and it buries you
+      this.gold[RED] += this.role === "solo" ? 2 + Math.min(2, (this.elapsed / 60) * 0.5) : 2;
+    }
+
+    if (this.role === "solo") {
+      this.brainT -= TICK_DT;
+      if (this.brainT <= 0) {
+        this.brainT = BRAIN_EVERY;
+        this.redBrain();
+      }
+      this.redPanic(TICK_DT);
+    }
+
+    // `?bot=1`: drive MY faction with the solo AI's reflexes through the command
+    // path, so both clients play a real, escalating game (the lockstep test).
+    if (this.botMode) {
+      this.botT -= TICK_DT;
+      if (this.botT <= 0) {
+        this.botT = BRAIN_EVERY;
+        this.playerBot();
+      }
+    }
+
+    this.updateHqDefense(TICK_DT);
+    this.blueShare = this.map.share(BLUE);
+    this.updateHeliLoop(this.helis.some((h) => !h.dead));
+
+    const mine = this.myFaction;
+    const m = this.map.tileCenter(this.axisCol[mine], 0);
+    // My front row (host space), then flipped to screen space for the guest —
+    // the HUD draws this marker in screen space over the mirrored world.
+    const wy = clamp(this.map.frontRowFromTop(mine, this.axisCol[mine]) * TILE, 60, MAP_H - 60);
+    this.axisMarker = { x: m.x, y: this.flipped ? MAP_H - wy : wy };
+
+    this.elapsed += TICK_DT;
+    this.sweepDead();
+
+    // 3. Publish this tick: buffer my orders to execute at T+DELAY on BOTH
+    //    clients, and broadcast the turn (heartbeat even when there are none).
+    const ex = T + (this.role === "solo" ? 1 : INPUT_DELAY);
+    if (this.outgoing.length) {
+      const slot = this.pendingCmds.get(ex);
+      if (slot) slot.push(...this.outgoing);
+      else this.pendingCmds.set(ex, this.outgoing.slice());
+    }
+    if (this.role !== "solo") this.sendNet({ type: "frame", tick: T, cmds: this.outgoing });
+    this.outgoing = [];
+
+    this.simTick = T + 1;
+  }
+
+  /**
+   * Render the guest's world vertically MIRRORED (so their army sits at the
+   * bottom) while the SIMULATION stays in host space. We swap each mobile
+   * entity's cy → MAP_H-cy around the engine draw (sprites stay upright, their
+   * local layout — health bars, shadows — is preserved) and flip the tilemap.
+   * The HUD/faders are screen-space and untouched. This keeps the sim's float
+   * math identical on both clients → bit-exact lockstep.
+   */
+  draw(): void {
+    if (!this.flipped) {
+      super.draw();
+      return;
+    }
+    const world = [this.units, this.bullets, this.buildings, this.helis, this.effects];
+    for (const list of world) for (const e of list) e.cy = MAP_H - e.cy;
+    this.map.renderFlip = true;
+    super.draw();
+    this.map.renderFlip = false;
+    for (const list of world) for (const e of list) e.cy = MAP_H - e.cy;
   }
 
   /* ---------------------------------------------------------------- *
@@ -1177,7 +1181,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   private spawnHqDefenseWave(hq: Building): void {
-    const dir = hq.faction === RED ? 1 : -1;
+    const dir = (hq.faction === RED ? 1 : -1) * this.flipY();
     const enemy = enemyOf(hq.faction);
     const attackers = this.units.filter(
       (u) => !u.dead && u.faction === enemy && u.distTo(hq.cx, hq.cy) <= HQ_DEFENSE_RADIUS
@@ -1201,13 +1205,13 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       const spread = i % 2 === 0 ? -1 : 1;
       this.spawnSoldier(
         hq.faction,
-        hq.cx + spread * rand(18, 150),
-        hq.cy + dir * rand(35, 165),
+        hq.cx + spread * srand(18, 150),
+        hq.cy + dir * srand(35, 165),
         this.levels[hq.faction]
       );
     }
     for (let i = 0; i < tanks; i++) {
-      this.spawnTank(hq.faction, hq.cx + rand(-130, 130), hq.cy + dir * rand(55, 150));
+      this.spawnTank(hq.faction, hq.cx + srand(-130, 130), hq.cy + dir * srand(55, 150));
     }
     this.popup(hq.cx, hq.cy - 54, `DEFENSE QG +${soldiers}`, hq.faction === RED ? 1 : 0);
     this.spawnEffect(new Shockwave(hq.cx, hq.cy, 150, "#ffffff", 0.55));
@@ -1512,6 +1516,160 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   /* ---------------------------------------------------------------- *
+   * Test bot (`?bot=1`) — plays MY faction via the command path
+   *
+   * The mirror means that, on every screen, "my faction" sits at the
+   * bottom and pushes upward, so one faction-generic brain works for the
+   * host (blue) and the guest (red) alike. Decisions use Math.random/
+   * randInt (NOT the sim RNG), so the bot's thinking never perturbs the
+   * deterministic srand stream — only the orders it emits do, exactly as
+   * a human tap would. Every order goes through bot* emitters that apply
+   * locally AND broadcast, so both sims run the same escalating game.
+   * ---------------------------------------------------------------- */
+
+  private playerBot(): void {
+    if (this.elapsed < AI_GRACE) return;
+    const me = this.myFaction;
+    const foe = enemyOf(me);
+    const g = this.gold[me];
+    const reserve = AI_MIN_RESERVE;
+
+    // Keep the attack axis on the hottest column (free, like the solo AI).
+    this.botAxis(this.contestedCol());
+
+    const alive = this.buildings.filter((b) => !b.dead);
+    const myB = (t: BuildingType) => alive.filter((b) => b.faction === me && b.type === t).length;
+    const myUnits = this.units.filter((u) => !u.dead && u.faction === me).length;
+    const foeUnits = this.units.filter((u) => !u.dead && u.faction === foe).length;
+
+    // 1) Airstrike a dense enemy pack.
+    if (g >= COST.strike + reserve) {
+      const pack = this.densestPack(foe, 4);
+      if (pack) {
+        this.botStrike(pack.x, pack.y);
+        return;
+      }
+    }
+    // 2) Helico raid now and then, down a contested column.
+    if (g >= COST.helico + reserve && Math.random() < 0.32) {
+      this.botHeli(this.columnCenter(this.contestedCol()));
+      return;
+    }
+    // 3) Upgrade to answer the current pressure.
+    if (Math.random() < 0.4) {
+      const kind: UpgradeKind = foeUnits > myUnits + 8 ? "turret" : Math.random() < 0.5 ? "soldier" : "tank";
+      if (g >= this.upgradeCostFor(me, kind) + reserve) {
+        this.botUpgrade(kind);
+        return;
+      }
+    }
+    // 4) Otherwise expand production / defense behind the front.
+    const maxBarracks = Math.min(6, 4 + Math.floor(this.elapsed / 90));
+    let want: "barracks" | "factory" | "turret" | null = null;
+    if (foeUnits > myUnits + 10 && myB("turret") < 5 && g >= COST.turret + reserve) want = "turret";
+    else if (myB("barracks") < maxBarracks && g >= COST.barracks + reserve * 0.4) want = "barracks";
+    else if (myB("factory") < 2 && g >= COST.factory + reserve) want = "factory";
+    else if (myB("turret") < 4 && g >= COST.turret + reserve) want = "turret";
+    else if (g >= COST.barracks + reserve + 30) want = "barracks";
+    if (want) this.botTryBuild(want);
+  }
+
+  /** Centre of mass of the densest cluster of `f`'s units (≥ minUnits within a strike radius). */
+  private densestPack(f: Faction, minUnits: number): { x: number; y: number } | null {
+    const us = this.units.filter((u) => !u.dead && u.faction === f);
+    let best: { x: number; y: number } | null = null;
+    let bestCount = minUnits;
+    for (const u of us) {
+      let count = 0;
+      let sx = 0;
+      let sy = 0;
+      for (const o of us) {
+        if (Math.hypot(o.cx - u.cx, o.cy - u.cy) <= STRIKE_RADIUS) {
+          count++;
+          sx += o.cx;
+          sy += o.cy;
+        }
+      }
+      if (count > bestCount) {
+        bestCount = count;
+        best = { x: sx / count, y: sy / count };
+      }
+    }
+    return best;
+  }
+
+  /** The column where my front and the enemy's are closest — the live battle line. */
+  private contestedCol(): number {
+    const me = this.myFaction;
+    const foe = enemyOf(me);
+    let best = 8;
+    let bestGap = Infinity;
+    for (let c = 0; c < GRID_W; c++) {
+      if (!this.map.isLand(c, 1) && !this.map.isLand(c, GRID_H - 2)) continue;
+      const gap = this.map.frontRowFromTop(me, c) - this.map.frontRowFromTop(foe, c);
+      if (gap < bestGap) {
+        bestGap = gap;
+        best = c;
+      }
+    }
+    return clamp(best + randInt(-1, 1), 0, GRID_W - 1);
+  }
+
+  /** Find an owned, buildable tile just behind my front and raise `kind` there. */
+  private botTryBuild(kind: "barracks" | "factory" | "turret"): void {
+    const me = this.myFaction;
+    const axis = this.axisCol[me];
+    for (let tries = 0; tries < 20; tries++) {
+      const c = clamp(axis + randInt(-4, 4), 0, GRID_W - 1);
+      const front = this.map.frontRowFromTop(me, c); // smallest row I own (toward the enemy)
+      const r = clamp(front + randInt(0, 3), 1, GRID_H - 2); // a touch behind it
+      if (this.canBotBuildAt(me, c, r)) {
+        this.botBuild(kind, c, r);
+        return;
+      }
+    }
+    // Fallback: spread out around my HQ so saved gold still becomes useful.
+    const hq = this.buildings.find((b) => !b.dead && b.type === "hq" && b.faction === me);
+    if (!hq) return;
+    for (let tries = 0; tries < 12; tries++) {
+      const c = clamp(hq.col + randInt(-4, 4), 0, GRID_W - 1);
+      const r = clamp(hq.row + randInt(-5, -1), 1, GRID_H - 2); // toward the enemy = up = smaller row
+      if (this.canBotBuildAt(me, c, r)) {
+        this.botBuild(kind, c, r);
+        return;
+      }
+    }
+  }
+
+  private canBotBuildAt(f: Faction, c: number, r: number): boolean {
+    const i = this.map.idx(c, r);
+    return this.map.isLand(c, r) && this.map.owner[i] === f && !this.buildingAt.has(i) && !this.map.hasChest(i);
+  }
+
+  /* Bot order emitters — queue exactly like a human tap (host space, scheduled
+   * to execute at simTick+INPUT_DELAY on both clients). */
+  private botBuild(kind: "barracks" | "factory" | "turret", c: number, r: number): void {
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "build", kind, c, r });
+  }
+
+  private botStrike(x: number, y: number): void {
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "strike", x: Math.round(x), y: Math.round(y) });
+  }
+
+  private botHeli(x: number): void {
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "helico", x: Math.round(x) });
+  }
+
+  private botAxis(c: number): void {
+    if (this.axisCol[this.myFaction] === c) return;
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "axis", col: c });
+  }
+
+  private botUpgrade(kind: UpgradeKind): void {
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "upgrade", kind });
+  }
+
+  /* ---------------------------------------------------------------- *
    * World helpers
    * ---------------------------------------------------------------- */
 
@@ -1540,10 +1698,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     for (const b of this.buildings) put(b);
   }
 
-  /** Explosion with gameplay record (host) — guests get it via `booms`. */
+  /** Explosion — each client spawns its own (the sim is deterministic). */
   private explosion(x: number, y: number, big: boolean): void {
     this.explosionVisual(x, y, big);
-    if (this.role === "host") this.pBooms.push([Math.round(x), Math.round(y), big ? 1 : 0]);
   }
 
   private explosionVisual(x: number, y: number, big: boolean): void {
@@ -1614,9 +1771,12 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   /** Solo/host: authoritative end. */
   private endGame(winner: Faction): void {
     if (this.ended) return;
+    // Lockstep: the guest runs its own sim, so its local HQ kill can fire a
+    // moment before (or, on drift, disagree with) the host. The host stays
+    // authoritative for the verdict — the guest ends only via the "end" msg.
+    if (this.role === "guest") return;
     if (this.role === "host") {
-      // One last snapshot so the guest sees the HQ blow up, then the verdict
-      this.sendSnapshot();
+      // The guest's own sim destroys the HQ too; the host's verdict is final.
       this.sendNet({
         type: "end",
         winner,

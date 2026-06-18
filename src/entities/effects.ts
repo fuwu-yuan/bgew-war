@@ -27,10 +27,16 @@ export class FpsMeter extends GameObject {
     super.draw(ctx);
     ctx.font = "12px monospace";
     ctx.textAlign = "left";
-    ctx.fillStyle = "rgba(0,0,0,0.55)";
-    ctx.fillRect(2, 2, 168, 18);
+    // `info` may be multi-line (the game step packs every comparable count in).
+    const lines = this.info ? this.info.split("\n") : [];
+    const w = 250;
+    const h = (lines.length + 1) * 15 + 5;
+    ctx.fillStyle = "rgba(0,0,0,0.62)";
+    ctx.fillRect(2, 2, w, h);
     ctx.fillStyle = this.fps >= 50 ? "#5dde6a" : this.fps >= 30 ? "#ffd95e" : "#ff5b4d";
-    ctx.fillText(`FPS ${this.fps}  ${this.info}`, 7, 15);
+    ctx.fillText(`FPS ${this.fps}`, 7, 15);
+    ctx.fillStyle = "#d6e6ff";
+    for (let i = 0; i < lines.length; i++) ctx.fillText(lines[i], 7, 30 + i * 15);
   }
 }
 

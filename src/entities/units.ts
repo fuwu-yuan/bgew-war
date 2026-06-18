@@ -1,7 +1,8 @@
 import { GameObject } from "./gameobject";
 import { GameAPI, Target } from "../api";
 import { BLUE, COLORS, Faction, MAP_H, RED, VIEW_W } from "../globals";
-import { clamp, rand, TAU } from "../utils";
+import { clamp, TAU } from "../utils";
+import { srand } from "../sim-rng";
 import { drawSprite, SPR } from "../sprites";
 
 /**
@@ -27,10 +28,10 @@ export abstract class Unit extends GameObject {
   protected fireSfx: string;
   protected fireSfxVol: number;
 
-  private cd = rand(0.2, 1);
-  private convertCd = rand(0.05, 0.3);
-  private lane = rand(-100, 100);
-  private walkT = rand(0, TAU);
+  private cd = srand(0.2, 1); // sim: fire cooldown
+  private convertCd = srand(0.05, 0.3); // sim: tile-conversion timing
+  private lane = srand(-100, 100); // sim: movement lane offset
+  private walkT = srand(0, TAU); // seeded: feeds the movement wobble (vx), so it MUST be deterministic
   private walking = false;
   private muzzleT = 0;
   private aimX = 0;
@@ -66,7 +67,7 @@ export abstract class Unit extends GameObject {
     this.sprSize = o.sprSize;
     this.fireSfx = o.fireSfx;
     this.fireSfxVol = o.fireSfxVol;
-    this.aimY = faction === RED ? 1 : -1;
+    this.aimY = (faction === RED ? 1 : -1) * game.flipY();
   }
 
   get isTank(): boolean {
@@ -86,7 +87,7 @@ export abstract class Unit extends GameObject {
       this.aimX = target.cx - this.cx;
       this.aimY = target.cy - this.cy;
       if (this.cd <= 0) {
-        this.cd = this.firePeriod * rand(0.85, 1.15);
+        this.cd = this.firePeriod * srand(0.85, 1.15);
         this.muzzleT = 0.06;
         this.game.fireBullet(this.cx, this.cy, target, this.dmgVal, this.faction, this.isTank);
         this.game.sfx(this.fireSfx, this.fireSfxVol);
@@ -110,7 +111,7 @@ export abstract class Unit extends GameObject {
   }
 
   private move(dt: number): void {
-    const dirY = this.faction === RED ? 1 : -1;
+    const dirY = (this.faction === RED ? 1 : -1) * this.game.flipY();
     const desiredX = this.game.axisX(this.faction) + this.lane;
     let vx = clamp((desiredX - this.cx) * 1.4, -this.moveSpd, this.moveSpd) + Math.sin(this.walkT * 2.6) * 9;
     let vy = dirY * this.moveSpd;
@@ -183,7 +184,7 @@ export class Soldier extends Unit {
       dmg: 1 + 0.5 * (level - 1),
       range: 90 + 5 * (level - 1),
       firePeriod: 1 * Math.pow(0.95, level - 1),
-      speed: rand(48, 62) + 5 * (level - 1),
+      speed: srand(48, 62) + 5 * (level - 1),
       spr: faction === BLUE ? SPR.B_SOLDIER : SPR.R_SOLDIER,
       sprSize: 26,
       fireSfx: `shot${1 + Math.floor(Math.random() * 3)}`,

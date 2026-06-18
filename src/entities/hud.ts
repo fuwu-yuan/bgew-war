@@ -175,6 +175,19 @@ export class Hud extends Entity {
     ctx.fillText(this.trunc(s.enemyName), VIEW_W - 6, 24);
     ctx.textAlign = "left";
 
+    /* Battle clock — centered at the top, between the two names (m:ss) */
+    const total = Math.max(0, Math.floor(s.elapsed));
+    const clock = `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+    ctx.font = `11px ${FONT}`;
+    const cw = ctx.measureText(clock).width;
+    ctx.fillStyle = "rgba(8, 20, 38, 0.6)";
+    this.roundRect(ctx, VIEW_W / 2 - cw / 2 - 7, 15, cw + 14, 15, 4);
+    ctx.fill();
+    ctx.fillStyle = "#ffffff";
+    ctx.textAlign = "center";
+    ctx.fillText(clock, VIEW_W / 2, 27);
+    ctx.textAlign = "left";
+
     /* Bottom panel */
     ctx.fillStyle = COLORS.hudBg;
     ctx.fillRect(0, MAP_H, VIEW_W, VIEW_H - MAP_H);

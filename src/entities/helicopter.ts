@@ -12,7 +12,8 @@ import {
   RED,
   VIEW_W,
 } from "../globals";
-import { clamp, rand, TAU } from "../utils";
+import { clamp, TAU } from "../utils";
+import { srand } from "../sim-rng";
 import { drawSprite, SPR } from "../sprites";
 
 /** Rendu partagé hôte/invité : ombre décalée au sol, sprite qui plane, rotor animé. */
@@ -62,7 +63,7 @@ export class Helicopter extends GameObject {
   public returning = false;
 
   private game: GameAPI;
-  private t = rand(0, TAU);
+  private t = srand(0, TAU); // seeded: feeds the heli's cx drift, must be deterministic
   private fireCd = 0.5; // petit délai de décollage avant la première rafale
 
   constructor(game: GameAPI, faction: Faction, cx: number, cy: number) {
@@ -76,7 +77,7 @@ export class Helicopter extends GameObject {
     this.t += dt;
     this.fireCd -= dt;
 
-    const dir = this.faction === RED ? 1 : -1; // vers l'ennemi
+    const dir = (this.faction === RED ? 1 : -1) * this.game.flipY(); // vers l'ennemi (miroir-safe)
     this.cy += (this.returning ? -dir : dir) * HELI_SPEED * dt;
     this.cx = clamp(this.cx + Math.sin(this.t * 1.6) * 16 * dt, 18, VIEW_W - 18);
     if (!this.returning && (dir > 0 ? this.cy >= MAP_H - 64 : this.cy <= 64)) {
@@ -90,7 +91,7 @@ export class Helicopter extends GameObject {
     if (this.fireCd <= 0) {
       const target = this.game.nearestEnemy(this.cx, this.cy, this.faction, HELI_RANGE);
       if (target) {
-        this.fireCd = HELI_FIRE_PERIOD * rand(0.85, 1.15);
+        this.fireCd = HELI_FIRE_PERIOD * srand(0.85, 1.15);
         this.game.fireBullet(this.cx, this.cy, target, HELI_DMG, this.faction, false);
         this.game.sfx("shot2", 0.1);
       }
