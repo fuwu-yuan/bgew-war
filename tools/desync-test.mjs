@@ -75,7 +75,16 @@ async function open(browser, tag) {
   return { p, at: (x, y) => [box.x + x * scale, box.y + y * scale] };
 }
 const sig = (pg) => pg.evaluate(() => window.__bgewwar.steps.play.simSignature());
+// Atomic sig+unit-dump at ONE tick (so host & guest can be diffed unit-by-unit).
+const probe = (pg) => pg.evaluate(() => ({ sig: window.__bgewwar.steps.play.simSignature(), dump: window.__bgewwar.steps.play.dumpUnits() }));
 const step = (pg) => pg.evaluate(() => window.__bgewwar.board.step.name);
+function firstDiffs(a, b, n = 6) {
+  const A = a.split("|"), B = b.split("|"), out = [];
+  const setB = new Set(B), setA = new Set(A);
+  for (const r of A) if (!setB.has(r) && out.length < n) out.push(`H only: ${r}`);
+  for (const r of B) if (!setA.has(r) && out.length < n) out.push(`G only: ${r}`);
+  return out;
+}
 
 const A = await open(browserA, "A");
 const B = await open(browserB, "B");
@@ -97,30 +106,56 @@ if ((await step(host.p)) !== "game" || (await step(guest.p)) !== "game") errors.
 const samples = [15, 30, 45, 60, 75, 90];
 let prev = 8;
 let last = null;
+let sawExact = false;
+const ended = (pg) => pg.evaluate(() => window.__bgewwar.steps.play.ended || window.__bgewwar.board.step.name !== "game");
 for (const t of samples) {
   await host.p.waitForTimeout((t - prev) * 1000); prev = t;
-  if ((await step(host.p)) !== "game" || (await step(guest.p)) !== "game") {
-    console.log(`t≈${t}s  match ended early (a HQ fell) — stopping samples`);
+  if ((await ended(host.p)) || (await ended(guest.p))) {
+    console.log(`t≈${t}s  match already decided (a HQ fell) — stopping samples`);
     break;
   }
-  const [sh, sg] = await Promise.all([sig(host.p), sig(guest.p)]);
+  // Compare at the SAME sim tick: the host leads by ~INPUT_DELAY ticks, so
+  // snapshot the host, then let the guest catch up to that exact tick. Now any
+  // residual delta is true divergence, not the input-delay sampling offset.
+  const ph = await probe(host.p);
+  const sh = ph.sig;
+  let pg = await probe(guest.p);
+  for (let k = 0; k < 400 && pg.sig.tick < sh.tick; k++) {
+    await guest.p.waitForTimeout(4); // poll fast so we land ON the host's tick
+    pg = await probe(guest.p);
+  }
+  const sg = pg.sig;
+  if (sh.tick === sg.tick && ph.dump !== pg.dump) {
+    console.log(`  first unit diffs @tick ${sh.tick}:\n    ` + firstDiffs(ph.dump, pg.dump).join("\n    "));
+  }
   await Promise.all([
     host.p.screenshot({ path: `/tmp/desync-${t}s-host.png` }),
     guest.p.screenshot({ path: `/tmp/desync-${t}s-guest.png` }),
   ]);
   const dU = Math.abs(sh.units - sg.units), dB = Math.abs(sh.buildings - sg.buildings);
+  const dH = Math.abs(sh.helis - sg.helis);
   const dS = Math.abs(sh.share - sg.share), dG = Math.abs((sh.goldR + sh.goldB) - (sg.goldR + sg.goldB));
-  last = { dU, dB, dS, dG, units: Math.max(sh.units, sg.units) };
-  console.log(`t≈${t}s  HOST ${JSON.stringify(sh)}  GUEST ${JSON.stringify(sg)}  Δunits=${dU} Δbuild=${dB} Δshare=${dS}pts Δgold=${dG}`);
-}
+  const dTick = Math.abs(sh.tick - sg.tick); // the two reads land a few ticks apart
+  last = { units: Math.max(sh.units, sg.units) };
+  console.log(`t≈${t}s  HOST ${JSON.stringify(sh)}  GUEST ${JSON.stringify(sg)}  Δtick=${dTick} Δunits=${dU} Δheli=${dH} Δbuild=${dB} Δshare=${dS}pts Δgold=${dG}`);
 
-// Gate on the authoritative quantities; unit count may drift but must stay sane.
-if (last) {
-  if (last.dB > 4) errors.push(`buildings diverged: Δ=${last.dB}`);
-  if (last.dS > 8) errors.push(`territory diverged: Δshare=${last.dS}pts`);
-  if (last.dU > last.units * 0.5) errors.push(`unit count diverged: Δ=${last.dU} of ${last.units}`);
-  if (last.units < 20) errors.push(`bots barely played: only ${last.units} units — check ?bot=1`);
+  // True deterministic lockstep, checked PER SAMPLE. At the SAME tick the sims
+  // must be BIT-EXACT (the proof). With a ±dTick skew a command (≤150 gold) or a
+  // spawn can legitimately land in the gap, so deltas are bounded by the skew —
+  // never by game size (the old best-effort model grew without bound).
+  if (dTick === 0) {
+    if (dU || dH || dB || dS || dG)
+      errors.push(`t${t}: NOT bit-exact at equal tick: Δunits=${dU} Δheli=${dH} Δbuild=${dB} Δshare=${dS}pts Δgold=${dG}`);
+    else sawExact = true;
+  } else {
+    if (dB > 2) errors.push(`t${t}: buildings diverged Δ=${dB} (Δtick=${dTick})`);
+    if (dS > 3) errors.push(`t${t}: territory diverged Δshare=${dS}pts (Δtick=${dTick})`);
+    if (dG > 160 * dTick + 4) errors.push(`t${t}: gold diverged Δ=${dG} (Δtick=${dTick})`);
+    if (dU > 4 * dTick + 4) errors.push(`t${t}: units diverged Δ=${dU} (Δtick=${dTick})`);
+  }
 }
+if (last && last.units < 20) errors.push(`bots barely played: only ${last.units} units — check ?bot=1`);
+if (!sawExact) errors.push("never caught the two sims at the same tick — can't prove bit-exactness");
 
 console.log(errors.length ? "ERRORS:\n" + errors.join("\n") : "run ok ✓ (screenshots in /tmp/desync-*.png)");
 if (HEADED) { console.log("watch the two windows… closing in 40s"); await A.p.waitForTimeout(40000); }

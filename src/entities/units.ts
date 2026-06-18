@@ -1,7 +1,7 @@
 import { GameObject } from "./gameobject";
 import { GameAPI, Target } from "../api";
 import { BLUE, COLORS, Faction, MAP_H, RED, VIEW_W } from "../globals";
-import { clamp, rand, TAU } from "../utils";
+import { clamp, TAU } from "../utils";
 import { srand } from "../sim-rng";
 import { drawSprite, SPR } from "../sprites";
 
@@ -31,7 +31,7 @@ export abstract class Unit extends GameObject {
   private cd = srand(0.2, 1); // sim: fire cooldown
   private convertCd = srand(0.05, 0.3); // sim: tile-conversion timing
   private lane = srand(-100, 100); // sim: movement lane offset
-  private walkT = rand(0, TAU); // cosmetic — keeps Math.random
+  private walkT = srand(0, TAU); // seeded: feeds the movement wobble (vx), so it MUST be deterministic
   private walking = false;
   private muzzleT = 0;
   private aimX = 0;

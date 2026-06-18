@@ -33,14 +33,24 @@ import { Fader, FpsMeter, Particle, ScorePopup, Shockwave, StrikeMarker, Tracer 
 import { BuildMode, Hud, HudState } from "../entities/hud";
 import { GameObject } from "../entities/gameobject";
 import { RemoteWorld } from "../entities/remote";
-import { CmdMsg, EndMsg, GameMsg, gameData, InitMsg, IpMsg, MultiData, SnapMsg, VoidMsg } from "../network";
+import { CmdMsg, EndMsg, FrameMsg, GameMsg, gameData, InitMsg, IpMsg, MultiData, SnapMsg, VoidMsg } from "../network";
 import { track, trackScreen } from "../analytics";
 import { toggleMute } from "../sound";
 import { currentUser, displayName } from "../firebase";
 
 const BRAIN_EVERY = 3; // s — red AI thinks (solo only)
 const INCOME_EVERY = 1; // s
-const SNAP_EVERY = 0.1; // s — host → guest snapshots
+const SNAP_EVERY = 0.1; // s — host → guest snapshots (legacy; unused under lockstep)
+
+/* Deterministic lockstep (phases 1 & 3): a fixed sim tick + input delay. */
+const TICK_HZ = 60;
+const TICK_MS = 1000 / TICK_HZ;
+const TICK_DT = 1 / TICK_HZ; // s — every sim step integrates exactly this
+/** Ticks between issuing an order and executing it. Both clients buffer orders
+ *  to this shared tick, so they run in identical RNG order. ~200ms covers the
+ *  relay round-trip; under worse latency the sim micro-stalls (never desyncs). */
+const INPUT_DELAY = 12;
+const MAX_STEPS_PER_UPDATE = 6; // anti-spiral: never simulate more than this per frame
 /* Anti-cheat (ranked multiplayer fairness) */
 const IDLE_LIMIT = 30; // s of opponent inactivity → the match is stopped & voided
 const MIN_RANKED_DURATION = 20; // s — anything shorter can't be ranked
@@ -130,10 +140,6 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   /* Lockstep foundation: shared RNG seed (host-minted, sent in init). */
   private matchSeed = 0;
   private nextNid = 1;
-  private pShots: number[][] = [];
-  private pBooms: number[][] = [];
-  private pPops: [number, number, string, number][] = [];
-  private pWarns: number[][] = [];
 
   /* Airstrikes in flight + solo-AI panic state */
   private strikes: { x: number; y: number; t: number; faction: Faction }[] = [];
@@ -166,6 +172,13 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   /** `?bot=1` — auto-play MY faction through the command path (desync tests). */
   private botMode = false;
   private botT = BRAIN_EVERY;
+
+  /* Deterministic lockstep state */
+  private simTick = 0; // ticks executed locally
+  private remoteTick = 0; // highest tick the opponent has reached (from frames)
+  private acc = 0; // ms accumulated toward the next fixed step
+  private pendingCmds = new Map<number, CmdMsg[]>(); // executeTick → orders
+  private outgoing: CmdMsg[] = []; // orders issued this tick, flushed in a frame
   private incomeT = INCOME_EVERY;
   private buckets: Target[][] = [];
   private sfxLast = new Map<string, number>();
@@ -175,17 +188,31 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   /** Flip-invariant gameplay signature for desync detection (host vs guest). */
-  simSignature(): { t: number; units: number; buildings: number; goldR: number; goldB: number; share: number } {
+  simSignature(): { tick: number; t: number; units: number; helis: number; buildings: number; goldR: number; goldB: number; share: number } {
     const units = this.units.filter((u) => !u.dead).length;
+    const helis = this.helis.filter((h) => !h.dead).length;
     const buildings = this.buildings.filter((b) => !b.dead).length;
     return {
+      tick: this.simTick, // exact sim tick — lets a comparer separate skew from drift
       t: Math.round(this.elapsed),
       units,
+      helis,
       buildings,
       goldR: Math.floor(this.gold[RED]),
       goldB: Math.floor(this.gold[BLUE]),
       share: Math.round(this.blueShare * 100),
     };
+  }
+
+  /** Determinism probe: every unit in CANONICAL (host) space, sorted by nid, so
+   *  the host and guest dumps can be diffed directly to find the first drift. */
+  dumpUnits(): string {
+    const canon = (cy: number) => Math.round(this.flipped ? MAP_H - cy : cy);
+    const rows = this.units
+      .filter((u) => !u.dead)
+      .map((u) => `${u.nid},${u.faction},${Math.round(u.cx)},${canon(u.cy)},${Math.round(u.hp)}`)
+      .sort();
+    return rows.join("|");
   }
 
   /** `?debug=1` overlay text — every comparable count, by ABSOLUTE faction
@@ -328,11 +355,12 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.incomeT = INCOME_EVERY;
     this.snapT = 0;
     this.readyT = 0;
+    this.simTick = 0;
+    this.remoteTick = 0;
+    this.acc = 0;
+    this.pendingCmds.clear();
+    this.outgoing = [];
     this.nextNid = 1;
-    this.pShots = [];
-    this.pBooms = [];
-    this.pPops = [];
-    this.pWarns = [];
     this.strikes = [];
     this.garrisonCd = 0;
     this.alertT = 0;
@@ -472,11 +500,18 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       return;
     }
 
-    // Commands flow BOTH ways now (lockstep): each client applies the opponent's
-    // order to the opponent's faction, in its own (mirrored) space.
-    if (data.type === "cmd") {
-      this.oppActed = true;
-      this.applyCommand(data as CmdMsg);
+    // Lockstep turn: advance our view of the opponent's tick (so we may step)
+    // and buffer their orders to the shared execute tick. Flows both ways.
+    if (data.type === "frame") {
+      const fr = data as FrameMsg;
+      if (fr.tick > this.remoteTick) this.remoteTick = fr.tick;
+      if (fr.cmds && fr.cmds.length) {
+        this.oppActed = true;
+        const ex = fr.tick + INPUT_DELAY;
+        const slot = this.pendingCmds.get(ex);
+        if (slot) slot.push(...fr.cmds);
+        else this.pendingCmds.set(ex, fr.cmds.slice());
+      }
       return;
     }
 
@@ -484,13 +519,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       if (data.type === "ready") {
         if (typeof data.name === "string") this.enemyName = data.name || "Invite";
         if (typeof data.uid === "string") this.enemyUid = data.uid;
-        // (Re)send the island + an immediate snapshot, carrying our name, uid
-        // and the shared match id the guest reports under.
+        // (Re)send the island + seed so the guest builds the SAME initial state.
         const init: InitMsg = { type: "init", map: this.map.getInitData(), name: this.myName, uid: this.myUid, matchId: this.matchId, seed: this.matchSeed };
         this.sendNet(init);
-        // The (re)joined guest knows no units yet → resend every unit's static data.
-        this.sentStatic.clear();
-        this.sendSnapshot();
         this.sendNet({ type: "ip", hash: this.myIpHash ?? "" }); // (re)share our IP hash
       }
       return;
@@ -512,8 +543,6 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         this.inited = true;
       }
       this.sendNet({ type: "ip", hash: this.myIpHash ?? "" }); // share our IP hash
-    } else if (data.type === "snap") {
-      this.applySnapshot(data as SnapMsg);
     } else if (data.type === "end") {
       const end = data as EndMsg;
       this.killsBy = { [RED]: end.kills.red, [BLUE]: end.kills.blue };
@@ -588,15 +617,15 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     }
   }
 
-  /** Host: a validated order from the red (guest) player. */
   /**
-   * Apply the OPPONENT's command. Commands travel in host space; this client
-   * converts them to its own space (viewRow/viewY — identity on host, mirrored
-   * on guest) and applies them to the opponent's faction.
+   * Execute ONE order at its scheduled tick (lockstep) — mine or the opponent's,
+   * identical on both clients. Orders travel in host space + an absolute faction;
+   * each client converts coords to its own space (viewRow/viewY — identity on the
+   * host, mirrored on the guest) and applies them to that faction.
    */
-  private applyCommand(cmd: CmdMsg): void {
+  private executeCommand(cmd: CmdMsg): void {
     if (this.ended) return;
-    const f = enemyOf(this.myFaction); // a received command is always the opponent's
+    const f: Faction = cmd.faction === RED ? RED : BLUE;
     if (cmd.cmd === "axis" && typeof cmd.col === "number") {
       this.axisCol[f] = clamp(Math.round(cmd.col), 0, GRID_W - 1); // col is X — no mirror
       return;
@@ -645,84 +674,6 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     }
   }
 
-  /**
-   * Host → guest authoritative correction (~2 Hz). Lockstep: the guest runs
-   * its OWN sim, so this is deliberately LEAN — no per-unit stream, no effects.
-   * It carries only what the guest can't derive on its own and must not be left
-   * to drift: the faction economy, upgrade levels, the action counter (anti-AFK)
-   * and the FULL territory grid (the scoreboard + win-condition surface). A few
-   * hundred bytes instead of the old multi-kilobyte world snapshot.
-   */
-  private sendSnapshot(period: number = SNAP_EVERY): void {
-    // Drain the per-snapshot effect/dirty queues so they can't grow unbounded
-    // (the guest produces its own effects locally; they're not transmitted).
-    this.pShots = [];
-    this.pBooms = [];
-    this.pPops = [];
-    this.pWarns = [];
-    this.map.flushDirty();
-
-    const snap: SnapMsg = {
-      type: "snap",
-      units: [],
-      hurt: [],
-      spawns: [],
-      buildings: [],
-      own: [],
-      grid: this.map.ownerString(),
-      shots: [],
-      booms: [],
-      pops: [],
-      warns: [],
-      gold: { red: this.gold[RED], blue: this.gold[BLUE] },
-      lvl: {
-        red: this.levels[RED],
-        blue: this.levels[BLUE],
-        tankRed: this.tankLevels[RED],
-        tankBlue: this.tankLevels[BLUE],
-        turretRed: this.turretLevels[RED],
-        turretBlue: this.turretLevels[BLUE],
-      },
-      share: this.map.share(BLUE),
-      acts: this.myActs,
-      period,
-    };
-    this.sendNet(snap);
-  }
-
-  /**
-   * Guest: the host's periodic snapshot. The guest now runs its OWN sim, so for
-   * this first lockstep pass the snapshot is used ONLY as the anti-AFK signal
-   * (host action counter) — per-unit/state correction is the next sub-step.
-   * Leaving it inert lets the desync harness measure RAW sim divergence.
-   */
-  private applySnapshot(snap: SnapMsg): void {
-    if (this.debug) this.lastSnapBytes = JSON.stringify(snap).length;
-    // Light authoritative correction: the guest runs its own sim for smooth,
-    // network-independent unit motion; we only reconcile the faction-wide
-    // economy + upgrade levels (units/territory drift is tiny and self-similar).
-    // Territory is authoritative: adopt the host's full ownership grid wholesale
-    // (mirrored for our flipped view). This snaps the scoreboard + front line back
-    // every snapshot, so per-unit drift can never accumulate into a wrong map.
-    if (snap.grid) {
-      this.map.applyOwnerString(snap.grid, this.flipped);
-      this.blueShare = this.map.share(BLUE);
-    }
-    this.gold[RED] = snap.gold.red;
-    this.gold[BLUE] = snap.gold.blue;
-    this.levels[RED] = snap.lvl.red;
-    this.levels[BLUE] = snap.lvl.blue;
-    this.tankLevels[RED] = snap.lvl.tankRed ?? 1;
-    this.tankLevels[BLUE] = snap.lvl.tankBlue ?? 1;
-    this.turretLevels[RED] = snap.lvl.turretRed ?? 1;
-    this.turretLevels[BLUE] = snap.lvl.turretBlue ?? 1;
-    const acts = snap.acts ?? 0;
-    if (acts > this.lastSeenActs) {
-      this.lastSeenActs = acts;
-      this.oppActed = true;
-    }
-  }
-
   /* ---------------------------------------------------------------- *
    * Input — one tap handler drives everything (desktop & mobile)
    * ---------------------------------------------------------------- */
@@ -749,6 +700,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
     if (!this.mode) return;
 
+    // Orders are scheduled, not applied now: they execute at simTick+INPUT_DELAY
+    // on BOTH clients (lockstep). The gold check here is just UX — the real
+    // spend happens deterministically at execution (re-checked there).
     if (this.mode === "strike") {
       if (this.myGold < COST.strike) {
         this.board.playSound("error", false, 0.4);
@@ -756,11 +710,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
       this.mode = null;
       track("use_airstrike", { mode: this.role });
-      this.myActs++;
-      // Lockstep: apply locally AND broadcast (host space) — both sims act.
-      this.gold[mine] -= COST.strike;
-      this.scheduleStrike(x, y, mine);
-      this.sendNet({ type: "cmd", cmd: "strike", x: Math.round(x), y: Math.round(this.viewY(y)) });
+      this.queueCmd({ type: "cmd", faction: mine, cmd: "strike", x: Math.round(x), y: Math.round(this.viewY(y)) });
       this.board.playSound("click", false, 0.5);
       return;
     }
@@ -772,24 +722,18 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
       this.mode = null;
       track("use_helico", { mode: this.role });
-      this.myActs++;
-      this.gold[mine] -= COST.helico;
-      this.spawnHeli(mine, x);
-      // x needs no conversion: the mirror only flips y.
-      this.sendNet({ type: "cmd", cmd: "helico", x: Math.round(x) });
+      this.queueCmd({ type: "cmd", faction: mine, cmd: "helico", x: Math.round(x) }); // x: no mirror
       this.board.playSound("click", false, 0.5);
       return;
     }
 
     if (this.mode === "axis") {
       const c = clamp(Math.floor(x / TILE), 0, GRID_W - 1);
-      this.axisCol[mine] = c;
       this.mode = null;
       track("set_axis", { mode: this.role });
-      this.myActs++;
       this.board.playSound("click", false, 0.5);
       this.spawnEffect(new ScorePopup(x, y, "AXE D'ATTAQUE", "#ffe27a", 16));
-      this.sendNet({ type: "cmd", cmd: "axis", col: c }); // col is X — no mirror
+      this.queueCmd({ type: "cmd", faction: mine, cmd: "axis", col: c }); // col is X — no mirror
       return;
     }
 
@@ -813,14 +757,17 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     }
     this.mode = null;
     track("build", { type: kind, mode: this.role });
-    this.myActs++;
-    this.gold[mine] -= cost;
-    this.placeBuilding(mine, kind, c, r);
     this.board.playSound("build", false, 0.5);
-    const center = this.map.tileCenter(c, r);
-    this.spawnEffect(new Shockwave(center.x, center.y, 50, "#ffffff", 0.35));
-    // Broadcast in host space (row mirrored back on the guest).
-    this.sendNet({ type: "cmd", cmd: "build", kind, c, r: this.viewRow(r) });
+    // Host space (row mirrored back on the guest). The building + shockwave
+    // appear at execution (a few hundred ms later).
+    this.queueCmd({ type: "cmd", faction: mine, cmd: "build", kind, c, r: this.viewRow(r) });
+  }
+
+  /** Queue one of MY orders. It rides this tick's frame and executes at
+   *  simTick+INPUT_DELAY on both clients. Counts as a meaningful action. */
+  private queueCmd(cmd: CmdMsg): void {
+    this.outgoing.push(cmd);
+    this.myActs++;
   }
 
   private requestUpgrade(kind: UpgradeKind): void {
@@ -830,9 +777,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       return;
     }
     track("upgrade", { kind, level: this.upgradeLevelFor(this.myFaction, kind) + 1, mode: this.role });
-    this.myActs++;
-    this.buyUpgrade(this.myFaction, kind);
-    this.sendNet({ type: "cmd", cmd: "upgrade", kind });
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "upgrade", kind });
   }
 
   private upgradeLevelFor(f: Faction, kind: UpgradeKind): number {
@@ -899,7 +844,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         for (const t of cell) {
           if (t.dead || t.faction !== seek) continue;
           const d = Math.hypot(t.cx - x, t.cy - y) - t.radius;
-          if (d <= range && d < bestD) {
+          // Tie-break by nid: bucket scan order is mirror-flipped on the guest,
+          // so on an exact-distance tie the two sims would otherwise pick
+          // different targets and slowly desync. nid is mirror-invariant.
+          if (d <= range && (d < bestD || (d === bestD && best !== null && t.nid < best.nid))) {
             bestD = d;
             best = t;
           }
@@ -913,9 +861,6 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     const b = new Bullet(this, x, y, target, dmg, f, big);
     this.bullets.push(b);
     this.board.addEntity(b);
-    if (this.role === "host") {
-      this.pShots.push([Math.round(x), Math.round(y), Math.round(target.cx), Math.round(target.cy), big ? 1 : 0]);
-    }
   }
 
   spawnSoldier(f: Faction, x: number, y: number, level?: number): void {
@@ -956,7 +901,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     for (const h of this.helis) {
       if (h.dead || h.faction !== seek) continue;
       const d = Math.hypot(h.cx - x, h.cy - y) - h.radius;
-      if (d <= range && d < bestD) {
+      if (d <= range && (d < bestD || (d === bestD && best !== null && h.nid < best.nid))) {
         bestD = d;
         best = h;
       }
@@ -1026,10 +971,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.board.playSound(name, false, volume);
   }
 
-  /** Popup visible on both sides (recorded for the guest in multi). */
+  /** Popup — each client spawns its own (the sim is deterministic). */
   private popup(x: number, y: number, text: string, colorIdx: 0 | 1): void {
     this.spawnEffect(new ScorePopup(x, y, text, colorIdx === 1 ? "#ff8b7a" : COLORS.gold, 15));
-    if (this.role === "host") this.pPops.push([Math.round(x), Math.round(y), text, colorIdx]);
   }
 
   /* ---------------------------------------------------------------- *
@@ -1040,7 +984,6 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.strikes.push({ x, y, t: STRIKE_DELAY, faction: f });
     this.spawnEffect(new StrikeMarker(x, y, STRIKE_RADIUS, STRIKE_DELAY));
     this.popup(x, y - STRIKE_RADIUS - 8, "FRAPPE !", 1);
-    if (this.role === "host") this.pWarns.push([Math.round(x), Math.round(y)]);
     this.sfx("click", 0.5);
   }
 
@@ -1078,101 +1021,124 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
    * ---------------------------------------------------------------- */
 
   update(delta: number): void {
-    const dt = Math.min(delta, 50) / 1000;
-    this.elapsed += dt;
-
-    // Lockstep: the guest runs the SAME sim once `init` has set it up. `inited`
-    // is always true for host/solo, and true for the guest after setup.
-    if (this.inited) {
-      this.rebuildBuckets();
-      // Buildings spawn/fire at their faction's current upgrade levels.
-      for (const b of this.buildings) {
-        b.soldierLevel = this.levels[b.faction];
-        b.tankLevel = this.tankLevels[b.faction];
-        b.turretLevel = this.turretLevels[b.faction];
+    // Real-time (not part of the deterministic sim): the join handshake retry
+    // runs off wall-clock, before the sim even exists.
+    if (this.role === "guest" && !this.inited) {
+      this.readyT -= Math.min(delta, 50) / 1000;
+      if (this.readyT <= 0) {
+        this.readyT = 0.6;
+        this.sendNet({ type: "ready", name: this.myName, uid: this.myUid });
       }
     }
 
-    super.update(delta); // updates every entity + timers
-
-    if (!this.ended) {
-      if (this.inited) {
-        this.updateStrikes(dt);
-
-        this.incomeT -= dt;
-        if (this.incomeT <= 0) {
-          this.incomeT = INCOME_EVERY;
-          this.gold[BLUE] += 2;
-          // Solo: the AI's war chest grows with time — stall and it buries you
-          this.gold[RED] += this.role === "solo" ? 2 + Math.min(2, (this.elapsed / 60) * 0.5) : 2;
-        }
-
-        if (this.role === "solo") {
-          this.brainT -= dt;
-          if (this.brainT <= 0) {
-            this.brainT = BRAIN_EVERY;
-            this.redBrain();
-          }
-          this.redPanic(dt);
-        }
-
-        // `?bot=1`: drive MY faction with the solo AI's reflexes, but route
-        // every order through the command path (apply local + broadcast) so
-        // both clients play a real, escalating game — the lockstep desync test.
-        if (this.botMode) {
-          this.botT -= dt;
-          if (this.botT <= 0) {
-            this.botT = BRAIN_EVERY;
-            this.playerBot();
-          }
-        }
-
-        this.updateHqDefense(dt);
-        this.blueShare = this.map.share(BLUE);
-        this.updateHeliLoop(this.helis.some((h) => !h.dead));
+    // Fixed-timestep sim (phase 1): accumulate wall-clock time and run whole
+    // ticks of EXACTLY TICK_DT. The sim never reads `delta`, so it's identical
+    // on every machine given the same inputs.
+    if (this.inited && !this.ended) {
+      this.acc += Math.min(delta, MAX_STEPS_PER_UPDATE * TICK_MS);
+      let steps = 0;
+      while (this.acc >= TICK_MS && steps < MAX_STEPS_PER_UPDATE) {
+        // Lockstep stall (phase 3): don't execute a tick whose opponent orders
+        // may not have arrived. Safe once the opponent reached simTick-DELAY.
+        if (this.role !== "solo" && this.simTick > this.remoteTick + INPUT_DELAY) break;
+        this.acc -= TICK_MS;
+        this.simStep();
+        steps++;
       }
+    }
 
-      if (this.role === "host") {
-        this.snapT -= dt;
-        if (this.snapT <= 0) {
-          // Lockstep: the guest runs its own sim, so the snapshot is only a
-          // periodic authoritative correction (economy/levels). 2 Hz is plenty
-          // — unit motion is fully local and never waits on the network.
-          this.snapT = 0.5;
-          this.sendSnapshot(0.5);
-        }
-      }
-
-      // Anti-AFK: cancel ONLY when the opponent never plays at all (AFK from
-      // the start). Once they've issued a single order, going quiet later is a
-      // legitimate choice and must NOT void the match. The guest learns of host
-      // actions via snap.acts, the host of guest orders via cmd messages.
-      if (this.role !== "solo" && this.inited && !this.voided && !this.oppActed && this.elapsed > IDLE_LIMIT) {
-        this.voidMatch("Adversaire inactif", true);
-      }
-
-      if (this.role === "guest" && !this.inited) {
-        this.readyT -= dt;
-        if (this.readyT <= 0) {
-          this.readyT = 0.6;
-          this.sendNet({ type: "ready", name: this.myName, uid: this.myUid });
-        }
-      }
-
-      const mine = this.myFaction;
-      const m = this.map.tileCenter(this.axisCol[mine], 0);
-      // frontRowFromTop: on every screen "my" army pushes upward (the
-      // guest's view is mirrored), so the marker sits on my furthest row
-      this.axisMarker = {
-        x: m.x,
-        y: clamp(this.map.frontRowFromTop(mine, this.axisCol[mine]) * TILE, 60, MAP_H - 60),
-      };
+    // Anti-AFK: void ONLY if the opponent never acts from the start (elapsed is
+    // sim time). Going quiet mid-match after acting is legitimate.
+    if (this.role !== "solo" && this.inited && !this.ended && !this.voided && !this.oppActed && this.elapsed > IDLE_LIMIT) {
+      this.voidMatch("Adversaire inactif", true);
     }
 
     if (this.fpsMeter) this.fpsMeter.info = this.debugReadout();
-
-    this.sweepDead();
     this.bringToFront();
+  }
+
+  /**
+   * One deterministic simulation tick (fixed dt). Both clients run identical
+   * ticks, apply each order at the same shared tick, and draw from one seeded
+   * RNG in the same order → bit-exact state (mod the guest's vertical mirror).
+   */
+  private simStep(): void {
+    const T = this.simTick;
+
+    // 1. Execute orders scheduled for this tick. Each client issues only its
+    //    OWN faction, so sorting by faction yields the same sequence on both.
+    const due = this.pendingCmds.get(T);
+    if (due) {
+      this.pendingCmds.delete(T);
+      due.sort((a, b) => a.faction - b.faction);
+      for (const c of due) this.executeCommand(c);
+    }
+
+    // 2. Advance the world by exactly one tick.
+    this.rebuildBuckets();
+    for (const b of this.buildings) {
+      b.soldierLevel = this.levels[b.faction];
+      b.tankLevel = this.tankLevels[b.faction];
+      b.turretLevel = this.turretLevels[b.faction];
+    }
+    super.update(TICK_MS); // every entity + timers, fixed dt
+    this.updateStrikes(TICK_DT);
+
+    this.incomeT -= TICK_DT;
+    if (this.incomeT <= 0) {
+      this.incomeT = INCOME_EVERY;
+      this.gold[BLUE] += 2;
+      // Solo: the AI's war chest grows with time — stall and it buries you
+      this.gold[RED] += this.role === "solo" ? 2 + Math.min(2, (this.elapsed / 60) * 0.5) : 2;
+    }
+
+    if (this.role === "solo") {
+      this.brainT -= TICK_DT;
+      if (this.brainT <= 0) {
+        this.brainT = BRAIN_EVERY;
+        this.redBrain();
+      }
+      this.redPanic(TICK_DT);
+    }
+
+    // `?bot=1`: drive MY faction with the solo AI's reflexes through the command
+    // path, so both clients play a real, escalating game (the lockstep test).
+    if (this.botMode) {
+      this.botT -= TICK_DT;
+      if (this.botT <= 0) {
+        this.botT = BRAIN_EVERY;
+        this.playerBot();
+      }
+    }
+
+    this.updateHqDefense(TICK_DT);
+    this.blueShare = this.map.share(BLUE);
+    this.updateHeliLoop(this.helis.some((h) => !h.dead));
+
+    const mine = this.myFaction;
+    const m = this.map.tileCenter(this.axisCol[mine], 0);
+    // frontRowFromTop: on every screen "my" army pushes upward (the guest's
+    // view is mirrored), so the marker sits on my furthest row.
+    this.axisMarker = {
+      x: m.x,
+      y: clamp(this.map.frontRowFromTop(mine, this.axisCol[mine]) * TILE, 60, MAP_H - 60),
+    };
+
+    this.elapsed += TICK_DT;
+    this.sweepDead();
+
+    // 3. Publish this tick: buffer my orders to execute at T+DELAY on BOTH
+    //    clients, and broadcast the turn (heartbeat even when there are none).
+    const ex = T + (this.role === "solo" ? 1 : INPUT_DELAY);
+    if (this.outgoing.length) {
+      const slot = this.pendingCmds.get(ex);
+      if (slot) slot.push(...this.outgoing);
+      else this.pendingCmds.set(ex, this.outgoing.slice());
+    }
+    if (this.role !== "solo") this.sendNet({ type: "frame", tick: T, cmds: this.outgoing });
+    this.outgoing = [];
+
+    this.simTick = T + 1;
   }
 
   /* ---------------------------------------------------------------- *
@@ -1667,43 +1633,27 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     return this.map.isLand(c, r) && this.map.owner[i] === f && !this.buildingAt.has(i) && !this.map.hasChest(i);
   }
 
-  /* Bot order emitters — mirror handleTap's network path, minus the UI. */
+  /* Bot order emitters — queue exactly like a human tap (host space, scheduled
+   * to execute at simTick+INPUT_DELAY on both clients). */
   private botBuild(kind: "barracks" | "factory" | "turret", c: number, r: number): void {
-    const me = this.myFaction;
-    this.gold[me] -= COST[kind];
-    this.myActs++;
-    this.placeBuilding(me, kind, c, r);
-    this.sendNet({ type: "cmd", cmd: "build", kind, c, r: this.viewRow(r) });
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "build", kind, c, r: this.viewRow(r) });
   }
 
   private botStrike(x: number, y: number): void {
-    const me = this.myFaction;
-    this.gold[me] -= COST.strike;
-    this.myActs++;
-    this.scheduleStrike(x, y, me);
-    this.sendNet({ type: "cmd", cmd: "strike", x: Math.round(x), y: Math.round(this.viewY(y)) });
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "strike", x: Math.round(x), y: Math.round(this.viewY(y)) });
   }
 
   private botHeli(x: number): void {
-    const me = this.myFaction;
-    this.gold[me] -= COST.helico;
-    this.myActs++;
-    this.spawnHeli(me, x);
-    this.sendNet({ type: "cmd", cmd: "helico", x: Math.round(x) });
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "helico", x: Math.round(x) });
   }
 
   private botAxis(c: number): void {
-    const me = this.myFaction;
-    if (this.axisCol[me] === c) return;
-    this.axisCol[me] = c;
-    this.myActs++;
-    this.sendNet({ type: "cmd", cmd: "axis", col: c });
+    if (this.axisCol[this.myFaction] === c) return;
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "axis", col: c });
   }
 
   private botUpgrade(kind: UpgradeKind): void {
-    this.myActs++;
-    this.buyUpgrade(this.myFaction, kind); // pays internally
-    this.sendNet({ type: "cmd", cmd: "upgrade", kind });
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "upgrade", kind });
   }
 
   /* ---------------------------------------------------------------- *
@@ -1735,10 +1685,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     for (const b of this.buildings) put(b);
   }
 
-  /** Explosion with gameplay record (host) — guests get it via `booms`. */
+  /** Explosion — each client spawns its own (the sim is deterministic). */
   private explosion(x: number, y: number, big: boolean): void {
     this.explosionVisual(x, y, big);
-    if (this.role === "host") this.pBooms.push([Math.round(x), Math.round(y), big ? 1 : 0]);
   }
 
   private explosionVisual(x: number, y: number, big: boolean): void {
@@ -1814,8 +1763,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     // authoritative for the verdict — the guest ends only via the "end" msg.
     if (this.role === "guest") return;
     if (this.role === "host") {
-      // One last snapshot so the guest sees the HQ blow up, then the verdict
-      this.sendSnapshot();
+      // The guest's own sim destroys the HQ too; the host's verdict is final.
       this.sendNet({
         type: "end",
         winner,

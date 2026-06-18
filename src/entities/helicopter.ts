@@ -12,7 +12,7 @@ import {
   RED,
   VIEW_W,
 } from "../globals";
-import { clamp, rand, TAU } from "../utils";
+import { clamp, TAU } from "../utils";
 import { srand } from "../sim-rng";
 import { drawSprite, SPR } from "../sprites";
 
@@ -63,7 +63,7 @@ export class Helicopter extends GameObject {
   public returning = false;
 
   private game: GameAPI;
-  private t = rand(0, TAU);
+  private t = srand(0, TAU); // seeded: feeds the heli's cx drift, must be deterministic
   private fireCd = 0.5; // petit délai de décollage avant la première rafale
 
   constructor(game: GameAPI, faction: Faction, cx: number, cy: number) {
