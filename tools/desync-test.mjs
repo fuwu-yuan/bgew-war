@@ -37,7 +37,9 @@ const server = http.createServer(async (req, res) => {
   } catch { res.writeHead(404); res.end("not found"); }
 });
 await new Promise((r) => server.listen(PORT, r));
-const net = spawn(process.execPath, [join(ROOT, "tools", "server.mjs"), String(NET_PORT)], { stdio: ["ignore", "inherit", "inherit"] });
+// PROD=1 → use the real relay (wss://bgew.stevecohen.fr) instead of a local one.
+const PROD = process.env.PROD === "1";
+const net = PROD ? null : spawn(process.execPath, [join(ROOT, "tools", "server.mjs"), String(NET_PORT)], { stdio: ["ignore", "inherit", "inherit"] });
 await new Promise((r) => setTimeout(r, 700));
 
 // HEADED=1 → real visible windows (needs a FULL chromium, not the headless shell).
@@ -63,7 +65,9 @@ const launch = (x) =>
   });
 const browserA = await launch(10);
 const browserB = HEADED ? await launch(720) : browserA;
-const URLB = `http://localhost:${PORT}/?server=localhost:${NET_PORT}&firebase=off&splash=off&bot=1&debug=1`;
+// PROD: `server=off` clears any cached override → the built-in wss prod relay.
+const SERVER = PROD ? "off" : `localhost:${NET_PORT}`;
+const URLB = `http://localhost:${PORT}/?server=${SERVER}&firebase=off&splash=off&bot=1&debug=1`;
 
 async function open(browser, tag) {
   const p = await browser.newPage({ viewport: HEADED ? null : { width: 640, height: 1024 } });
@@ -89,17 +93,44 @@ function firstDiffs(a, b, n = 6) {
 const A = await open(browserA, "A");
 const B = await open(browserB, "B");
 
-// Quick match: A searches & creates, B joins, A presses COMMENCER.
-await A.p.mouse.click(...A.at(320, 599)); await A.p.waitForTimeout(700);
-await A.p.mouse.click(...A.at(320, 348)); await A.p.waitForTimeout(1600);
-await B.p.mouse.click(...B.at(320, 599)); await B.p.waitForTimeout(700);
-await B.p.mouse.click(...B.at(320, 348)); await A.p.waitForTimeout(2800);
-await A.p.mouse.click(...A.at(320, 496)); await A.p.waitForTimeout(2500);
+// Poll a predicate (handles real-network matchmaking latency, not just localhost).
+async function until(fn, ms = 15000, every = 250) {
+  for (let i = 0; i * every < ms; i++) { if (await fn()) return true; await A.p.waitForTimeout(every); }
+  return false;
+}
+
+const code = (pg) => pg.evaluate(() => window.__bgewwar.board.step.code || null);
+
+if (PROD) {
+  // Shared prod server: quick-match would pair with stale/other rooms, so use a
+  // PRIVATE room to pin A+B together. A creates → reads its code → B deep-links
+  // into it (?join=CODE) → A (the creator) presses COMMENCER.
+  await A.p.mouse.click(...A.at(320, 599)); await A.p.waitForTimeout(700); // MULTIJOUEUR
+  await A.p.mouse.click(...A.at(320, 418)); await A.p.waitForTimeout(700); // PARTIE PRIVEE
+  await A.p.mouse.click(...A.at(320, 346)); // CREER UNE PARTIE
+  if (!(await until(async () => (await step(A.p)) === "salon" && (await code(A.p))))) errors.push("private room never created");
+  const joinCode = await code(A.p);
+  console.log(`private code = ${joinCode}`);
+  await B.p.goto(`${URLB}&join=${joinCode}`, { waitUntil: "networkidle" }); // B deep-links into A's room
+  if (!(await until(async () => (await step(A.p)) === "salon" && (await step(B.p)) === "salon"))) errors.push("guest never joined the private room");
+  await A.p.waitForTimeout(500);
+  await A.p.mouse.click(...A.at(320, 590)); // COMMENCER (private creator: y=564 + copy button above)
+  if (!(await until(async () => (await step(A.p)) === "game" && (await step(B.p)) === "game"))) errors.push("not both in game");
+} else {
+  // Local relay: quick match. A searches & creates, B joins, A presses COMMENCER.
+  await A.p.mouse.click(...A.at(320, 599)); await A.p.waitForTimeout(700);
+  await A.p.mouse.click(...A.at(320, 348)); await A.p.waitForTimeout(1500);
+  await B.p.mouse.click(...B.at(320, 599)); await B.p.waitForTimeout(700);
+  await B.p.mouse.click(...B.at(320, 348));
+  if (!(await until(async () => (await step(A.p)) === "salon"))) errors.push("matchmaking never paired (no salon)");
+  await A.p.waitForTimeout(500);
+  await A.p.mouse.click(...A.at(320, 496)); // COMMENCER (quick creator)
+  if (!(await until(async () => (await step(A.p)) === "game" && (await step(B.p)) === "game"))) errors.push("not both in game");
+}
 
 const rA = await A.p.evaluate(() => window.__bgewwar.steps.play.role);
 const host = rA === "host" ? A : B;
 const guest = rA === "host" ? B : A;
-if ((await step(host.p)) !== "game" || (await step(guest.p)) !== "game") errors.push("not both in game");
 
 // Both sides play themselves via `?bot=1` — nothing to drive from here, just
 // sample at synced moments: signatures + screenshots from BOTH sides.
@@ -161,5 +192,5 @@ console.log(errors.length ? "ERRORS:\n" + errors.join("\n") : "run ok ✓ (scree
 if (HEADED) { console.log("watch the two windows… closing in 40s"); await A.p.waitForTimeout(40000); }
 await browserA.close();
 if (HEADED) await browserB.close();
-server.close(); net.kill();
+server.close(); if (net) net.kill();
 process.exit(errors.length ? 1 : 0);
