@@ -1039,6 +1039,11 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         this.simStep();
         steps++;
       }
+    } else if (this.ended) {
+      // Game over: the sim is frozen, but keep the engine ticking (real delta)
+      // so step timers + the end-screen fader + cosmetics still run — otherwise
+      // the post-match transition (addTimer → moveToStep "end") never fires.
+      super.update(delta);
     }
 
     // Anti-AFK: void ONLY if the opponent never acts from the start (elapsed is

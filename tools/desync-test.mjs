@@ -143,6 +143,12 @@ for (const t of samples) {
   await host.p.waitForTimeout((t - prev) * 1000); prev = t;
   if ((await ended(host.p)) || (await ended(guest.p))) {
     console.log(`t≈${t}s  match already decided (a HQ fell) — stopping samples`);
+    // Regression guard: when an HQ falls, BOTH sides must transition to the
+    // "end" step within a few seconds (not freeze on the play step).
+    const stepName = (pg) => pg.evaluate(() => window.__bgewwar.board.step.name);
+    const bothEnded = await until(async () => (await stepName(host.p)) === "end" && (await stepName(guest.p)) === "end", 8000);
+    console.log(`end transition: host=${await stepName(host.p)} guest=${await stepName(guest.p)}`);
+    if (!bothEnded) errors.push("end transition did not fire — game froze on HQ destruction");
     break;
   }
   // Compare at the SAME sim tick: the host leads by ~INPUT_DELAY ticks, so
