@@ -313,8 +313,20 @@ export class TileMap extends Entity {
     }
   }
 
+  /** Guest renders the island mirrored. The data stays host-space (the sim is
+   *  identical on every client); only the rendering flips. */
+  public renderFlip = false;
+
   draw(ctx: CanvasRenderingContext2D): void {
     super.draw(ctx);
+
+    // Vertical mirror for the guest: rects/cliffs/sand/flash all mirror cleanly;
+    // only the decor & chest SPRITES need a local counter-flip to stay upright.
+    if (this.renderFlip) {
+      ctx.save();
+      ctx.translate(0, MAP_H);
+      ctx.scale(1, -1);
+    }
 
     /* Ocean */
     const grad = ctx.createLinearGradient(0, 0, 0, MAP_H);
@@ -399,17 +411,30 @@ export class TileMap extends Entity {
       }
     }
 
-    /* Decor + chests */
+    /* Decor + chests — sprites: counter-flip under the mirror so they stay upright. */
+    const sprite = (spr: number, px: number, py: number, size: number): void => {
+      if (!this.renderFlip) {
+        drawSprite(ctx, spr, px, py, size);
+        return;
+      }
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.scale(1, -1); // undo the global flip locally → upright sprite, mirrored position
+      drawSprite(ctx, spr, 0, 0, size);
+      ctx.restore();
+    };
     for (const d of this.decors) {
       const c = d.i % GRID_W;
       const r = Math.floor(d.i / GRID_W);
-      drawSprite(ctx, d.spr, c * TILE + TILE / 2, r * TILE + TILE / 2, 30);
+      sprite(d.spr, c * TILE + TILE / 2, r * TILE + TILE / 2, 30);
     }
     for (const i of this.chests) {
       const c = i % GRID_W;
       const r = Math.floor(i / GRID_W);
       const bob = Math.sin(this.waveT * 3 + i) * 2;
-      drawSprite(ctx, SPR.GOLD, c * TILE + TILE / 2, r * TILE + TILE / 2 + bob, 26);
+      sprite(SPR.GOLD, c * TILE + TILE / 2, r * TILE + TILE / 2 + bob, 26);
     }
+
+    if (this.renderFlip) ctx.restore();
   }
 }

@@ -138,19 +138,17 @@ const guestUnits = await guest.page.evaluate(() => window.__bgewwar.steps.play.u
 console.log(`guest sim units: ${guestUnits}`);
 if (guestUnits < 5) errors.push(`SYNC: guest only has ${guestUnits} units`);
 
-// Mirror check: the red HQ sits near the top for the host and near the
-// bottom for the guest (rows must be vertical mirrors of each other)
+// Lockstep: the SIM is now identical (host space) on both clients — the mirror
+// is render-only. So the red HQ row must MATCH (the guest just draws it flipped).
 const hostHqRow = await host.page.evaluate(
   () => window.__bgewwar.steps.play.buildings.find((b) => b.type === "hq" && b.faction === 1)?.row
 );
 const guestHqRow = await guest.page.evaluate(
   () => window.__bgewwar.steps.play.buildings.find((b) => b.type === "hq" && b.faction === 1)?.row
 );
-const gridH = await host.page.evaluate(() => window.__bgewwar.steps.play.map.owner.length / 16);
-const mirrorRow = gridH - 1 - hostHqRow;
-console.log(`red HQ row: host=${hostHqRow} guest=${guestHqRow} (mirror of ${hostHqRow} is ${mirrorRow})`);
-if (guestHqRow !== mirrorRow) {
-  errors.push(`FLIP: red HQ should be mirrored (host row ${hostHqRow}, guest row ${guestHqRow})`);
+console.log(`red HQ row: host=${hostHqRow} guest=${guestHqRow} (identical sim, render-only mirror)`);
+if (guestHqRow !== hostHqRow) {
+  errors.push(`SIM: red HQ row should match host-space on both (host ${hostHqRow}, guest ${guestHqRow})`);
 }
 
 // Host leaves → the guest must win by forfeit

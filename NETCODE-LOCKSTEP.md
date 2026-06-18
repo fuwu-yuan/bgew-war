@@ -29,32 +29,32 @@ stays tiny (1 snapshot/s vs ~12/s today).
 
 ## Phases (each verified headless: 2 sims, same seed+inputs, compare a state hash)
 - [x] **0. Foundation** — `makeRng` PRNG + share `seed` in `init`. (non-breaking)
-- [~] **1. Fixed timestep** — NOT done. Sim still reads wall-clock `delta`
-      (capped per frame). Best-effort determinism instead of bit-exact; the
-      correction channel (below) absorbs the residual drift.
-- [x] **2. Seed the sim** — all sim random (units/buildings/game.step
-      spawns+combat timing) routed through the match RNG via `sim-rng`.
-- [~] **3. Commands at a tick** — NOT done. Commands apply on arrival (apply
-      local + broadcast), not at a shared tick. This is the source of the
-      per-unit drift: the same order lands at a different sim-frame on each
-      client, so the srand stream diverges from that point.
-- [x] **4. Guest runs the sim** — the guest simulates locally in its mirrored
-      view space (`flipY`), no longer mirroring the host frame-by-frame.
-- [~] **5. Correction** — host sends a LEAN snapshot ~2×/s: economy, upgrade
-      levels, anti-AFK action count, and the FULL territory grid (the guest
-      adopts it wholesale, mirrored). Buildings stay synced via the command
-      path. **Unit positions are deliberately NOT reconciled** (decision,
-      2026-06-17): doing so needs a ~1×/s full-unit resync the guest snaps onto,
-      which risks visible jumps; the unit-count drift is purely cosmetic
-      (soldier density) since territory/economy/verdict are authoritative.
+- [x] **1. Fixed timestep** — sim advances in whole 60Hz ticks of exactly
+      TICK_DT via an accumulator; never reads wall-clock `delta`. update() =
+      real-time prelude + fixed-step loop (simStep).
+- [x] **2. Seed the sim** — all sim random routed through the match RNG
+      (`sim-rng`). Plus: walkT/heli-t (fed the movement wobble) seeded, and
+      nearestEnemy tie-breaks by nid (bucket scan order is mirror-flipped).
+- [x] **3. Commands at a tick** — every order executes at simTick+INPUT_DELAY
+      on BOTH clients. Each tick a FrameMsg broadcasts (heartbeat + orders); a
+      stall keeps a client from running past remoteTick+DELAY so orders always
+      arrive before their tick. Orders carry an absolute faction + host coords.
+- [x] **4. Guest runs the sim** — identical host-space sim on every client.
+- [x] **5. Render-only mirror** — the guest's mirror is applied at RENDER and
+      INPUT only (swap each entity's cy↔MAP_H-cy around the draw; flip the
+      tilemap; un-flip taps). The SIM is bit-identical, so float math is
+      mirror-symmetric — the last drift source (the mirrored sim accumulated
+      ½-ULP asymmetries) is gone. No snapshot correction at all.
 
-## Status (feat/lockstep)
-Functional. Authoritative + corrected each snapshot: territory, economy, upgrade
-levels, and the match verdict (host-authoritative). Verified by the bot-driven
-desync harness (`?bot=1`, two clients, real 90s game): Δterritory ≤3pts, Δgold
-≤10, Δbuildings ≤1 throughout; unit COUNT drifts (cosmetic, bounded). Smoke +
-multi tests green. NOT a bit-exact lockstep — phases 1 & 3 were intentionally
-skipped in favour of best-effort determinism + the correction channel.
+## Status (feat/lockstep) — TRUE bit-exact lockstep
+Done. The two sims are bit-identical at equal ticks. Verified by the bot-driven
+desync harness (`?bot=1`, two clients) comparing host vs guest at the SAME tick
+across a full match: Δ=0 on units, helis, buildings, gold AND territory — every
+sample, every run (hundreds of units, airstrikes, helicos). Guest renders the
+mirror correctly (army at the bottom, sprites upright, HUD normal). Host stays
+authoritative for the verdict as a belt-and-suspenders. Smoke + multi green.
+No per-frame world snapshot — only ~tiny per-tick frames (heartbeat + orders),
+far below the old snapshot bandwidth.
 
 ## Rollback
 All of this lives on `feat/lockstep`. `main` keeps the working host-authoritative

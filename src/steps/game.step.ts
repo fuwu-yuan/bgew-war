@@ -25,7 +25,7 @@ import {
 } from "../globals";
 import { clamp, pick, rand, randInt, sha256, TAU } from "../utils";
 import { seedSim, srand } from "../sim-rng";
-import { flipMapData, flipTileIndex, TileMap } from "../entities/tilemap";
+import { TileMap } from "../entities/tilemap";
 import { Bullet, Soldier, Tank, Unit } from "../entities/units";
 import { Building, BUILDING_CODE, BuildingType } from "../entities/buildings";
 import { Helicopter } from "../entities/helicopter";
@@ -204,13 +204,12 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     };
   }
 
-  /** Determinism probe: every unit in CANONICAL (host) space, sorted by nid, so
-   *  the host and guest dumps can be diffed directly to find the first drift. */
+  /** Determinism probe: every unit (host space — identical on both clients now),
+   *  sorted by nid, so the host and guest dumps can be diffed directly. */
   dumpUnits(): string {
-    const canon = (cy: number) => Math.round(this.flipped ? MAP_H - cy : cy);
     const rows = this.units
       .filter((u) => !u.dead)
-      .map((u) => `${u.nid},${u.faction},${Math.round(u.cx)},${canon(u.cy)},${Math.round(u.hp)}`)
+      .map((u) => `${u.nid},${u.faction},${Math.round(u.cx)},${Math.round(u.cy)},${Math.round(u.hp)}`)
       .sort();
     return rows.join("|");
   }
@@ -420,12 +419,12 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   /**
    * Build the symmetric starting state. Both clients run this identically right
    * after seeding (same seed → same RNG draws in the same order), so their sims
-   * start in lockstep. Building rows are mirrored on the guest (its view is
-   * flipped); spawn-Y goes through mirrorY. MUST be the first srand-drawing call
-   * after seedSim, with no random draws in between, or the sequences diverge.
+   * start in lockstep. Identical host-space layout on every client (the guest
+   * only flips its VIEW). MUST be the first srand-drawing call after seedSim,
+   * with no random draws in between, or the sequences diverge.
    */
   private setupInitialState(): void {
-    const mr = (row: number): number => (this.flipped ? GRID_H - 1 - row : row);
+    const mr = (row: number): number => row; // host space on every client
     this.placeBuilding(RED, "hq", 8, mr(2), true);
     this.placeBuilding(RED, "barracks", 4, mr(4), true);
     this.placeBuilding(RED, "barracks", 8, mr(4), true);
@@ -464,26 +463,14 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   /* ------------------------------------------------------------------
-   * Guest view mirror: the red player sees the island flipped vertically
-   * so THEIR army sits at the bottom of the screen. Everything coming
-   * from the host is converted to view space here, and every command
-   * sent back is converted to host space. No-ops for solo/host.
+   * Guest view mirror: the red player sees the island flipped vertically so
+   * THEIR army sits at the bottom of the screen. The SIMULATION is identical
+   * (host space) on every client; the mirror is applied ONLY at render (draw)
+   * and input (handleTap). So float math is bit-symmetric → deterministic.
    * ------------------------------------------------------------------ */
 
   private get flipped(): boolean {
     return this.role === "guest";
-  }
-
-  private viewY(y: number): number {
-    return this.flipped ? MAP_H - y : y;
-  }
-
-  private viewRow(r: number): number {
-    return this.flipped ? GRID_H - 1 - r : r;
-  }
-
-  private viewIdx(i: number): number {
-    return this.flipped ? flipTileIndex(i) : i;
   }
 
   onNetworkMessage(msg: Network.SocketMessage): void {
@@ -538,7 +525,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       if (!this.inited) {
         if (typeof initMsg.seed === "number") this.matchSeed = initMsg.seed;
         seedSim(this.matchSeed);
-        this.map.applyInit(this.flipped ? flipMapData(initMsg.map) : initMsg.map);
+        this.map.applyInit(initMsg.map); // host space on both — the guest flips only its view
         this.setupInitialState(); // first srand draw after seedSim — order matches host
         this.inited = true;
       }
@@ -637,7 +624,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     if (cmd.cmd === "strike" && typeof cmd.x === "number" && typeof cmd.y === "number") {
       if (this.gold[f] >= COST.strike) {
         this.gold[f] -= COST.strike;
-        this.scheduleStrike(clamp(cmd.x, 0, VIEW_W), this.viewY(clamp(cmd.y, 0, MAP_H)), f);
+        this.scheduleStrike(clamp(cmd.x, 0, VIEW_W), clamp(cmd.y, 0, MAP_H), f);
       }
       return;
     }
@@ -655,7 +642,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       typeof cmd.r === "number"
     ) {
       const c = cmd.c;
-      const r = this.viewRow(cmd.r); // host row → this client's row
+      const r = cmd.r; // host space on every client
       const cost = COST[cmd.kind];
       const i = this.map.idx(c, r);
       if (
@@ -700,6 +687,12 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
     if (!this.mode) return;
 
+    // The map is rendered vertically flipped for the guest, so un-flip the tap
+    // into host-space WORLD coords. The sim is identical on both clients, so the
+    // command carries plain host-space coords (no per-client conversion).
+    const wx = x;
+    const wy = this.flipped ? MAP_H - y : y;
+
     // Orders are scheduled, not applied now: they execute at simTick+INPUT_DELAY
     // on BOTH clients (lockstep). The gold check here is just UX — the real
     // spend happens deterministically at execution (re-checked there).
@@ -710,7 +703,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
       this.mode = null;
       track("use_airstrike", { mode: this.role });
-      this.queueCmd({ type: "cmd", faction: mine, cmd: "strike", x: Math.round(x), y: Math.round(this.viewY(y)) });
+      this.queueCmd({ type: "cmd", faction: mine, cmd: "strike", x: Math.round(wx), y: Math.round(wy) });
       this.board.playSound("click", false, 0.5);
       return;
     }
@@ -722,24 +715,24 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
       this.mode = null;
       track("use_helico", { mode: this.role });
-      this.queueCmd({ type: "cmd", faction: mine, cmd: "helico", x: Math.round(x) }); // x: no mirror
+      this.queueCmd({ type: "cmd", faction: mine, cmd: "helico", x: Math.round(wx) });
       this.board.playSound("click", false, 0.5);
       return;
     }
 
     if (this.mode === "axis") {
-      const c = clamp(Math.floor(x / TILE), 0, GRID_W - 1);
+      const c = clamp(Math.floor(wx / TILE), 0, GRID_W - 1);
       this.mode = null;
       track("set_axis", { mode: this.role });
       this.board.playSound("click", false, 0.5);
-      this.spawnEffect(new ScorePopup(x, y, "AXE D'ATTAQUE", "#ffe27a", 16));
-      this.queueCmd({ type: "cmd", faction: mine, cmd: "axis", col: c }); // col is X — no mirror
+      this.spawnEffect(new ScorePopup(wx, wy, "AXE D'ATTAQUE", "#ffe27a", 16));
+      this.queueCmd({ type: "cmd", faction: mine, cmd: "axis", col: c });
       return;
     }
 
     // Build
-    const c = Math.floor(x / TILE);
-    const r = Math.floor(y / TILE);
+    const c = Math.floor(wx / TILE);
+    const r = Math.floor(wy / TILE);
     const kind = this.mode;
     const cost = COST[kind];
     const i = this.map.idx(c, r);
@@ -747,20 +740,18 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     const buildable = this.map.isLand(c, r) && this.map.owner[i] === mine && !occupied && !this.map.hasChest(i);
     if (!buildable) {
       this.board.playSound("error", false, 0.4);
-      this.spawnEffect(new ScorePopup(x, y, "CASE INVALIDE", "#ff8b7a", 14));
+      this.spawnEffect(new ScorePopup(wx, wy, "CASE INVALIDE", "#ff8b7a", 14));
       return;
     }
     if (this.myGold < cost) {
       this.board.playSound("error", false, 0.4);
-      this.spawnEffect(new ScorePopup(x, y, "PAS ASSEZ D'OR", "#ff8b7a", 14));
+      this.spawnEffect(new ScorePopup(wx, wy, "PAS ASSEZ D'OR", "#ff8b7a", 14));
       return;
     }
     this.mode = null;
     track("build", { type: kind, mode: this.role });
     this.board.playSound("build", false, 0.5);
-    // Host space (row mirrored back on the guest). The building + shockwave
-    // appear at execution (a few hundred ms later).
-    this.queueCmd({ type: "cmd", faction: mine, cmd: "build", kind, c, r: this.viewRow(r) });
+    this.queueCmd({ type: "cmd", faction: mine, cmd: "build", kind, c, r });
   }
 
   /** Queue one of MY orders. It rides this tick's frame and executes at
@@ -819,13 +810,16 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   /** +1 in host space, -1 when the view is mirrored (guest). */
+  /** Lockstep: the SIM is identical (host space) on every client now — the
+   *  guest's mirror is applied at RENDER + INPUT only, so float math stays
+   *  bit-symmetric. Always +1. (Kept as a method so entities need no change.) */
   flipY(): number {
-    return this.flipped ? -1 : 1;
+    return 1;
   }
 
-  /** Mirror a Y/px coordinate into this client's space (identity on the host). */
+  /** Sim is host-space on both clients — no mirror in the simulation. */
   private mirrorY(y: number): number {
-    return this.flipped ? MAP_H - y : y;
+    return y;
   }
 
   nearestEnemy(x: number, y: number, f: Faction, range: number): Target | null {
@@ -1117,12 +1111,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
     const mine = this.myFaction;
     const m = this.map.tileCenter(this.axisCol[mine], 0);
-    // frontRowFromTop: on every screen "my" army pushes upward (the guest's
-    // view is mirrored), so the marker sits on my furthest row.
-    this.axisMarker = {
-      x: m.x,
-      y: clamp(this.map.frontRowFromTop(mine, this.axisCol[mine]) * TILE, 60, MAP_H - 60),
-    };
+    // My front row (host space), then flipped to screen space for the guest —
+    // the HUD draws this marker in screen space over the mirrored world.
+    const wy = clamp(this.map.frontRowFromTop(mine, this.axisCol[mine]) * TILE, 60, MAP_H - 60);
+    this.axisMarker = { x: m.x, y: this.flipped ? MAP_H - wy : wy };
 
     this.elapsed += TICK_DT;
     this.sweepDead();
@@ -1139,6 +1131,27 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.outgoing = [];
 
     this.simTick = T + 1;
+  }
+
+  /**
+   * Render the guest's world vertically MIRRORED (so their army sits at the
+   * bottom) while the SIMULATION stays in host space. We swap each mobile
+   * entity's cy → MAP_H-cy around the engine draw (sprites stay upright, their
+   * local layout — health bars, shadows — is preserved) and flip the tilemap.
+   * The HUD/faders are screen-space and untouched. This keeps the sim's float
+   * math identical on both clients → bit-exact lockstep.
+   */
+  draw(): void {
+    if (!this.flipped) {
+      super.draw();
+      return;
+    }
+    const world = [this.units, this.bullets, this.buildings, this.helis, this.effects];
+    for (const list of world) for (const e of list) e.cy = MAP_H - e.cy;
+    this.map.renderFlip = true;
+    super.draw();
+    this.map.renderFlip = false;
+    for (const list of world) for (const e of list) e.cy = MAP_H - e.cy;
   }
 
   /* ---------------------------------------------------------------- *
@@ -1636,11 +1649,11 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   /* Bot order emitters — queue exactly like a human tap (host space, scheduled
    * to execute at simTick+INPUT_DELAY on both clients). */
   private botBuild(kind: "barracks" | "factory" | "turret", c: number, r: number): void {
-    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "build", kind, c, r: this.viewRow(r) });
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "build", kind, c, r });
   }
 
   private botStrike(x: number, y: number): void {
-    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "strike", x: Math.round(x), y: Math.round(this.viewY(y)) });
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "strike", x: Math.round(x), y: Math.round(y) });
   }
 
   private botHeli(x: number): void {
