@@ -1,9 +1,11 @@
 /**
  * Repro: end-of-match freeze in SOLO. Builds a LARGE battle (many units firing
- * → bullets + effects), then forces the BLUE (player) HQ down. During the
- * ~2.9s end-transition window the play step keeps running super.update(delta)
- * but NO LONGER sweeps dead entities — measure the frame rate through that
- * window to catch the freeze.
+ * → bullets + effects), then forces the BLUE (player) HQ down. The battle is
+ * MEANT to keep raging behind the end-screen fade (explosions look nice), but
+ * at the fixed 60Hz tick with sweepDead — so entities must stay BOUNDED, not
+ * pile up (the freeze was real-delta combat with no sweep, doubling the board).
+ * We measure both the frame rate and the entity-count trajectory through the
+ * transition window.
  *
  * Usage: node tools/end-freeze-test.mjs [runs]
  */

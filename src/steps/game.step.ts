@@ -1034,35 +1034,36 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
     // Fixed-timestep sim (phase 1): accumulate wall-clock time and run whole
     // ticks of EXACTLY TICK_DT. The sim never reads `delta`, so it's identical
-    // on every machine given the same inputs.
-    if (this.inited && !this.ended) {
+    // on every machine given the same inputs. It keeps running AFTER the match
+    // ends too, so the battle keeps raging (movement + explosions) behind the
+    // end-screen fade — but ALWAYS at the fixed 60Hz tick, which runs sweepDead()
+    // every step, so entities stay bounded. (The v1.7.1 freeze was this same
+    // battle running off super.update() at REAL delta with NO sweep → the board
+    // doubled every few frames until slower devices froze.)
+    if (this.inited) {
       this.acc += Math.min(delta, MAX_STEPS_PER_UPDATE * TICK_MS);
       let steps = 0;
       while (this.acc >= TICK_MS && steps < MAX_STEPS_PER_UPDATE) {
         // Lockstep stall (phase 3): don't execute a tick whose opponent orders
-        // may not have arrived. Safe once the opponent reached simTick-DELAY.
-        if (this.role !== "solo" && this.simTick > this.remoteTick + INPUT_DELAY) break;
+        // may not have arrived. Only matters while the match is live and
+        // deterministic — the post-verdict skirmish is cosmetic, so don't stall.
+        if (!this.ended && this.role !== "solo" && this.simTick > this.remoteTick + INPUT_DELAY) break;
         this.acc -= TICK_MS;
         this.simStep();
         steps++;
       }
-    } else if (this.ended) {
-      // Game over: the sim is FROZEN on its final frame. We must NOT call
-      // super.update() here — that re-ticks EVERY board entity, so the units
-      // keep firing (spawning bullets + impact effects) at real delta while
-      // sweepDead() no longer runs, piling up entities every frame until slower
-      // devices freeze on the end screen (the intermittent end-of-match freeze).
-      // Instead we animate ONLY the cosmetic top layer (HUD + faders) and run
-      // the post-match transition off a real-time countdown.
-      for (const e of this.topEntities) e.update(delta);
-      if (this.endTransitionT >= 0) {
-        this.endTransitionT -= delta;
-        if (this.endTransitionT <= 0) {
-          this.endTransitionT = -1;
-          const out = new Fader(0, 1, 700, "#08111f", () => this.board.moveToStep("end", this.endData));
-          this.board.addEntity(out);
-          this.topEntities.push(out);
-        }
+    }
+
+    // Post-match: hold on the still-raging battle for a beat, then fade to the
+    // end screen. A real-time countdown (NOT a step timer) so it's decoupled
+    // from the sim cadence.
+    if (this.ended && this.endTransitionT >= 0) {
+      this.endTransitionT -= delta;
+      if (this.endTransitionT <= 0) {
+        this.endTransitionT = -1;
+        const out = new Fader(0, 1, 700, "#08111f", () => this.board.moveToStep("end", this.endData));
+        this.board.addEntity(out);
+        this.topEntities.push(out);
       }
     }
 
