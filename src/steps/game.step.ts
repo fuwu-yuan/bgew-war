@@ -167,6 +167,11 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     [BLUE]: { soldiers: 0, tanks: 0 },
   };
   private ended = false;
+  /** Post-match transition: ms left before the fade-out (−1 = inactive), plus
+   *  the end-screen payload captured at showEnd. Driven by a real-time countdown
+   *  in update() while the sim is frozen — see the `ended` branch. */
+  private endTransitionT = -1;
+  private endData: any = null;
   private brainT = BRAIN_EVERY;
   private aiPosture: AiPosture = "counter";
   /** `?bot=1` — auto-play MY faction through the command path (desync tests). */
@@ -349,6 +354,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.axisCol = { [RED]: 8, [BLUE]: 8 };
     this.counts = { [RED]: { soldiers: 0, tanks: 0 }, [BLUE]: { soldiers: 0, tanks: 0 } };
     this.ended = false;
+    this.endTransitionT = -1;
+    this.endData = null;
     this.brainT = BRAIN_EVERY;
     this.aiPosture = "counter";
     this.incomeT = INCOME_EVERY;
@@ -1040,10 +1047,23 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         steps++;
       }
     } else if (this.ended) {
-      // Game over: the sim is frozen, but keep the engine ticking (real delta)
-      // so step timers + the end-screen fader + cosmetics still run — otherwise
-      // the post-match transition (addTimer → moveToStep "end") never fires.
-      super.update(delta);
+      // Game over: the sim is FROZEN on its final frame. We must NOT call
+      // super.update() here — that re-ticks EVERY board entity, so the units
+      // keep firing (spawning bullets + impact effects) at real delta while
+      // sweepDead() no longer runs, piling up entities every frame until slower
+      // devices freeze on the end screen (the intermittent end-of-match freeze).
+      // Instead we animate ONLY the cosmetic top layer (HUD + faders) and run
+      // the post-match transition off a real-time countdown.
+      for (const e of this.topEntities) e.update(delta);
+      if (this.endTransitionT >= 0) {
+        this.endTransitionT -= delta;
+        if (this.endTransitionT <= 0) {
+          this.endTransitionT = -1;
+          const out = new Fader(0, 1, 700, "#08111f", () => this.board.moveToStep("end", this.endData));
+          this.board.addEntity(out);
+          this.topEntities.push(out);
+        }
+      }
     }
 
     // Anti-AFK: void ONLY if the opponent never acts from the start (elapsed is
@@ -1847,16 +1867,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       matchId: this.matchId,
       enemyUid: this.enemyUid,
     };
-    this.addTimer(
-      this.voided ? 1200 : 2200,
-      () => {
-        const out = new Fader(0, 1, 700, "#08111f", () => {
-          this.board.moveToStep("end", data);
-        });
-        this.board.addEntity(out);
-        this.topEntities.push(out);
-      },
-      false
-    );
+    // Hold on the frozen battle for a beat, then fade to the end screen. The
+    // countdown is driven by update()'s `ended` branch (NOT a step timer), so it
+    // ticks even though the sim is frozen and no super.update() runs the timers.
+    this.endData = data;
+    this.endTransitionT = this.voided ? 1200 : 2200;
   }
 }
