@@ -71,8 +71,11 @@ const errors = [];
   await page.mouse.click(...at(320, 880));
   await page.waitForTimeout(400);
 
-  // JOUER
+  // JOUER -> selecteur de difficulte -> MOYEN
   await page.mouse.click(...at(320, 533));
+  await page.waitForTimeout(500);
+  await page.screenshot({ path: "/tmp/bgew-war-2b-difficulty.png" });
+  await page.mouse.click(...at(320, 633));
   await page.waitForTimeout(1400);
   await page.screenshot({ path: "/tmp/bgew-war-3-game-start.png" });
 
@@ -262,6 +265,8 @@ const errors = [];
 
   // Tap JOUER
   await page.touchscreen.tap(...at(320, 533));
+  await page.waitForTimeout(500);
+  await page.touchscreen.tap(...at(320, 633)); // MOYEN
   await page.waitForTimeout(1400);
   await page.screenshot({ path: "/tmp/bgew-war-m2-game.png" });
 

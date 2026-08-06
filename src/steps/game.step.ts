@@ -37,6 +37,7 @@ import { CmdMsg, EndMsg, FrameMsg, GameMsg, gameData, InitMsg, IpMsg, MultiData,
 import { track, trackScreen } from "../analytics";
 import { toggleMute } from "../sound";
 import { currentUser, displayName } from "../firebase";
+import { AI_TUNING, AiTuning, barracksCap, DIFFICULTIES, Difficulty } from "../ai";
 
 const BRAIN_EVERY = 3; // s — red AI thinks (solo only)
 const INCOME_EVERY = 1; // s
@@ -62,12 +63,12 @@ function newMatchId(): string {
   if (c && typeof c.randomUUID === "function") return c.randomUUID();
   return `m-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
 }
-const AI_GRACE = 6; // s before the AI starts spending
-const GARRISON_COST = 50;
+const AI_GRACE = 6; // s before the test bot (?bot=1) starts spending
+const GARRISON_UNIT_COST = 10; // gold per emergency soldier — the AI PAYS its garrison
 const GARRISON_CD = 8; // s
 const HQ_ALERT_RADIUS = 240; // px — enemies this close to the HQ trigger panic
-const AI_MIN_RESERVE = GARRISON_COST + 20;
-const AI_REPLAN_VARIANCE = 0.35;
+const AI_MIN_RESERVE = 70; // test bot (?bot=1) only — the solo AI uses tun.bank
+const COMBO_CD = 18; // s between insane strike+helico combos
 const HQ_DEFENSE_RADIUS = 340;
 const HQ_DEFENSE_MIN_SOLDIERS = 36;
 const HQ_DEFENSE_MAX_SOLDIERS = 130;
@@ -83,6 +84,8 @@ interface RedAiIntel {
   axis: number;
   pressureCol: number;
   opportunityCol: number;
+  /** Colonne d'attaque favorite du joueur (adapt) — -1 si rien de marquant. */
+  favoredCol: number;
   blueTanks: number;
   blueSoldiers: number;
   blueTurrets: number;
@@ -174,6 +177,13 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private endData: any = null;
   private brainT = BRAIN_EVERY;
   private aiPosture: AiPosture = "counter";
+  /* Solo difficulty: every knob is a handicap or smarter play — never free gold. */
+  private difficulty: Difficulty = "medium";
+  private tun: AiTuning = AI_TUNING.medium;
+  private comboCd = 0;
+  /** What the human has SHOWN so far (their executed, on-screen orders — the
+   *  adaptive AI reads nothing the player couldn't see of it in reverse). */
+  private habits = { strikes: 0, helis: 0, upSoldier: 0, upTank: 0, upTurret: 0, axisHist: new Array<number>(GRID_W).fill(0) };
   /** `?bot=1` — auto-play MY faction through the command path (desync tests). */
   private botMode = false;
   private botT = BRAIN_EVERY;
@@ -311,16 +321,21 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
    * Lifecycle
    * ---------------------------------------------------------------- */
 
-  onEnter(data: { multi?: MultiData }): void {
+  onEnter(data: { multi?: MultiData; difficulty?: Difficulty }): void {
     this.role = data?.multi ? (data.multi.role === "guest" ? "guest" : "host") : "solo";
     this.myFaction = this.role === "guest" ? RED : BLUE;
+
+    // Solo difficulty: from the menu, else `?diff=` (headless tests), else medium.
+    const qsDiff = new URLSearchParams(window.location.search).get("diff") as Difficulty | null;
+    this.difficulty = data?.difficulty ?? (qsDiff && DIFFICULTIES.includes(qsDiff) ? qsDiff : "medium");
+    this.tun = AI_TUNING[this.difficulty];
 
     // Player names shown in the HUD. Local name = signed-in pseudo, else a
     // sensible default. The enemy name arrives over the network (ready/init)
     // so it starts as a placeholder.
     const u = currentUser();
     this.myName = u && !u.isAnonymous ? displayName(u) : this.role === "solo" ? "Vous" : "Invite";
-    this.enemyName = this.role === "solo" ? "IA" : this.role === "guest" ? "Adversaire" : "Invite";
+    this.enemyName = this.role === "solo" ? `IA ${this.tun.label}` : this.role === "guest" ? "Adversaire" : "Invite";
     // Ranked identity: my uid (empty when not signed in) and a shared match id
     // the host mints and shares so the Cloud Function can pair the two reports.
     this.myUid = u && !u.isAnonymous ? u.uid : "";
@@ -332,7 +347,11 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     if (this.role !== "guest") seedSim(this.role === "solo" ? (Math.floor(Math.random() * 0xffffffff) >>> 0) : this.matchSeed);
 
     trackScreen("game");
-    track("game_start", { mode: this.role, faction: this.myFaction === RED ? "red" : "blue" });
+    track("game_start", {
+      mode: this.role,
+      faction: this.myFaction === RED ? "red" : "blue",
+      ...(this.role === "solo" ? { difficulty: this.difficulty } : {}),
+    });
 
     this.units = [];
     this.bullets = [];
@@ -342,7 +361,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.effects = [];
     this.buildingAt.clear();
     this.remote = null;
-    this.gold = { [RED]: this.role === "solo" ? 40 : 80, [BLUE]: 80 };
+    // Fair play : l'or de départ de l'IA est un HANDICAP (≤ 80), jamais un bonus.
+    this.gold = { [RED]: this.role === "solo" ? this.tun.startGold : 80, [BLUE]: 80 };
     this.levels = { [RED]: 1, [BLUE]: 1 };
     this.tankLevels = { [RED]: 1, [BLUE]: 1 };
     this.turretLevels = { [RED]: 1, [BLUE]: 1 };
@@ -356,8 +376,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.ended = false;
     this.endTransitionT = -1;
     this.endData = null;
-    this.brainT = BRAIN_EVERY;
+    this.brainT = this.tun.brainEvery;
     this.aiPosture = "counter";
+    this.comboCd = 0;
+    this.habits = { strikes: 0, helis: 0, upSoldier: 0, upTank: 0, upTurret: 0, axisHist: new Array<number>(GRID_W).fill(0) };
     this.incomeT = INCOME_EVERY;
     this.snapT = 0;
     this.readyT = 0;
@@ -620,6 +642,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private executeCommand(cmd: CmdMsg): void {
     if (this.ended) return;
     const f: Faction = cmd.faction === RED ? RED : BLUE;
+    // Solo : le cerveau rouge étudie les ordres VISIBLES du joueur (adapt).
+    if (this.role === "solo" && f === BLUE) this.observeBlue(cmd);
     if (cmd.cmd === "axis" && typeof cmd.col === "number") {
       this.axisCol[f] = clamp(Math.round(cmd.col), 0, GRID_W - 1); // col is X — no mirror
       return;
@@ -1107,15 +1131,17 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.incomeT -= TICK_DT;
     if (this.incomeT <= 0) {
       this.incomeT = INCOME_EVERY;
+      // Fair play : même revenu des deux côtés, à TOUS les niveaux — la
+      // difficulté n'achète jamais d'or, elle achète de la réflexion.
       this.gold[BLUE] += 2;
-      // Solo: the AI's war chest grows with time — stall and it buries you
-      this.gold[RED] += this.role === "solo" ? 2 + Math.min(2, (this.elapsed / 60) * 0.5) : 2;
+      this.gold[RED] += 2;
     }
 
     if (this.role === "solo") {
+      this.comboCd -= TICK_DT;
       this.brainT -= TICK_DT;
       if (this.brainT <= 0) {
-        this.brainT = BRAIN_EVERY;
+        this.brainT = this.tun.brainEvery;
         this.redBrain();
       }
       this.redPanic(TICK_DT);
@@ -1252,7 +1278,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.garrisonCd -= dt;
     this.alertT -= dt;
     if (this.alertT > 0) return;
-    this.alertT = 0.4; // probe a couple of times per second
+    this.alertT = this.tun.panicEvery; // réflexe défensif : plus vif aux hauts niveaux
 
     const hq = this.buildings.find((b) => !b.dead && b.type === "hq" && b.faction === RED);
     if (!hq) return;
@@ -1271,11 +1297,12 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     // Recall the army toward the breach
     this.axisCol[RED] = clamp(Math.floor(threatX / TILE), 0, GRID_W - 1);
 
-    // Emergency garrison around the HQ
-    if (this.garrisonCd <= 0 && this.gold[RED] >= GARRISON_COST) {
+    // Emergency garrison around the HQ — paid at full price, never free
+    const gCost = this.tun.garrison * GARRISON_UNIT_COST;
+    if (this.garrisonCd <= 0 && this.gold[RED] >= gCost) {
       this.garrisonCd = GARRISON_CD;
-      this.gold[RED] -= GARRISON_COST;
-      for (let i = 0; i < 5; i++) {
+      this.gold[RED] -= gCost;
+      for (let i = 0; i < this.tun.garrison; i++) {
         this.spawnSoldier(RED, hq.cx + rand(-50, 50), hq.cy + rand(20, 60));
       }
       this.popup(hq.cx, hq.cy - 44, "GARNISON !", 1);
@@ -1300,80 +1327,183 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     }
   }
 
+  /** Le joueur vient de donner un ordre visible : l'IA adaptative le note. */
+  private observeBlue(cmd: CmdMsg): void {
+    if (cmd.cmd === "strike") this.habits.strikes++;
+    else if (cmd.cmd === "helico") this.habits.helis++;
+    else if (cmd.cmd === "upgrade") {
+      if (cmd.kind === "tank") this.habits.upTank++;
+      else if (cmd.kind === "turret") this.habits.upTurret++;
+      else this.habits.upSoldier++;
+    } else if (cmd.cmd === "axis" && typeof cmd.col === "number") {
+      this.habits.axisHist[clamp(Math.round(cmd.col), 0, GRID_W - 1)] += 1;
+    }
+  }
+
+  /**
+   * Un plan de l'IA rouge. La difficulté ne change QUE la qualité et la
+   * cadence des décisions : hésitations et axe brouillon en facile,
+   * enchaînements d'ordres + contres ciblés + combos en imbattable.
+   */
   private redBrain(): void {
+    const tun = this.tun;
+    // Les vieilles habitudes du joueur s'estompent — seules les récentes comptent.
+    for (let c = 0; c < GRID_W; c++) this.habits.axisHist[c] *= 0.985;
+
     const intel = this.redIntel();
     this.aiPosture = intel.posture;
     this.axisCol[RED] = intel.axis;
 
-    // Short grace so the player can take the early initiative.
-    if (this.elapsed < AI_GRACE) return;
+    // Grace so the player can take the early initiative, then hesitation.
+    if (this.elapsed < tun.grace) return;
+    if (Math.random() < tun.skipChance) return;
 
-    const reserve = intel.infantryFlood ? 25 : intel.posture === "defend" ? 45 : AI_MIN_RESERVE;
+    for (let i = 0; i < tun.actionsPerPlan; i++) {
+      if (!this.redAct(intel)) break;
+    }
+  }
+
+  /** One spending decision; true = gold committed (high levels chain a few).
+   *
+   *  Gestion d'or : la frappe (100) est l'arme qui gagne les guerres ici —
+   *  une IA forte garde donc une BANQUE intouchable par les constructions et
+   *  frappe dès qu'une cible la rentabilise. Une IA faible (bank 0) vide tout
+   *  dans des bâtiments et ne peut jamais riposter — comme un débutant. */
+  private redAct(intel: RedAiIntel): boolean {
+    const tun = this.tun;
+    const bank = tun.bank;
+    const heliFree = this.helis.filter((h) => !h.dead && h.faction === RED).length < MAX_HELIS;
+
+    // Imbattable : combo économisé — bombarder les défenseurs de la colonne
+    // la plus faible, puis y verser un hélico ET l'axe d'attaque.
+    if (
+      tun.combo &&
+      this.comboCd <= 0 &&
+      heliFree &&
+      intel.posture !== "defend" &&
+      this.gold[RED] >= COST.strike + COST.helico + 40
+    ) {
+      this.comboCd = COMBO_CD;
+      const hole = intel.opportunityCol;
+      const pack = this.densestBluePack(3);
+      if (pack) {
+        this.gold[RED] -= COST.strike;
+        const aim = this.leadStrike(pack);
+        this.scheduleStrike(aim.x, aim.y, RED);
+      }
+      this.gold[RED] -= COST.helico;
+      this.spawnHeli(RED, this.columnCenter(hole));
+      this.axisCol[RED] = hole;
+      return true;
+    }
 
     // Strike only when it really changes the fight: packed troops first,
-    // then exposed production/defense clusters if the player turtles.
-    if (this.gold[RED] >= COST.strike + reserve) {
+    // then exposed production/defense clusters if the player turtles. The
+    // bank exists FOR this — fire as soon as a worthwhile target shows up.
+    if (this.gold[RED] >= COST.strike + 20) {
       const target = this.bestRedStrikeTarget(intel);
       if (target) {
         this.gold[RED] -= COST.strike;
         this.scheduleStrike(target.x, target.y, RED);
-        return;
+        return true;
       }
     }
 
     // Helico punishes players who skip anti-air, but it becomes rarer once
     // blue has built enough turrets to avoid wasting gold.
     const antiAirGap = intel.blueTurrets < 2 || intel.blueFactories + intel.blueBarracks >= intel.blueTurrets + 3;
-    const wantsHeli = antiAirGap && intel.posture !== "defend" && Math.random() < (intel.blueTurrets === 0 ? 0.75 : 0.38);
-    if (wantsHeli && this.gold[RED] >= COST.helico + reserve) {
+    const heliP = intel.blueTurrets === 0 ? Math.min(0.85, tun.heliChance * 2) : tun.heliChance;
+    if (heliFree && antiAirGap && intel.posture !== "defend" && Math.random() < heliP && this.gold[RED] >= COST.helico + bank * 0.4) {
       this.gold[RED] -= COST.helico;
       this.spawnHeli(RED, this.columnCenter(intel.opportunityCol + randInt(-1, 1)));
-      return;
+      return true;
     }
 
-    // Upgrade whatever answers the current pressure best.
-    const upgradeKind: UpgradeKind =
-      intel.infantryFlood || intel.blueSoldiers > intel.redSoldiers + 8
-        ? "turret"
-        : intel.blueTanks >= 2 || intel.blueFactories >= 2
-          ? "tank"
-          : "soldier";
+    // Upgrade whatever answers the current pressure best. The adaptive AI
+    // also follows a tech curve — a permanent army multiplier beats a
+    // disposable building once the surplus allows it.
+    const upgradeKind = this.redUpgradeKind(intel);
     const upCost = this.upgradeCostFor(RED, upgradeKind);
+    const techBehind = tun.adapt && this.levels[RED] + this.tankLevels[RED] + this.turretLevels[RED] < 3 + Math.floor(this.elapsed / 60);
     const wantsUpgrade =
       (intel.blueBarracks >= 5 ||
         intel.redShare > 0.54 ||
         this.levels[BLUE] > this.levels[RED] ||
         this.tankLevels[BLUE] > this.tankLevels[RED] ||
-        this.turretLevels[BLUE] > this.turretLevels[RED]) &&
-      this.gold[RED] >= upCost + reserve;
+        this.turretLevels[BLUE] > this.turretLevels[RED] ||
+        techBehind ||
+        // Haut niveau : l'or qui dort ne gagne pas de guerre.
+        (tun.adapt && this.gold[RED] >= upCost + bank + 120)) &&
+      this.gold[RED] >= upCost + bank * 0.7;
     if (wantsUpgrade) {
       this.buyUpgrade(RED, upgradeKind);
-      return;
+      return true;
     }
 
-    const maxBarracks = Math.min(6, 4 + Math.floor(this.elapsed / 90));
+    // Constructions : toutes respectent la banque (les urgences n'en
+    // consomment que la moitié) — plus jamais de banque vidée en tourelles.
+    const bCap = barracksCap(tun, this.elapsed);
     let want: BuildingType | null = null;
-    if (intel.infantryFlood && intel.redTurrets < 7 && this.gold[RED] >= COST.turret + 5) {
+    if (intel.infantryFlood && intel.redTurrets < tun.maxTurrets && this.gold[RED] >= COST.turret + bank * 0.5) {
       want = "turret";
-    } else if (intel.infantryFlood && intel.redBarracks < Math.max(5, intel.blueBarracks - 1) && this.gold[RED] >= COST.barracks + 5) {
+    } else if (
+      intel.infantryFlood &&
+      intel.redBarracks < Math.min(bCap + 1, Math.max(5, intel.blueBarracks - 1)) &&
+      this.gold[RED] >= COST.barracks + bank * 0.5
+    ) {
       want = "barracks";
-    } else if (intel.posture === "defend" && intel.redTurrets < 5 && this.gold[RED] >= COST.turret + 15) {
+    } else if (
+      intel.posture === "defend" &&
+      intel.redTurrets < Math.max(3, tun.maxTurrets - 2) &&
+      this.gold[RED] >= COST.turret + bank * 0.6
+    ) {
       want = "turret";
-    } else if ((intel.blueTanks >= 2 || intel.blueFactories >= 2) && intel.redFactories < 2 && this.gold[RED] >= COST.factory + reserve) {
+    } else if (
+      (intel.blueTanks >= 2 || intel.blueFactories >= 2) &&
+      intel.redFactories < Math.min(2, tun.maxFactories) &&
+      this.gold[RED] >= COST.factory + bank
+    ) {
       want = "factory";
-    } else if (intel.redBarracks < maxBarracks && this.gold[RED] >= COST.barracks + reserve * 0.4) {
+    } else if (intel.redBarracks < bCap && this.gold[RED] >= COST.barracks + bank * 0.8) {
       want = "barracks";
-    } else if (intel.redTurrets < 4 && this.gold[RED] >= COST.turret + reserve) {
+    } else if (intel.redTurrets < Math.max(2, tun.maxTurrets - 3) && this.gold[RED] >= COST.turret + bank) {
       want = "turret";
-    } else if (intel.redFactories < (intel.posture === "tech" ? 3 : 2) && this.gold[RED] >= COST.factory + reserve) {
+    } else if (
+      intel.redFactories < (intel.posture === "tech" ? tun.maxFactories : Math.max(1, tun.maxFactories - 1)) &&
+      this.gold[RED] >= COST.factory + bank
+    ) {
       want = "factory";
-    } else if (this.gold[RED] >= COST.barracks + reserve + 30) {
+    } else if (this.gold[RED] >= COST.barracks + bank + 30) {
       want = "barracks";
     }
-    if (!want) return;
+    if (!want) return false;
 
     const built = this.tryRedBuild(want, intel);
     if (built) this.gold[RED] -= COST[want];
+    return built;
+  }
+
+  /** Which upgrade answers the board — the adaptive AI counters the PLAYER. */
+  private redUpgradeKind(intel: RedAiIntel): UpgradeKind {
+    if (this.tun.adapt) {
+      // Les tourelles répondent aux hélicos ET aux marées d'infanterie ;
+      // les tanks répondent au blindé ; les soldats sont l'épée par défaut.
+      if (intel.blueHelis > 0 || this.habits.helis >= 2) return "turret";
+      if (intel.blueTanks >= 2 || intel.blueFactories >= 2 || this.habits.upTank >= 2) return "tank";
+      if (intel.infantryFlood || intel.blueSoldiers > intel.redSoldiers + 8) return "turret";
+      return this.levels[RED] <= this.tankLevels[RED] ? "soldier" : "tank";
+    }
+    return intel.infantryFlood || intel.blueSoldiers > intel.redSoldiers + 8
+      ? "turret"
+      : intel.blueTanks >= 2 || intel.blueFactories >= 2
+        ? "tank"
+        : "soldier";
+  }
+
+  /** Vise devant un groupe en marche : les bleus montent (~40 px pendant la mèche). */
+  private leadStrike(p: { x: number; y: number }): { x: number; y: number } {
+    if (!this.tun.strikeLead) return p;
+    return { x: p.x, y: Math.max(TILE, p.y - 38 * STRIKE_DELAY) };
   }
 
   private redIntel(): RedAiIntel {
@@ -1431,15 +1561,42 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     else if (redShare > 0.57) posture = "press";
     else if (blueFactories >= 2 || blueTanks >= 3 || blueTurrets >= 5) posture = "tech";
 
-    let axis = posture === "press" ? opportunityCol : pressureCol;
-    if (posture === "tech" && Math.random() < 0.45) axis = opportunityCol;
-    if (Math.random() < AI_REPLAN_VARIANCE) axis = clamp(axis + randInt(-1, 1), 0, GRID_W - 1);
+    // Adapt : la colonne que le joueur privilégie (historique décroissant de
+    // ses ordres d'axe) — l'IA y pré-positionne ses tourelles.
+    let favoredCol = -1;
+    if (this.tun.adapt) {
+      let best = 0.75;
+      for (let c = 0; c < GRID_W; c++) {
+        if (this.habits.axisHist[c] > best) {
+          best = this.habits.axisHist[c];
+          favoredCol = c;
+        }
+      }
+    }
+
+    // Le choix d'axe qui GAGNE dans ce jeu : attaquer là où l'ennemi est
+    // faible (les tuiles capturées paient tout), jamais empiler son armée
+    // dans la colonne la plus forte de l'adversaire — sauf urgence profonde,
+    // où l'armée est rappelée sur la percée (redPanic gère le QG lui-même).
+    let axis: number;
+    if (this.tun.adapt) {
+      axis = deepestBlueRow <= 6 ? pressureCol : opportunityCol;
+    } else {
+      axis = posture === "press" ? opportunityCol : pressureCol;
+      if (posture === "tech" && Math.random() < 0.45) axis = opportunityCol;
+    }
+    // Facile dérive souvent (et plus loin) ; imbattable presque jamais.
+    if (Math.random() < this.tun.axisJitter) {
+      const amp = this.tun.adapt ? 1 : 2;
+      axis = clamp(axis + randInt(-amp, amp), 0, GRID_W - 1);
+    }
 
     return {
       posture,
       axis,
       pressureCol,
       opportunityCol,
+      favoredCol,
       blueTanks,
       blueSoldiers,
       blueTurrets,
@@ -1457,8 +1614,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   private bestRedStrikeTarget(intel: RedAiIntel): { x: number; y: number } | null {
-    const pack = this.densestBluePack(intel.infantryFlood || intel.posture === "defend" ? 3 : 4);
-    if (pack) return pack;
+    const urgent = intel.infantryFlood || intel.posture === "defend";
+    const pack = this.densestBluePack(Math.max(2, this.tun.strikeMinPack - (urgent ? 1 : 0)));
+    if (pack) return this.leadStrike(pack);
 
     if (intel.blueTurrets + intel.blueFactories + intel.blueBarracks < 5) return null;
     let best: { x: number; y: number; score: number } | null = null;
@@ -1475,13 +1633,33 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   private tryRedBuild(kind: BuildingType, intel: RedAiIntel): boolean {
-    const axis = kind === "turret" ? intel.pressureCol : this.axisCol[RED];
-    const rowBias = kind === "turret" ? [1, 2, 3, 4] : kind === "factory" ? [4, 5, 6, 3] : [2, 3, 4, 5];
+    // Adapt : une tourelle sur deux part sur la colonne favorite du joueur
+    // (défense anticipée), le reste sur la colonne sous pression.
+    const axis =
+      kind === "turret"
+        ? intel.favoredCol >= 0 && Math.random() < 0.45
+          ? intel.favoredCol
+          : intel.pressureCol
+        : this.axisCol[RED];
+    // Adapt : les tourelles naissent un cran plus en retrait — un chantier de
+    // tourelle (30 pv, 4 s) posé SUR le front meurt avant de tirer et paie
+    // l'ennemi ; deux rangées plus haut, il finit sa construction et tient.
+    const rowBias =
+      kind === "turret"
+        ? this.tun.adapt
+          ? [2, 3, 4, 5]
+          : [1, 2, 3, 4]
+        : kind === "factory"
+          ? [4, 5, 6, 3]
+          : [2, 3, 4, 5];
+    // Adapt : contre un joueur qui frappe souvent, s'étaler pour qu'une seule
+    // frappe ne paie jamais deux bâtiments.
+    const spread = this.tun.adapt && this.habits.strikes >= 2;
     for (let tries = 0; tries < 18; tries++) {
       const c = clamp(axis + randInt(-3, 3), 0, GRID_W - 1);
       const front = this.map.blueFrontRow(c);
       const r = clamp(front - pick(rowBias), 1, GRID_H - 2);
-      if (this.canRedBuildAt(c, r)) {
+      if (this.canRedBuildAt(c, r) && (!spread || this.redClusterAt(c, r) < 2)) {
         this.placeBuilding(RED, kind, c, r);
         return true;
       }
@@ -1506,17 +1684,30 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     return this.map.isLand(c, r) && this.map.owner[i] === RED && !this.buildingAt.has(i) && !this.map.hasChest(i);
   }
 
+  /** Bâtiments rouges à portée d'une même frappe autour de cette case. */
+  private redClusterAt(c: number, r: number): number {
+    const p = this.map.tileCenter(c, r);
+    let n = 0;
+    for (const b of this.buildings) {
+      if (!b.dead && b.faction === RED && b.distTo(p.x, p.y) < STRIKE_RADIUS * 1.3) n++;
+    }
+    return n;
+  }
+
   private columnCenter(c: number): number {
     return clamp(c, 0, GRID_W - 1) * TILE + TILE / 2;
   }
 
-  /** Best airstrike target: ≥5 blue units packed in a 3×3-tile window. */
-  private densestBluePack(minUnits = 4): { x: number; y: number } | null {
+  /** Densest blue pack in a 3×3-tile window, scored in soldier-equivalents
+   *  (tank = 2.5). The adaptive AI also subtracts its OWN units in the blast
+   *  (a strike hits both sides) — its frappes deviennent chirurgicales. */
+  private densestBluePack(minScore = 4): { x: number; y: number } | null {
     let best: { x: number; y: number } | null = null;
-    let bestCount = minUnits;
+    let bestScore = minScore;
     for (let r = 1; r < GRID_H - 1; r++) {
       for (let c = 1; c < GRID_W - 1; c++) {
-        let count = 0;
+        let score = 0;
+        let w = 0;
         let sx = 0;
         let sy = 0;
         for (let dr = -1; dr <= 1; dr++) {
@@ -1524,17 +1715,22 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
             const cell = this.buckets[(r + dr) * GRID_W + c + dc];
             if (!cell) continue;
             for (const t of cell) {
-              if (!t.dead && t.faction === BLUE && t instanceof Unit) {
-                count++;
-                sx += t.cx;
-                sy += t.cy;
+              if (t.dead || !(t instanceof Unit)) continue;
+              if (t.faction === BLUE) {
+                const v = t instanceof Tank ? 2.5 : 1;
+                score += v;
+                w += v;
+                sx += t.cx * v;
+                sy += t.cy * v;
+              } else if (this.tun.adapt) {
+                score -= t instanceof Tank ? 2 : 0.8; // friendly fire awareness
               }
             }
           }
         }
-        if (count > bestCount) {
-          bestCount = count;
-          best = { x: sx / count, y: sy / count };
+        if (w > 0 && score > bestScore) {
+          bestScore = score;
+          best = { x: sx / w, y: sy / w };
         }
       }
     }

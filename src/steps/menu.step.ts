@@ -19,6 +19,12 @@ import { track, trackScreen } from "../analytics";
 import { consumeJoinCode } from "../network";
 import { audioReady, drawMuteIcon, isMuted, toggleMute } from "../sound";
 import { openStatsModal } from "../entities/stats-modal";
+import { AI_TUNING, DIFFICULTIES, Difficulty, loadDifficulty, saveDifficulty } from "../ai";
+
+/* Sélecteur de difficulté (solo) — géométrie partagée art/boutons. */
+const DIFF_BTN_Y = 556;
+const DIFF_BTN_H = 46;
+const DIFF_BTN_STEP = 54;
 
 /** Mute toggle — top-right corner of the menu. */
 const MUTE_R = 16;
@@ -84,6 +90,13 @@ const HELP_LINES: HelpLine[] = [
   ["b", "Les raccourcis clavier sont notes"],
   ["b", "sur chaque bouton du jeu."],
   ["s", ""],
+  ["h", "LES DIFFICULTES"],
+  ["b", "4 niveaux d'IA, de FACILE a"],
+  ["b", "IMBATTABLE. L'IA ne triche jamais"],
+  ["b", "- plus le niveau monte, plus elle"],
+  ["b", "reflechit vite et s'adapte a"],
+  ["b", "votre facon de jouer."],
+  ["s", ""],
   ["h", "MULTIJOUEUR"],
   ["b", "Connectez-vous avec Google pour"],
   ["b", "cumuler vos victoires et grimper"],
@@ -100,6 +113,7 @@ const closeY = HELP_Y + 12;
 /** Title art drawn above the live island background. */
 class MenuArt extends Entity {
   public showHelp = false;
+  public showDiff = false;
   public helpScroll = 0;
   public leaderboard: LeaderboardEntry[] = [];
   public authName = "";
@@ -163,6 +177,21 @@ class MenuArt extends Entity {
     if (this.showHelp) {
       this.drawHelp(ctx);
       ctx.textAlign = "left";
+      return;
+    }
+
+    // Sélecteur de difficulté : titre + promesse de fair-play, les boutons
+    // (entités) se dessinent par-dessus. Le classement reste masqué.
+    if (this.showDiff) {
+      ctx.textAlign = "center";
+      ctx.font = `26px ${FONT}`;
+      ctx.fillStyle = COLORS.gold;
+      ctx.fillText("NIVEAU DE L'IA", VIEW_W / 2, 512);
+      ctx.font = `12px ${FONT}`;
+      ctx.fillStyle = "#bfd9f2";
+      ctx.fillText("L'IA ne triche jamais : elle joue juste mieux.", VIEW_W / 2, 538);
+      ctx.textAlign = "left";
+      drawMuteIcon(ctx, MUTE_CX, MUTE_CY, MUTE_R, isMuted());
       return;
     }
 
@@ -351,6 +380,9 @@ export class MenuStep extends GameStep {
 
   /* Help modal — buttons hidden while open, drag/wheel to scroll */
   private menuButtons: Entities.Button[] = [];
+  /* Difficulty picker (solo) — same show/hide dance as the help modal */
+  private diffButtons: Entities.Button[] = [];
+  private diffOpen = false;
   private openingHelp = false;
   private helpDragging = false;
   private helpLastY = 0;
@@ -410,8 +442,14 @@ export class MenuStep extends GameStep {
         else if (e.code === "ArrowUp") this.art.scrollHelp(-40);
         return;
       }
+      if (this.diffOpen) {
+        if (e.code === "Escape") this.closeDifficulty();
+        else if (e.key >= "1" && e.key <= "4") this.pickDifficulty(DIFFICULTIES[Number(e.key) - 1]);
+        else if (e.code === "Enter" || e.code === "NumpadEnter" || e.code === "Space") this.pickDifficulty(loadDifficulty());
+        return;
+      }
       if (this.starting) return;
-      if (e.code === "Enter" || e.code === "NumpadEnter" || e.code === "Space") this.startGame();
+      if (e.code === "Enter" || e.code === "NumpadEnter" || e.code === "Space") this.openDifficulty();
     });
   }
 
@@ -455,6 +493,8 @@ export class MenuStep extends GameStep {
     this.helpDragging = false;
     this.helpDragged = false;
     this.menuButtons = [];
+    this.diffButtons = [];
+    this.diffOpen = false;
     this.authResolved = false;
     this.camera.x = 0;
     this.camera.y = 0;
@@ -489,7 +529,7 @@ export class MenuStep extends GameStep {
     });
 
     const playBtn = this.makeButton(VIEW_W / 2 - 140, 504, 280, 58, "JOUER", "#ffe27a", 22);
-    playBtn.onMouseEvent("click", () => this.startGame());
+    playBtn.onMouseEvent("click", () => this.openDifficulty());
 
     const multiBtn = this.makeButton(VIEW_W / 2 - 140, 574, 280, 50, "MULTIJOUEUR", "#7fd1ff", 17);
     multiBtn.onMouseEvent("click", () => this.goLobby());
@@ -520,6 +560,21 @@ export class MenuStep extends GameStep {
       this.authAction(() => logout());
     });
     this.refreshAccount();
+
+    // Sélecteur de difficulté (caché) : 4 niveaux + retour. Créés une fois
+    // ici, révélés par openDifficulty — jamais dans un handler de clic
+    // (piège du dispatch : un bouton révélé sous le curseur prend le clic).
+    this.diffButtons = DIFFICULTIES.map((d, i) => {
+      const t = AI_TUNING[d];
+      const btn = this.makeButton(VIEW_W / 2 - 140, DIFF_BTN_Y + i * DIFF_BTN_STEP, 280, DIFF_BTN_H, t.label, t.color, 16);
+      btn.visible = false;
+      btn.onMouseEvent("click", () => this.pickDifficulty(d));
+      return btn;
+    });
+    const backBtn = this.makeButton(VIEW_W / 2 - 80, DIFF_BTN_Y + 4 * DIFF_BTN_STEP + 14, 160, 36, "RETOUR", "rgba(190, 215, 240, 0.9)", 12);
+    backBtn.visible = false;
+    backBtn.onMouseEvent("click", () => this.closeDifficulty());
+    this.diffButtons.push(backBtn);
 
     const footer = new Entities.Label(0, VIEW_H - 30, `v${GAME_VERSION} — cree avec BGEW, le Baguette Game Engine Web`, this.board.ctx);
     footer.fontFamily = FONT;
@@ -583,8 +638,8 @@ export class MenuStep extends GameStep {
     }
     // Google and Logout share the bottom-right slot: exactly one is shown
     // (and both stay hidden while the help modal covers the row).
-    if (this.logoutBtn) this.logoutBtn.visible = loggedIn && !this.art.showHelp;
-    if (this.googleBtn) this.googleBtn.visible = !loggedIn && !this.art.showHelp;
+    if (this.logoutBtn) this.logoutBtn.visible = loggedIn && !this.art.showHelp && !this.art.showDiff;
+    if (this.googleBtn) this.googleBtn.visible = !loggedIn && !this.art.showHelp && !this.art.showDiff;
   }
 
   private refreshLeaderboard(): void {
@@ -619,13 +674,50 @@ export class MenuStep extends GameStep {
     if (asked) track("set_pseudo");
   }
 
-  private startGame(): void {
+  /** JOUER → choix du niveau de l'IA (le dernier choix est mis en avant). */
+  private openDifficulty(): void {
+    if (this.starting || this.diffOpen || this.art?.showHelp) return;
+    this.board.playSound("click", false, 0.4);
+    this.diffOpen = true;
+    this.art.showDiff = true;
+    for (const b of this.menuButtons) b.visible = false;
+    if (this.logoutBtn) this.logoutBtn.visible = false;
+    // Révélation différée d'un tick — même garde anti-fuite de clic que le
+    // modal d'aide (le clic JOUER testerait sinon les boutons révélés).
+    setTimeout(() => {
+      if (this.board.step !== this || !this.diffOpen) return;
+      const last = loadDifficulty();
+      this.diffButtons.forEach((b, i) => {
+        b.visible = true;
+        if (i < DIFFICULTIES.length) {
+          b.fillColor = DIFFICULTIES[i] === last ? "rgba(90, 160, 230, 0.42)" : "rgba(10, 25, 45, 0.75)";
+        }
+      });
+    }, 0);
+  }
+
+  private closeDifficulty(): void {
+    if (!this.diffOpen) return;
+    this.diffOpen = false;
+    this.art.showDiff = false;
+    this.board.playSound("click", false, 0.4);
+    for (const b of this.diffButtons) b.visible = false;
+    setTimeout(() => {
+      if (this.board.step !== this || this.diffOpen || this.art.showHelp) return;
+      for (const b of this.menuButtons) b.visible = true;
+      this.refreshAccount(); // ne rétablit LOGOUT que si connecté
+    }, 0);
+  }
+
+  private pickDifficulty(d: Difficulty): void {
     if (this.starting) return;
     this.starting = true;
+    saveDifficulty(d);
+    track("solo_difficulty", { difficulty: d });
     this.board.playSound("click", false, 0.5);
     this.board.addEntity(
       new Fader(0, 1, 450, "#08111f", () => {
-        this.board.moveToStep("game", {});
+        this.board.moveToStep("game", { difficulty: d });
       })
     );
   }

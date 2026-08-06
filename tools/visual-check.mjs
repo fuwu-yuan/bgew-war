@@ -46,6 +46,9 @@ await page.waitForTimeout(300);
 
 // Start a solo game → names in battle (Vous vs IA)
 await page.mouse.click(...at(320, 533));
+await page.waitForTimeout(500);
+await page.screenshot({ path: "/tmp/vc-2b-difficulty.png" });
+await page.mouse.click(...at(320, 633)); // MOYEN
 await page.waitForTimeout(1200);
 await page.screenshot({ path: "/tmp/vc-3-battle-names.png" });
 

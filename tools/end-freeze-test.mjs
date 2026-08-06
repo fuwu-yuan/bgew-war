@@ -47,6 +47,8 @@ for (let run = 1; run <= RUNS; run++) {
   const scale = canvas.width / 640;
   const at = (x, y) => [canvas.x + x * scale, canvas.y + y * scale];
   await page.mouse.click(...at(320, 533)); // JOUER
+  await page.waitForTimeout(500);
+  await page.mouse.click(...at(320, 633)); // difficulte MOYEN
   await page.waitForTimeout(2500);
 
   // Build a heavy battle: a big mass of units on BOTH sides so the screen is
