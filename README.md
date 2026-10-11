@@ -62,6 +62,20 @@ dégât, +5 portée, +5 vitesse et cadence +5 % par niveau. Le coût croît
 vétérans déjà déployés gardent le leur (chevrons dorés au-dessus du casque).
 En solo, l'IA rouge achète aussi ses niveaux.
 
+## Niveau CLAUDE (privé)
+
+Cinquième niveau solo : le général rouge est un **vrai modèle Claude** (Anthropic),
+interrogé via la Cloud Function `claudeTurn` (voir `functions/README.md`). Il ne
+voit que ce que vous voyez et joue avec vos règles et votre revenu ; ses ordres
+sont exécutés par un « lieutenant » local qui garde les réflexes du niveau
+IMBATTABLE (défense du QG, visée des frappes) et reprend seul la partie si le
+serveur ne répond plus. Ses répliques s'affichent sous la barre de territoire.
+Le niveau est protégé par **mot de passe** pour le moment (clé API et facture).
+
+Tests : `node tools/claude-test.mjs` (Chromium headless, fonction simulée :
+menu, mot de passe, tours du général, mode dégradé, refus) et
+`node tools/claude-function-test.mjs` (module de la fonction, sans réseau).
+
 ## Comment jouer
 
 - Les unités sortent toutes seules des casernes et poussent le front.

@@ -149,3 +149,95 @@ exports.submitMatchResult = onCall(async (request) => {
     return { status, recorded: ok, reason: reasons[0] };
   });
 });
+
+/* ====================================================================== *
+ * Niveau CLAUDE — le général rouge est un vrai modèle Claude (Anthropic).
+ *
+ * `claudeTurn` est un callable protégé par MOT DE PASSE (le niveau est
+ * privé pour le moment) : la clé API ne quitte jamais le serveur, et le mot
+ * de passe borne la facture. Le client envoie l'état du jeu tel que le
+ * joueur le voit ; le modèle répond par des intentions (axe, réserve,
+ * 0-4 ordres) que le lieutenant local exécute avec les règles communes.
+ *
+ * Secrets (firebase functions:secrets:set) : ANTHROPIC_API_KEY,
+ * CLAUDE_LEVEL_PASSWORD. Réglages (.env) : CLAUDE_MODEL, CLAUDE_EFFORT,
+ * CLAUDE_DAILY_CALLS (plafond d'appels/jour, coupe-circuit budget).
+ * ====================================================================== */
+const { defineSecret } = require("firebase-functions/params");
+const { buildPrompt, askGeneral } = require("./claude-general");
+
+const anthropicKey = defineSecret("ANTHROPIC_API_KEY");
+const claudePassword = defineSecret("CLAUDE_LEVEL_PASSWORD");
+
+let anthropicClient = null;
+function anthropic() {
+  if (!anthropicClient) {
+    const Anthropic = require("@anthropic-ai/sdk");
+    anthropicClient = new Anthropic({ apiKey: anthropicKey.value(), maxRetries: 1, timeout: 45000 });
+  }
+  return anthropicClient;
+}
+
+function passwordOk(given) {
+  const expected = String(claudePassword.value() || "");
+  const got = String(given || "");
+  if (!expected || !got) return false;
+  const a = crypto.createHash("sha256").update(got).digest();
+  const b = crypto.createHash("sha256").update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+function todayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+exports.claudeTurn = onCall(
+  { secrets: [anthropicKey, claudePassword], timeoutSeconds: 60, memory: "256MiB" },
+  async (request) => {
+    const d = request.data || {};
+    if (!passwordOk(d.password)) throw new HttpsError("permission-denied", "Mot de passe incorrect.");
+    // Le menu vérifie le mot de passe avant de lancer la partie : pas d'appel modèle.
+    if (d.ping === true) return { ok: true };
+
+    const state = d.state && typeof d.state === "object" ? d.state : null;
+    if (!state || !Array.isArray(state.map)) throw new HttpsError("invalid-argument", "state");
+    const journal = Array.isArray(d.journal) ? d.journal.slice(-6) : [];
+
+    // Coupe-circuit budget : N appels par jour, tous joueurs confondus.
+    const cap = Math.max(1, Number(process.env.CLAUDE_DAILY_CALLS) || 3000);
+    const usageRef = db.collection("claudeUsage").doc(todayKey());
+    const usage = await usageRef.get();
+    const calls = usage.exists ? Number(usage.data().calls) || 0 : 0;
+    if (calls >= cap) throw new HttpsError("resource-exhausted", "Quota du jour atteint.");
+
+    const model = process.env.CLAUDE_MODEL || "claude-opus-5-5";
+    const effort = process.env.CLAUDE_EFFORT || "medium";
+    const t0 = Date.now();
+    let out;
+    try {
+      out = await askGeneral(anthropic(), { state, journal, model, effort });
+    } catch (e) {
+      console.error("claudeTurn failed", e && e.message);
+      throw new HttpsError("unavailable", `Général injoignable : ${e && e.message ? String(e.message).slice(0, 120) : "erreur"}`);
+    }
+    const latencyMs = Date.now() - t0;
+    const u = out.usage || {};
+    usageRef
+      .set(
+        {
+          calls: FieldValue.increment(1),
+          inputTokens: FieldValue.increment(Number(u.input_tokens) || 0),
+          cacheReadTokens: FieldValue.increment(Number(u.cache_read_input_tokens) || 0),
+          outputTokens: FieldValue.increment(Number(u.output_tokens) || 0),
+          latencyMs: FieldValue.increment(latencyMs),
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      )
+      .catch((e) => console.error("claudeUsage write failed", e && e.message));
+    return { plan: out.plan, latencyMs, model, usage: u };
+  }
+);
+
+/** Exposé pour les tests Node (tools/claude-function-test.mjs). */
+exports._claudePrompt = buildPrompt;

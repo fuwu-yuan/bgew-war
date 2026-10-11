@@ -24,7 +24,13 @@ export interface HudState {
   turretUpgradeCost: number;
   myName: string; // local player's name (left, my unit color)
   enemyName: string; // opponent's name (right, enemy unit color)
+  /** Niveau CLAUDE : réplique du général (affichée CLAUDE_SAY_FOR s) + témoin « réfléchit ». */
+  enemySay: string;
+  enemySayAge: number; // s depuis la réplique
+  enemyThinking: boolean;
 }
+
+const SAY_FOR = 8; // s
 
 interface Btn {
   id: HudButton;
@@ -172,8 +178,31 @@ export class Hud extends Entity {
     ctx.fillText(this.trunc(s.myName), 6, 24);
     ctx.fillStyle = enemyColor;
     ctx.textAlign = "right";
-    ctx.fillText(this.trunc(s.enemyName), VIEW_W - 6, 24);
+    // Le général distant « réfléchit » : points animés devant son nom.
+    const dots = s.enemyThinking ? ".".repeat(1 + (Math.floor(this.t * 3) % 3)).padEnd(3, " ") + " " : "";
+    ctx.fillText(dots + this.trunc(s.enemyName), VIEW_W - 6, 24);
     ctx.textAlign = "left";
+
+    /* Réplique du général (niveau CLAUDE) — bulle sous la bande des noms,
+       cédant la place à la bannière de mode quand le joueur en a une. */
+    if (!s.mode && s.enemySay && s.enemySayAge < SAY_FOR) {
+      const fade = clamp((SAY_FOR - s.enemySayAge) / 1.2, 0, 1);
+      ctx.font = `12px ${FONT}`;
+      const txt = `« ${s.enemySay} »`;
+      const tw = Math.min(ctx.measureText(txt).width, VIEW_W - 40);
+      ctx.globalAlpha = fade;
+      ctx.fillStyle = "rgba(8, 20, 38, 0.82)";
+      this.roundRect(ctx, VIEW_W / 2 - tw / 2 - 10, 32, tw + 20, 22, 6);
+      ctx.fill();
+      ctx.strokeStyle = enemyColor;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.fillStyle = "#ffe9d6";
+      ctx.textAlign = "center";
+      ctx.fillText(txt, VIEW_W / 2, 47, VIEW_W - 40);
+      ctx.textAlign = "left";
+      ctx.globalAlpha = 1;
+    }
 
     /* Battle clock — centered at the top, between the two names (m:ss) */
     const total = Math.max(0, Math.floor(s.elapsed));

@@ -37,7 +37,17 @@ import { CmdMsg, EndMsg, FrameMsg, GameMsg, gameData, InitMsg, IpMsg, MultiData,
 import { track, trackScreen } from "../analytics";
 import { toggleMute } from "../sound";
 import { currentUser, displayName } from "../firebase";
-import { AI_TUNING, AiTuning, barracksCap, DIFFICULTIES, Difficulty } from "../ai";
+import { AI_TUNING, AiTuning, barracksCap, CLAUDE_DIFFICULTY, DIFFICULTIES, Difficulty } from "../ai";
+import {
+  askClaudeTurn,
+  ClaudeBuildingInfo,
+  ClaudeError,
+  ClaudeJournalEntry,
+  ClaudeOrder,
+  ClaudePlan,
+  ClaudeState,
+  loadClaudePassword,
+} from "../claude-general";
 
 const BRAIN_EVERY = 3; // s — red AI thinks (solo only)
 const INCOME_EVERY = 1; // s
@@ -75,6 +85,14 @@ const HQ_DEFENSE_MAX_SOLDIERS = 130;
 const HQ_DEFENSE_MIN_TANKS = 4;
 const HQ_DEFENSE_MAX_TANKS = 16;
 
+/* Niveau CLAUDE — cadence du général distant et de son lieutenant local */
+const CLAUDE_FIRST_AT = 1.5; // s — premier tour (la carte est posée)
+const CLAUDE_MIN_GAP = 2.5; // s — repos minimal entre deux tours (après la réponse)
+const CLAUDE_RETRY = 4; // s — après un échec réseau
+const CLAUDE_OFFLINE_AFTER = 14; // s sans réponse → le lieutenant (IA imbattable) prend le relais
+const CLAUDE_ORDER_EVERY = 0.35; // s — au plus un ordre exécuté par ce laps (rythme naturel)
+const CLAUDE_JOURNAL_MAX = 6;
+
 type NetRole = "solo" | "host" | "guest";
 type AiPosture = "defend" | "counter" | "press" | "tech";
 type UpgradeKind = "soldier" | "tank" | "turret";
@@ -99,6 +117,27 @@ interface RedAiIntel {
   redShare: number;
   deepestBlueRow: number;
   infantryFlood: boolean;
+}
+
+/** Niveau CLAUDE : état du général distant + de ses ordres en cours. */
+interface GeneralState {
+  password: string;
+  match: number; // jeton : ignore les réponses d'une partie précédente
+  turn: number;
+  inFlight: boolean;
+  nextAt: number; // elapsed (s) du prochain appel
+  lastOkAt: number; // elapsed du dernier plan reçu
+  failures: number;
+  plan: ClaudePlan | null;
+  pending: ClaudeOrder[];
+  reserve: number;
+  orderT: number;
+  journal: ClaudeJournalEntry[];
+  current: ClaudeJournalEntry | null;
+  latencyMs: number;
+  lastError: string;
+  /** Cycles joués par l'IA locale pendant que le général était muet. */
+  lieutenantRuns: number;
 }
 
 export class PlayStep extends GameStep implements GameAPI, HudState {
@@ -184,6 +223,12 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   /** What the human has SHOWN so far (their executed, on-screen orders — the
    *  adaptive AI reads nothing the player couldn't see of it in reverse). */
   private habits = { strikes: 0, helis: 0, upSoldier: 0, upTank: 0, upTurret: 0, axisHist: new Array<number>(GRID_W).fill(0) };
+  /** Niveau CLAUDE : le général (modèle distant) — null aux autres niveaux. */
+  private general: GeneralState | null = null;
+  /* HudState — réplique du général et témoin « réfléchit » */
+  public enemySay = "";
+  public enemySayAge = 0;
+  public enemyThinking = false;
   /** `?bot=1` — auto-play MY faction through the command path (desync tests). */
   private botMode = false;
   private botT = BRAIN_EVERY;
@@ -248,6 +293,11 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       `bldg   R ${bR}  B ${bB}`,
       `gold   R ${Math.floor(this.gold[RED])}  B ${Math.floor(this.gold[BLUE])}`,
       `lvl  s R${this.levels[RED]} B${this.levels[BLUE]}  tk R${this.tankLevels[RED]} B${this.tankLevels[BLUE]}  tu R${this.turretLevels[RED]} B${this.turretLevels[BLUE]}`,
+      ...(this.general
+        ? [
+            `claude tours ${this.general.turn}  ${this.general.inFlight ? "pense" : "attend"}  ${this.general.latencyMs}ms  ko ${this.general.failures}${this.generalOnline() ? "" : "  LIEUTENANT"}`,
+          ]
+        : []),
     ].join("\n");
   }
 
@@ -329,13 +379,38 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     const qsDiff = new URLSearchParams(window.location.search).get("diff") as Difficulty | null;
     this.difficulty = data?.difficulty ?? (qsDiff && DIFFICULTIES.includes(qsDiff) ? qsDiff : "medium");
     this.tun = AI_TUNING[this.difficulty];
+    this.general =
+      this.role === "solo" && this.difficulty === CLAUDE_DIFFICULTY
+        ? {
+            password: loadClaudePassword(),
+            match: Date.now(),
+            turn: 0,
+            inFlight: false,
+            nextAt: CLAUDE_FIRST_AT,
+            lastOkAt: 0,
+            failures: 0,
+            plan: null,
+            pending: [],
+            reserve: this.tun.bank,
+            orderT: 0,
+            journal: [],
+            current: null,
+            latencyMs: 0,
+            lastError: "",
+            lieutenantRuns: 0,
+          }
+        : null;
+    this.enemySay = "";
+    this.enemySayAge = 0;
+    this.enemyThinking = false;
 
     // Player names shown in the HUD. Local name = signed-in pseudo, else a
     // sensible default. The enemy name arrives over the network (ready/init)
     // so it starts as a placeholder.
     const u = currentUser();
     this.myName = u && !u.isAnonymous ? displayName(u) : this.role === "solo" ? "Vous" : "Invite";
-    this.enemyName = this.role === "solo" ? `IA ${this.tun.label}` : this.role === "guest" ? "Adversaire" : "Invite";
+    this.enemyName =
+      this.role === "solo" ? (this.general ? "CLAUDE" : `IA ${this.tun.label}`) : this.role === "guest" ? "Adversaire" : "Invite";
     // Ranked identity: my uid (empty when not signed in) and a shared match id
     // the host mints and shares so the Cloud Function can pair the two reports.
     this.myUid = u && !u.isAnonymous ? u.uid : "";
@@ -1142,9 +1217,17 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       this.brainT -= TICK_DT;
       if (this.brainT <= 0) {
         this.brainT = this.tun.brainEvery;
-        this.redBrain();
+        // Niveau CLAUDE : le cerveau local ne joue que si le général est muet.
+        if (!this.generalOnline()) {
+          this.redBrain();
+          if (this.general) {
+            this.general.lieutenantRuns++;
+            this.publishGeneralDebug();
+          }
+        }
       }
       this.redPanic(TICK_DT);
+      if (this.general) this.updateGeneral(TICK_DT);
     }
 
     // `?bot=1`: drive MY faction with the solo AI's reflexes through the command
@@ -1701,11 +1784,12 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   /** Densest blue pack in a 3×3-tile window, scored in soldier-equivalents
    *  (tank = 2.5). The adaptive AI also subtracts its OWN units in the blast
    *  (a strike hits both sides) — its frappes deviennent chirurgicales. */
-  private densestBluePack(minScore = 4): { x: number; y: number } | null {
+  private densestBluePack(minScore = 4, onlyCol = -1): { x: number; y: number } | null {
     let best: { x: number; y: number } | null = null;
     let bestScore = minScore;
     for (let r = 1; r < GRID_H - 1; r++) {
       for (let c = 1; c < GRID_W - 1; c++) {
+        if (onlyCol >= 0 && Math.abs(c - onlyCol) > 1) continue; // niveau CLAUDE : frappe « colonne »
         let score = 0;
         let w = 0;
         let sx = 0;
@@ -1735,6 +1819,359 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
     }
     return best;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Niveau CLAUDE — le général (modèle distant) et son lieutenant
+   *
+   * Le général reçoit l'état VISIBLE du jeu et répond par des intentions
+   * (axe, réserve, 0-4 ordres). Le lieutenant, ici, les exécute au rythme
+   * de l'or avec exactement les validations du joueur, vise les frappes au
+   * moment du tir (l'état envoyé a déjà quelques secondes), et garde ses
+   * réflexes (redPanic). Hors-ligne, l'IA imbattable locale prend le relais
+   * pour que la partie ne se fige jamais.
+   * ---------------------------------------------------------------- */
+
+  /** Le général est joignable : le cerveau local se tait. */
+  private generalOnline(): boolean {
+    const g = this.general;
+    return !!g && this.elapsed - g.lastOkAt < CLAUDE_OFFLINE_AFTER;
+  }
+
+  private updateGeneral(dt: number): void {
+    const g = this.general;
+    if (!g) return;
+    this.enemySayAge += dt;
+    this.enemyThinking = g.inFlight;
+    if (!g.inFlight && !this.ended && this.elapsed >= g.nextAt) this.requestGeneralTurn();
+
+    g.orderT -= dt;
+    if (g.orderT <= 0 && g.pending.length) {
+      g.orderT = CLAUDE_ORDER_EVERY;
+      this.runGeneralOrder();
+    }
+  }
+
+  private requestGeneralTurn(): void {
+    const g = this.general;
+    if (!g || g.inFlight) return;
+    g.inFlight = true;
+    g.turn++;
+    const match = g.match;
+    const state = this.claudeSnapshot(g);
+    askClaudeTurn(g.password, state, g.journal)
+      .then((res) => {
+        if (this.general !== g || g.match !== match || this.board.step !== this) return;
+        g.inFlight = false;
+        g.failures = 0;
+        g.lastOkAt = this.elapsed;
+        g.latencyMs = res.latencyMs;
+        g.nextAt = this.elapsed + CLAUDE_MIN_GAP;
+        if (!this.ended) this.applyGeneralPlan(res.plan);
+        this.publishGeneralDebug();
+      })
+      .catch((e: ClaudeError) => {
+        if (this.general !== g || g.match !== match) return;
+        g.inFlight = false;
+        g.failures++;
+        g.lastError = `${e.code}: ${e.message}`;
+        // Mauvais mot de passe / quota : inutile d'insister, le lieutenant joue.
+        g.nextAt = this.elapsed + (e.code === "password" || e.code === "quota" ? 1e9 : CLAUDE_RETRY * Math.min(4, g.failures));
+        if (g.failures === 1 || e.code === "password") console.warn("[claude] général injoignable —", g.lastError);
+        this.publishGeneralDebug();
+      });
+  }
+
+  /** L'état envoyé au général : rien que le joueur ne voie pas à l'écran. */
+  private claudeSnapshot(g: GeneralState): ClaudeState {
+    const map: string[] = [];
+    for (let r = 0; r < GRID_H; r++) {
+      let line = "";
+      for (let c = 0; c < GRID_W; c++) {
+        const i = this.map.idx(c, r);
+        let ch = "~";
+        if (this.map.isLand(c, r)) {
+          const o = this.map.owner[i];
+          ch = o === RED ? "r" : o === BLUE ? "b" : "-";
+          if (this.map.hasChest(i)) ch = "$";
+          const b = this.buildingAt.get(i);
+          if (b && !b.dead) {
+            const code = b.type === "hq" ? "q" : b.type === "barracks" ? "c" : b.type === "turret" ? "t" : "u";
+            ch = b.faction === RED ? code.toUpperCase() : code;
+          }
+        }
+        line += ch;
+      }
+      map.push(line);
+    }
+
+    const blueFront: number[] = [];
+    const redCol = new Array<number>(GRID_W).fill(0);
+    const blueCol = new Array<number>(GRID_W).fill(0);
+    let deepestBlueRow = GRID_H;
+    for (let c = 0; c < GRID_W; c++) {
+      const f = this.map.blueFrontRow(c);
+      blueFront.push(f);
+      if (f < deepestBlueRow) deepestBlueRow = f;
+    }
+    let redS = 0;
+    let redT = 0;
+    let blueS = 0;
+    let blueT = 0;
+    for (const u of this.units) {
+      if (u.dead) continue;
+      const c = clamp(Math.floor(u.cx / TILE), 0, GRID_W - 1);
+      const tank = u instanceof Tank;
+      const v = tank ? 2.5 : 1;
+      if (u.faction === RED) {
+        redCol[c] += v;
+        if (tank) redT++;
+        else redS++;
+      } else {
+        blueCol[c] += v;
+        if (tank) blueT++;
+        else blueS++;
+      }
+    }
+    const info = (f: Faction): ClaudeBuildingInfo[] =>
+      this.buildings
+        .filter((b) => !b.dead && b.faction === f)
+        .map((b) => ({
+          type: b.type,
+          c: b.col,
+          r: b.row,
+          hp: Math.round((b.hp / b.maxHp) * 100) / 100,
+          building: b.buildProgress < 1,
+        }));
+    const hqOf = (f: Faction): number => {
+      const hq = this.buildings.find((b) => !b.dead && b.type === "hq" && b.faction === f);
+      return hq ? hq.hp / hq.maxHp : 0;
+    };
+    let favoredCol = -1;
+    let best = 0.75;
+    for (let c = 0; c < GRID_W; c++) {
+      if (this.habits.axisHist[c] > best) {
+        best = this.habits.axisHist[c];
+        favoredCol = c;
+      }
+    }
+    const lieutenant: string[] = [];
+    if (this.garrisonCd > 0) lieutenant.push("garnison d'urgence levée récemment (QG menacé)");
+    if (this.hqDefenseUsed[RED]) lieutenant.push("vague de défense du QG déjà utilisée");
+    return {
+      turn: g.turn,
+      t: this.elapsed,
+      gold: this.gold[RED],
+      share: this.map.share(RED),
+      axis: this.axisCol[RED],
+      reserve: g.reserve,
+      levels: {
+        red: { soldiers: this.levels[RED], tanks: this.tankLevels[RED], turrets: this.turretLevels[RED] },
+        blue: { soldiers: this.levels[BLUE], tanks: this.tankLevels[BLUE], turrets: this.turretLevels[BLUE] },
+      },
+      upgradeCost: {
+        soldiers: this.upgradeCostFor(RED, "soldier"),
+        tanks: this.upgradeCostFor(RED, "tank"),
+        turrets: this.upgradeCostFor(RED, "turret"),
+      },
+      units: { red: { soldiers: redS, tanks: redT }, blue: { soldiers: blueS, tanks: blueT } },
+      helis: {
+        red: this.helis.filter((h) => !h.dead && h.faction === RED).length,
+        blue: this.helis.filter((h) => !h.dead && h.faction === BLUE).length,
+      },
+      hq: { red: hqOf(RED), blue: hqOf(BLUE) },
+      map,
+      cols: { blueFront, red: redCol.map((v) => Math.round(v)), blue: blueCol.map((v) => Math.round(v)) },
+      redBuildings: info(RED),
+      blueBuildings: info(BLUE),
+      habits: {
+        strikes: this.habits.strikes,
+        helis: this.habits.helis,
+        upSoldier: this.habits.upSoldier,
+        upTank: this.habits.upTank,
+        upTurret: this.habits.upTurret,
+        favoredCol,
+      },
+      deepestBlueRow,
+      pending: g.pending.map((o) => this.describeOrder(o)),
+      lieutenant: lieutenant.join(" ; "),
+    };
+  }
+
+  private describeOrder(o: ClaudeOrder): string {
+    switch (o.type) {
+      case "frappe":
+        return o.cible === "colonne" ? `frappe colonne ${o.col}` : o.cible === "batiment" ? `frappe batiment (${o.col},${o.ligne})` : "frappe groupe";
+      case "helico":
+        return `helico colonne ${o.col}`;
+      case "amelioration":
+        return `amelioration ${o.quoi}`;
+      default:
+        return `${o.type} (${o.col},${o.ligne})`;
+    }
+  }
+
+  /** Un nouveau plan remplace l'ancien : axe immédiat, ordres en file. */
+  private applyGeneralPlan(plan: ClaudePlan): void {
+    const g = this.general;
+    if (!g) return;
+    // Clôture du journal du plan précédent : ce qu'il a donné.
+    if (g.current) {
+      g.current.partApres = this.map.share(RED);
+      g.current.orApres = this.gold[RED];
+      g.journal.push(g.current);
+      if (g.journal.length > CLAUDE_JOURNAL_MAX) g.journal.splice(0, g.journal.length - CLAUDE_JOURNAL_MAX);
+    }
+    g.plan = plan;
+    g.pending = plan.ordres.slice();
+    g.reserve = plan.reserve;
+    g.orderT = 0;
+    this.axisCol[RED] = clamp(Math.round(plan.axe), 0, GRID_W - 1);
+    g.current = {
+      t: this.elapsed,
+      axe: this.axisCol[RED],
+      reserve: plan.reserve,
+      message: plan.message,
+      faits: [],
+      ignores: [],
+      partAvant: this.map.share(RED),
+      partApres: 0,
+      orAvant: this.gold[RED],
+      orApres: 0,
+    };
+    if (plan.message) {
+      this.enemySay = plan.message;
+      this.enemySayAge = 0;
+    }
+  }
+
+  /** Exécute le premier ordre en file s'il est possible ET payable. */
+  private runGeneralOrder(): void {
+    const g = this.general;
+    if (!g || !g.pending.length || this.ended) return;
+    const o = g.pending[0];
+    const verdict = this.execGeneralOrder(o, g.reserve);
+    if (verdict === "wait") return; // pas encore l'or : on garde l'ordre en tête de file
+    g.pending.shift();
+    if (g.current) {
+      const label = this.describeOrder(o);
+      if (verdict === "done") g.current.faits.push(label);
+      else g.current.ignores.push(`${label} (${verdict.slice(5)})`);
+    }
+    this.publishGeneralDebug();
+  }
+
+  /**
+   * Même or, mêmes validations que pour un humain. Les constructions et
+   * améliorations respectent la réserve du général ; frappes et hélicos
+   * (l'usage de la réserve) ne le font pas.
+   */
+  private execGeneralOrder(o: ClaudeOrder, reserve: number): "done" | "wait" | `skip:${string}` {
+    const gold = this.gold[RED];
+    if (o.type === "caserne" || o.type === "tourelle" || o.type === "usine") {
+      const kind: BuildingType = o.type === "caserne" ? "barracks" : o.type === "tourelle" ? "turret" : "factory";
+      // Faisabilité AVANT l'or : un ordre impossible ne bloque pas la file.
+      const spot = this.nearestRedBuildable(o.col, o.ligne);
+      if (!spot) return "skip:aucune case rouge libre";
+      if (gold < COST[kind] + reserve) return "wait";
+      this.gold[RED] -= COST[kind];
+      this.placeBuilding(RED, kind, spot.c, spot.r);
+      const center = this.map.tileCenter(spot.c, spot.r);
+      this.spawnEffect(new Shockwave(center.x, center.y, 50, "#ffffff", 0.35));
+      this.sfx("build", 0.5);
+      return "done";
+    }
+    if (o.type === "amelioration") {
+      const kind: UpgradeKind = o.quoi === "tanks" ? "tank" : o.quoi === "tourelles" ? "turret" : "soldier";
+      if (gold < this.upgradeCostFor(RED, kind) + reserve) return "wait";
+      this.buyUpgrade(RED, kind);
+      return "done";
+    }
+    if (o.type === "frappe") {
+      if (gold < COST.strike) return "wait";
+      const target = this.resolveStrikeTarget(o);
+      if (!target) return "skip:aucune cible rentable";
+      this.gold[RED] -= COST.strike;
+      this.scheduleStrike(target.x, target.y, RED);
+      return "done";
+    }
+    if (o.type === "helico") {
+      if (this.helis.filter((h) => !h.dead && h.faction === RED).length >= MAX_HELIS) return "skip:3 helicos deja en vol";
+      if (gold < COST.helico) return "wait";
+      this.gold[RED] -= COST.helico;
+      this.spawnHeli(RED, this.columnCenter(o.col));
+      return "done";
+    }
+    return "skip:ordre inconnu";
+  }
+
+  /** Vise au moment du tir (l'état envoyé date de quelques secondes). */
+  private resolveStrikeTarget(o: ClaudeOrder): { x: number; y: number } | null {
+    if (o.cible === "batiment") {
+      const p = this.map.tileCenter(clamp(o.col, 0, GRID_W - 1), clamp(o.ligne, 0, GRID_H - 1));
+      let best: Building | null = null;
+      let bestD = TILE * 4;
+      for (const b of this.buildings) {
+        if (b.dead || b.faction !== BLUE || b.type === "hq") continue;
+        const d = b.distTo(p.x, p.y);
+        if (d < bestD) {
+          bestD = d;
+          best = b;
+        }
+      }
+      return best ? { x: best.cx, y: best.cy } : null;
+    }
+    const pack = this.densestBluePack(3, o.cible === "colonne" ? clamp(o.col, 0, GRID_W - 1) : -1);
+    return pack ? this.leadStrike(pack) : null;
+  }
+
+  /** Case rouge libre la plus proche de (c, r) — l'intention prime sur la case exacte. */
+  private nearestRedBuildable(c: number, r: number): { c: number; r: number } | null {
+    if (c < 0 || r < 0) {
+      // Sans case : derrière le front sur l'axe courant, comme l'IA locale.
+      const ac = this.axisCol[RED];
+      const front = this.map.blueFrontRow(ac);
+      c = ac;
+      r = clamp(front - 3, 1, GRID_H - 2);
+    }
+    c = clamp(c, 0, GRID_W - 1);
+    r = clamp(r, 0, GRID_H - 1);
+    let best: { c: number; r: number } | null = null;
+    let bestD = Infinity;
+    for (let rr = 1; rr < GRID_H - 1; rr++) {
+      for (let cc = 0; cc < GRID_W; cc++) {
+        if (!this.canRedBuildAt(cc, rr)) continue;
+        const d = (cc - c) * (cc - c) + (rr - r) * (rr - r) * 1.5;
+        if (d < bestD) {
+          bestD = d;
+          best = { c: cc, r: rr };
+        }
+      }
+    }
+    // Au-delà de 4 cases, l'intention n'a plus de sens (ex. case en zone bleue).
+    return best && bestD <= 16 ? best : null;
+  }
+
+  private publishGeneralDebug(): void {
+    const g = this.general;
+    if (!g) return;
+    const w = window as unknown as { __bgewClaude?: unknown };
+    const step = this;
+    w.__bgewClaude = {
+      turn: g.turn,
+      failures: g.failures,
+      lastError: g.lastError,
+      latencyMs: g.latencyMs,
+      lieutenantRuns: g.lieutenantRuns,
+      get online() {
+        return step.generalOnline();
+      },
+      plan: g.plan,
+      pending: g.pending.length,
+      journal: g.journal,
+      current: g.current,
+      say: this.enemySay,
+    };
   }
 
   /* ---------------------------------------------------------------- *

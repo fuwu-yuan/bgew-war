@@ -20,6 +20,7 @@ import { consumeJoinCode } from "../network";
 import { audioReady, drawMuteIcon, isMuted, toggleMute } from "../sound";
 import { openStatsModal } from "../entities/stats-modal";
 import { AI_TUNING, DIFFICULTIES, Difficulty, loadDifficulty, saveDifficulty } from "../ai";
+import { ClaudeError, loadClaudePassword, pingClaude, saveClaudePassword } from "../claude-general";
 
 /* Sélecteur de difficulté (solo) — géométrie partagée art/boutons. */
 const DIFF_BTN_Y = 556;
@@ -114,6 +115,8 @@ const closeY = HELP_Y + 12;
 class MenuArt extends Entity {
   public showHelp = false;
   public showDiff = false;
+  /** Ligne d'état sous le sélecteur (vérification du niveau CLAUDE). */
+  public diffStatus = "";
   public helpScroll = 0;
   public leaderboard: LeaderboardEntry[] = [];
   public authName = "";
@@ -190,6 +193,11 @@ class MenuArt extends Entity {
       ctx.font = `12px ${FONT}`;
       ctx.fillStyle = "#bfd9f2";
       ctx.fillText("L'IA ne triche jamais : elle joue juste mieux.", VIEW_W / 2, 538);
+      if (this.diffStatus) {
+        ctx.font = `12px ${FONT}`;
+        ctx.fillStyle = this.diffStatus.startsWith("Verification") ? "#bfd9f2" : "#ffb13d";
+        ctx.fillText(this.diffStatus, VIEW_W / 2, DIFF_BTN_Y + DIFFICULTIES.length * DIFF_BTN_STEP + 72);
+      }
       ctx.textAlign = "left";
       drawMuteIcon(ctx, MUTE_CX, MUTE_CY, MUTE_R, isMuted());
       return;
@@ -383,6 +391,8 @@ export class MenuStep extends GameStep {
   /* Difficulty picker (solo) — same show/hide dance as the help modal */
   private diffButtons: Entities.Button[] = [];
   private diffOpen = false;
+  /** Niveau CLAUDE : vérification du mot de passe en cours (serveur). */
+  private unlocking = false;
   private openingHelp = false;
   private helpDragging = false;
   private helpLastY = 0;
@@ -444,7 +454,7 @@ export class MenuStep extends GameStep {
       }
       if (this.diffOpen) {
         if (e.code === "Escape") this.closeDifficulty();
-        else if (e.key >= "1" && e.key <= "4") this.pickDifficulty(DIFFICULTIES[Number(e.key) - 1]);
+        else if (e.key >= "1" && e.key <= String(DIFFICULTIES.length)) this.pickDifficulty(DIFFICULTIES[Number(e.key) - 1]);
         else if (e.code === "Enter" || e.code === "NumpadEnter" || e.code === "Space") this.pickDifficulty(loadDifficulty());
         return;
       }
@@ -566,12 +576,28 @@ export class MenuStep extends GameStep {
     // (piège du dispatch : un bouton révélé sous le curseur prend le clic).
     this.diffButtons = DIFFICULTIES.map((d, i) => {
       const t = AI_TUNING[d];
-      const btn = this.makeButton(VIEW_W / 2 - 140, DIFF_BTN_Y + i * DIFF_BTN_STEP, 280, DIFF_BTN_H, t.label, t.color, 16);
+      const btn = this.makeButton(
+        VIEW_W / 2 - 140,
+        DIFF_BTN_Y + i * DIFF_BTN_STEP,
+        280,
+        DIFF_BTN_H,
+        t.locked ? `${t.label}  (PRIVE)` : t.label,
+        t.color,
+        16
+      );
       btn.visible = false;
       btn.onMouseEvent("click", () => this.pickDifficulty(d));
       return btn;
     });
-    const backBtn = this.makeButton(VIEW_W / 2 - 80, DIFF_BTN_Y + 4 * DIFF_BTN_STEP + 14, 160, 36, "RETOUR", "rgba(190, 215, 240, 0.9)", 12);
+    const backBtn = this.makeButton(
+      VIEW_W / 2 - 80,
+      DIFF_BTN_Y + DIFFICULTIES.length * DIFF_BTN_STEP + 14,
+      160,
+      36,
+      "RETOUR",
+      "rgba(190, 215, 240, 0.9)",
+      12
+    );
     backBtn.visible = false;
     backBtn.onMouseEvent("click", () => this.closeDifficulty());
     this.diffButtons.push(backBtn);
@@ -697,9 +723,10 @@ export class MenuStep extends GameStep {
   }
 
   private closeDifficulty(): void {
-    if (!this.diffOpen) return;
+    if (!this.diffOpen || this.unlocking) return;
     this.diffOpen = false;
     this.art.showDiff = false;
+    this.art.diffStatus = "";
     this.board.playSound("click", false, 0.4);
     for (const b of this.diffButtons) b.visible = false;
     setTimeout(() => {
@@ -710,6 +737,48 @@ export class MenuStep extends GameStep {
   }
 
   private pickDifficulty(d: Difficulty): void {
+    if (this.starting || this.unlocking) return;
+    if (AI_TUNING[d].locked) {
+      this.unlockAndStart(d);
+      return;
+    }
+    this.startSolo(d);
+  }
+
+  /**
+   * Niveau CLAUDE (privé pour le moment) : mot de passe demandé au joueur,
+   * vérifié par la Cloud Function (jamais dans le bundle), puis mémorisé.
+   * Invite native : fiable sur mobile (clavier) et sans entité à gérer.
+   */
+  private unlockAndStart(d: Difficulty): void {
+    const given = window.prompt("Niveau CLAUDE (prive) — mot de passe :", loadClaudePassword());
+    if (given === null) return;
+    const pass = given.trim();
+    if (!pass) return;
+    this.unlocking = true;
+    this.art.diffStatus = "Verification du mot de passe...";
+    pingClaude(pass)
+      .then(() => {
+        if (this.board.step !== this) return;
+        saveClaudePassword(pass);
+        this.unlocking = false;
+        this.art.diffStatus = "";
+        this.startSolo(d);
+      })
+      .catch((e: ClaudeError) => {
+        if (this.board.step !== this) return;
+        this.unlocking = false;
+        if (e.code === "password") {
+          saveClaudePassword("");
+          this.art.diffStatus = "Mot de passe incorrect.";
+        } else {
+          this.art.diffStatus = "Serveur injoignable — reessayez plus tard.";
+        }
+        this.board.playSound("error", false, 0.4);
+      });
+  }
+
+  private startSolo(d: Difficulty): void {
     if (this.starting) return;
     this.starting = true;
     saveDifficulty(d);

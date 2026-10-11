@@ -9,8 +9,13 @@
  * de base est identique des deux côtés à tous les niveaux.
  */
 
-export type Difficulty = "easy" | "medium" | "hard" | "insane";
-export const DIFFICULTIES: Difficulty[] = ["easy", "medium", "hard", "insane"];
+export type Difficulty = "easy" | "medium" | "hard" | "insane" | "claude";
+export const DIFFICULTIES: Difficulty[] = ["easy", "medium", "hard", "insane", "claude"];
+
+/** Niveau CLAUDE : le général rouge est un vrai modèle Claude (Anthropic),
+ *  interrogé via la Cloud Function `claudeTurn`. Privé pour le moment :
+ *  protégé par mot de passe (vérifié côté serveur, jamais dans le bundle). */
+export const CLAUDE_DIFFICULTY: Difficulty = "claude";
 
 export interface AiTuning {
   /** Nom affiché (HUD "IA …" + bouton du menu). */
@@ -53,6 +58,8 @@ export interface AiTuning {
   barracksBase: number;
   barracksRampEvery: number;
   barracksMax: number;
+  /** Niveau verrouillé par mot de passe (menu). */
+  locked?: boolean;
 }
 
 export const AI_TUNING: Record<Difficulty, AiTuning> = {
@@ -147,6 +154,32 @@ export const AI_TUNING: Record<Difficulty, AiTuning> = {
     barracksBase: 6,
     barracksRampEvery: 60,
     barracksMax: 9,
+  },
+  // Le général est Claude : ces réglages ne servent qu'au LIEUTENANT local
+  // (réflexes du QG, visée des frappes, repli hors-ligne) — même fair-play.
+  claude: {
+    label: "CLAUDE",
+    color: "#d97757",
+    startGold: 80,
+    grace: 0,
+    brainEvery: 3,
+    actionsPerPlan: 3,
+    skipChance: 0,
+    axisJitter: 0,
+    bank: 120,
+    strikeMinPack: 4,
+    strikeLead: true,
+    adapt: true,
+    combo: true,
+    heliChance: 0.5,
+    panicEvery: 0.25,
+    garrison: 8,
+    maxTurrets: 10,
+    maxFactories: 4,
+    barracksBase: 6,
+    barracksRampEvery: 60,
+    barracksMax: 9,
+    locked: true,
   },
 };
 
