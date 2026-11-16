@@ -3,7 +3,7 @@
   "description": "BGEW WAR — ranked match validation + Claude general (Cloud Functions)",
   "private": true,
   "engines": {
-    "node": "20"
+    "node": "22"
   },
   "main": "index.js",
   "dependencies": {
