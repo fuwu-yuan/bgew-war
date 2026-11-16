@@ -3,6 +3,7 @@ import { GameAPI } from "../api";
 import { BLUE, Faction, RED, TILE } from "../globals";
 import { clamp, rand, TAU } from "../utils";
 import { srand } from "../sim-rng";
+import { BAL } from "../balance";
 import { drawSprite, SPR } from "../sprites";
 
 export type BuildingType = "hq" | "barracks" | "factory" | "turret";
@@ -21,7 +22,6 @@ export const BUILDING_SPRITE: Record<BuildingType, [number, number]> = {
 
 interface BuildingStats {
   hp: number;
-  size: number;
   spawnEvery?: number; // s — time between production waves
   waveCount?: number;
   waveSpacing?: number; // s — delay between units inside a wave
@@ -31,14 +31,8 @@ interface BuildingStats {
   buildTime?: number; // s — chantier avant d'être opérationnel (HQ: aucun)
 }
 
-const STATS: Record<BuildingType, BuildingStats> = {
-  // The HQ is a fortress: lots of HP and it shoots back — rushing it
-  // without grinding the front first must fail.
-  hq: { hp: 320, size: 58, range: 170, dmg: 4, firePeriod: 0.7 },
-  barracks: { hp: 36, size: 38, spawnEvery: 8, waveCount: 12, waveSpacing: 0.18, buildTime: 3 },
-  factory: { hp: 48, size: 38, spawnEvery: 12, waveCount: 5, waveSpacing: 0.45, buildTime: 5 },
-  turret: { hp: 30, size: 38, range: 150, dmg: 3, firePeriod: 0.55, buildTime: 4 },
-};
+/** Chiffres de gameplay : BAL (balance.ts). Lus à chaque usage, jamais copiés. */
+const statsOf = (type: BuildingType): BuildingStats => BAL[type];
 
 const SPRITES = BUILDING_SPRITE;
 
@@ -169,17 +163,17 @@ export class Building extends GameObject {
 
   constructor(game: GameAPI, faction: Faction, type: BuildingType, col: number, row: number, instant = false) {
     const c = game.map.tileCenter(col, row);
-    super(c.x, c.y, STATS[type].size * 0.45);
+    super(c.x, c.y, BUILDING_SIZE[type] * 0.45);
     this.game = game;
     this.faction = faction;
     this.type = type;
     this.col = col;
     this.row = row;
-    this.stats = STATS[type];
+    this.stats = statsOf(type);
     this.maxHp = this.hp = this.stats.hp;
     if (!instant && this.stats.buildTime) {
       this.buildTotal = this.buildLeft = this.stats.buildTime;
-      this.hp = this.maxHp * 0.3; // un chantier est fragile
+      this.hp = this.maxHp * BAL.siteHp; // un chantier est fragile
     }
     this.spawnT = (this.stats.spawnEvery ?? 0) * srand(0.3, 1); // sim: first-spawn offset
     // a building stands on owned ground
@@ -198,7 +192,7 @@ export class Building extends GameObject {
 
     if (this.buildLeft > 0) {
       this.buildLeft -= dt;
-      this.hp = Math.min(this.hp + (this.maxHp * 0.7 * dt) / this.buildTotal, this.maxHp);
+      this.hp = Math.min(this.hp + (this.maxHp * (1 - BAL.siteHp) * dt) / this.buildTotal, this.maxHp);
       if (this.buildLeft <= 0) {
         this.buildLeft = 0;
         this.game.impact(this.cx, this.cy - 6, false);
@@ -229,9 +223,9 @@ export class Building extends GameObject {
     if (this.stats.range) {
       this.cd -= dt;
       const lvl = this.type === "turret" ? this.turretLevel : 1;
-      const range = (this.stats.range ?? 0) + (this.type === "turret" ? 10 * (lvl - 1) : 0);
-      const dmg = (this.stats.dmg ?? 1) * (this.type === "turret" ? 1 + 0.42 * (lvl - 1) : 1);
-      const firePeriod = (this.stats.firePeriod ?? 0.6) * (this.type === "turret" ? Math.pow(0.88, lvl - 1) : 1);
+      const range = (this.stats.range ?? 0) + (this.type === "turret" ? BAL.turret.up.range * (lvl - 1) : 0);
+      const dmg = (this.stats.dmg ?? 1) * (this.type === "turret" ? 1 + BAL.turret.up.dmg * (lvl - 1) : 1);
+      const firePeriod = (this.stats.firePeriod ?? 0.6) * (this.type === "turret" ? Math.pow(BAL.turret.up.fire, lvl - 1) : 1);
       // Anti-air d'abord : tourelles et QG sont la seule défense contre les hélicos
       const target =
         this.game.nearestAirEnemy(this.cx, this.cy, this.faction, range) ??
@@ -242,7 +236,7 @@ export class Building extends GameObject {
         if (this.cd <= 0) {
           this.cd = firePeriod;
           this.muzzleT = 0.06;
-          this.game.fireBullet(this.cx, this.cy - 10, target, dmg, this.faction, false);
+          this.game.fireBullet(this.cx, this.cy - 10, target, dmg, this.faction, this.type === "hq", this.type === "hq" ? BAL.hq.splash : 0);
           this.game.sfx("turret", 0.1);
         }
       }
@@ -251,7 +245,7 @@ export class Building extends GameObject {
 
   draw(ctx: CanvasRenderingContext2D): void {
     super.draw(ctx);
-    const size = this.stats.size;
+    const size = BUILDING_SIZE[this.type];
 
     drawBuildingBody(ctx, this.type, this.faction, this.cx, this.cy, this.buildProgress, this.t);
     if (this.buildProgress < 1) return; // la barre jaune du chantier suffit

@@ -1,3 +1,5 @@
+import { BAL } from "./balance";
+
 /** Viewport: portrait like the ad — map + two-row command HUD */
 export const VIEW_W = 640;
 export const VIEW_H = 1024;
@@ -9,7 +11,7 @@ export const GRID_H = 22; // 880
 export const MAP_H = GRID_H * TILE;
 
 export const GAME_NAME = "BGEW WAR";
-export const GAME_VERSION = "1.9.0";
+export const GAME_VERSION = "1.10.0";
 
 /** Factions */
 export const RED = 1;
@@ -41,40 +43,8 @@ export const COLORS = {
 
 export const FONT = "'Black Ops One', sans-serif";
 
-/** Costs (gold) */
-export const COST = { barracks: 50, turret: 75, factory: 120, strike: 100, helico: 150 } as const;
-
-/** Sortie d'hélico : traverse la carte, mitraille, revient. Ne convertit
- * pas les tuiles ; seuls TOURELLES et QG peuvent le toucher (anti-air). */
-export const HELI_HP = 28;
-export const HELI_DMG = 5;
-export const HELI_RANGE = 130;
-export const HELI_FIRE_PERIOD = 0.24;
-export const HELI_SPEED = 92; // px/s
-export const MAX_HELIS = 3; // sorties simultanées par faction
-
-/** Airstrike: radius and damage (hits BOTH sides — aim carefully) */
-export const STRIKE_RADIUS = 75;
-export const STRIKE_DMG_UNIT = 12;
-export const STRIKE_DMG_BUILDING = 10;
-export const STRIKE_DELAY = 0.9; // s between the warning marker and the blast
-
-/** Upgrade costs to reach `level + 1` from `level`. No max level. */
-export function soldierUpgradeCost(level: number): number {
-  return Math.round(80 * Math.pow(level, 1.18));
-}
-
-export function tankUpgradeCost(level: number): number {
-  return Math.round(120 * Math.pow(level, 1.2));
-}
-
-export function turretUpgradeCost(level: number): number {
-  return Math.round(100 * Math.pow(level, 1.2));
-}
-
-/** Caps to keep 60 fps on phones while allowing wave-based production. */
-export const MAX_SOLDIERS = 320;
-export const MAX_TANKS = 48;
+/** Costs (gold) — alias de BAL.cost (voir balance.ts, source de vérité). */
+export const COST = BAL.cost;
 
 export interface BestStats {
   wins: number;

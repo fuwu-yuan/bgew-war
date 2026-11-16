@@ -1,17 +1,7 @@
 import { GameObject } from "./gameobject";
 import type { GameAPI } from "../api";
-import {
-  BLUE,
-  Faction,
-  HELI_DMG,
-  HELI_FIRE_PERIOD,
-  HELI_HP,
-  HELI_RANGE,
-  HELI_SPEED,
-  MAP_H,
-  RED,
-  VIEW_W,
-} from "../globals";
+import { BLUE, Faction, MAP_H, RED, VIEW_W } from "../globals";
+import { BAL } from "../balance";
 import { clamp, TAU } from "../utils";
 import { srand } from "../sim-rng";
 import { drawSprite, SPR } from "../sprites";
@@ -57,14 +47,16 @@ export function drawHeli(
  */
 export class Helicopter extends GameObject {
   public faction: Faction;
-  public hp = HELI_HP;
-  public maxHp = HELI_HP;
+  public hp = BAL.heli.hp;
+  public maxHp = BAL.heli.hp;
   public nid = 0;
   public returning = false;
 
   private game: GameAPI;
   private t = srand(0, TAU); // seeded: feeds the heli's cx drift, must be deterministic
   private fireCd = 0.5; // petit délai de décollage avant la première rafale
+  private fuel = BAL.heli.fuel; // s d'autonomie à l'aller ; à sec, il rentre
+  private strafing = false; // une cible à portée au dernier tir : il ralentit pour mitrailler
 
   constructor(game: GameAPI, faction: Faction, cx: number, cy: number) {
     super(cx, cy, 13);
@@ -78,9 +70,15 @@ export class Helicopter extends GameObject {
     this.fireCd -= dt;
 
     const dir = (this.faction === RED ? 1 : -1) * this.game.flipY(); // vers l'ennemi (miroir-safe)
-    this.cy += (this.returning ? -dir : dir) * HELI_SPEED * dt;
+    // Appui-feu : à l'aller, il ralentit tant qu'il a une cible sous ses canons
+    // (il reste sur le front au lieu de le traverser en 3 s). Son autonomie est
+    // comptée : à sec, il fait demi-tour où qu'il soit.
+    this.fuel -= dt;
+    if (!this.returning && this.fuel <= 0) this.returning = true;
+    const pace = !this.returning && this.strafing ? BAL.heli.strafeSlow : 1;
+    this.cy += (this.returning ? -dir : dir) * BAL.heli.speed * pace * dt;
     this.cx = clamp(this.cx + Math.sin(this.t * 1.6) * 16 * dt, 18, VIEW_W - 18);
-    if (!this.returning && (dir > 0 ? this.cy >= MAP_H - 64 : this.cy <= 64)) {
+    if (!this.returning && (dir > 0 ? this.cy >= MAP_H - BAL.heli.turnBack : this.cy <= BAL.heli.turnBack)) {
       this.returning = true;
     } else if (this.returning && (dir > 0 ? this.cy <= 44 : this.cy >= MAP_H - 44)) {
       this.dead = true; // rentré à la base, sans explosion
@@ -89,10 +87,11 @@ export class Helicopter extends GameObject {
 
     // Strafe en vol continu : il ne s'arrête jamais
     if (this.fireCd <= 0) {
-      const target = this.game.nearestEnemy(this.cx, this.cy, this.faction, HELI_RANGE);
+      const target = this.game.nearestEnemy(this.cx, this.cy, this.faction, BAL.heli.range);
+      this.strafing = !!target;
       if (target) {
-        this.fireCd = HELI_FIRE_PERIOD * srand(0.85, 1.15);
-        this.game.fireBullet(this.cx, this.cy, target, HELI_DMG, this.faction, false);
+        this.fireCd = BAL.heli.firePeriod * srand(0.85, 1.15);
+        this.game.fireBullet(this.cx, this.cy, target, BAL.heli.dmg, this.faction, false);
         this.game.sfx("shot2", 0.1);
       }
     }

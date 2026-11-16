@@ -196,7 +196,8 @@ const errors = [];
     };
   }, bigRush.redBefore);
   console.log(`big rush test: ${bigRush.spawned} soldiers → ${JSON.stringify(bigDefense)}`);
-  if (bigRush.spawned >= 180 && bigDefense.redAdded < 60) {
+  // v1.10 : 3 vagues par paliers de pv (16 à 50 soldats chacune) au lieu d'une seule énorme.
+  if (bigRush.spawned >= 180 && bigDefense.redAdded < 40) {
     errors.push(`BALANCE: massive HQ attack spawned too small a defense (${JSON.stringify({ bigRush, bigDefense })})`);
   }
   const secondDefense = await page.evaluate(() => {

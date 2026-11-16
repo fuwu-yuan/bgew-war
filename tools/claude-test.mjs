@@ -75,9 +75,11 @@ function fakeGeneral(state) {
   const blueTurrets = state.blueBuildings.filter((b) => b.type === "turret").length;
   const ordres = [];
   const turn = state.turn;
-  if (turn % 3 === 1) ordres.push({ type: "caserne", col: axe, ligne: Math.max(1, front - 3), cible: "aucune", quoi: "aucune" });
+  // v1.10 (économie plus lente) : caserne aux tours impairs, frappe aux tours pairs —
+  // sinon la frappe (sans réserve) mange l'or de la caserne à chaque tour.
+  if (turn % 2 === 1) ordres.push({ type: "caserne", col: axe, ligne: Math.max(1, front - 3), cible: "aucune", quoi: "aucune" });
   if (turn % 4 === 2) ordres.push({ type: "tourelle", col: axe, ligne: Math.max(1, front - 4), cible: "aucune", quoi: "aucune" });
-  ordres.push({ type: "frappe", col: axe, ligne: -1, cible: turn % 2 ? "groupe" : "colonne", quoi: "aucune" });
+  if (turn % 2 === 0) ordres.push({ type: "frappe", col: axe, ligne: -1, cible: "groupe", quoi: "aucune" });
   if (turn % 5 === 3) ordres.push({ type: "amelioration", col: -1, ligne: -1, cible: "aucune", quoi: "soldats" });
   if (blueTurrets < 2 && turn % 4 === 0) ordres.push({ type: "helico", col: axe, ligne: -1, cible: "aucune", quoi: "aucune" });
   // Un ordre volontairement impossible : case en zone bleue (doit être ignoré proprement).
@@ -86,7 +88,7 @@ function fakeGeneral(state) {
     analyse: `Tour ${turn} : je pousse colonne ${axe}.`,
     message: turn === 1 ? "Je vois votre jeu. Commençons." : `Colonne ${axe}, en avant.`,
     axe,
-    reserve: 100,
+    reserve: 20, // v1.10 : économie plus lente — la 1re caserne (50) doit passer avec les 80 or de départ
     ordres: ordres.slice(0, 4),
   };
 }
@@ -205,8 +207,10 @@ function hook(page, tag, expectHttpErrors = false) {
   if ((c.journal || []).length < 3) errors.push("GAME: journal trop court");
   const faits = (c.journal || []).flatMap((j) => j.faits);
   const ignores = (c.journal || []).flatMap((j) => j.ignores);
-  if (!faits.some((f) => f.startsWith("caserne"))) errors.push("GAME: aucune caserne construite par le général");
-  if (!faits.some((f) => f.startsWith("frappe"))) errors.push("GAME: aucune frappe exécutée");
+  // Le journal ne garde que 6 tours : une caserne posée plus tôt se voit au nombre de
+  // bâtiments rouges (6 au départ) ; une frappe traitée peut avoir été écartée faute de cible.
+  if (!faits.some((f) => f.startsWith("caserne")) && g.redBuildings <= 6) errors.push("GAME: aucune caserne construite par le général");
+  if (![...faits, ...ignores].some((f) => f.startsWith("frappe"))) errors.push("GAME: aucun ordre de frappe traité");
   if (!ignores.some((f) => f.startsWith("usine (8,20) (aucune case"))) errors.push(`GAME: l'ordre impossible n'a pas été ignoré (${ignores.join(" | ")})`);
   if (!c.say) errors.push("GAME: aucune réplique reçue");
   if (maxConcurrent > 1) errors.push(`GAME: ${maxConcurrent} appels concurrents`);

@@ -14,6 +14,8 @@ export interface HudState {
   myGold: number;
   mode: BuildMode;
   elapsed: number;
+  /** Mort subite en cours : le QG du camp minoritaire en territoire s'effrite. */
+  suddenDeath: boolean;
   blueShare: number; // 0..1
   axisMarker: { x: number; y: number } | null;
   soldierLevel: number; // my faction's level
@@ -22,6 +24,8 @@ export interface HudState {
   tankUpgradeCost: number;
   turretLevel: number;
   turretUpgradeCost: number;
+  /** Prix actuel d'un bâtiment (il monte avec le nombre possédé). */
+  buildCostOf(kind: "barracks" | "factory" | "turret"): number;
   myName: string; // local player's name (left, my unit color)
   enemyName: string; // opponent's name (right, enemy unit color)
   /** Niveau CLAUDE : réplique du général (affichée CLAUDE_SAY_FOR s) + témoin « réfléchit ». */
@@ -212,9 +216,16 @@ export class Hud extends Entity {
     ctx.fillStyle = "rgba(8, 20, 38, 0.6)";
     this.roundRect(ctx, VIEW_W / 2 - cw / 2 - 7, 15, cw + 14, 15, 4);
     ctx.fill();
-    ctx.fillStyle = "#ffffff";
+    ctx.fillStyle = s.suddenDeath ? "#ff8b7a" : "#ffffff";
     ctx.textAlign = "center";
     ctx.fillText(clock, VIEW_W / 2, 27);
+    if (s.suddenDeath) {
+      // Mort subite : rappel clignotant sous l'horloge (qui a le moins de terrain perd son QG)
+      ctx.font = `9px ${FONT}`;
+      ctx.globalAlpha = 0.65 + 0.35 * Math.sin(s.elapsed * 6);
+      ctx.fillText("MORT SUBITE", VIEW_W / 2, 41);
+      ctx.globalAlpha = 1;
+    }
     ctx.textAlign = "left";
 
     /* Bottom panel */
@@ -245,6 +256,7 @@ export class Hud extends Entity {
       if (b.id === "upgradeTank") cost = s.tankUpgradeCost;
       else if (b.id === "upgradeTurret") cost = s.turretUpgradeCost;
       else if (b.id === "upgradeSoldier") cost = s.soldierUpgradeCost;
+      else if (b.id === "barracks" || b.id === "factory" || b.id === "turret") cost = s.buildCostOf(b.id);
       else if (b.id !== "axis") cost = COST[b.id];
       const afford = cost === 0 || s.myGold >= cost;
       const selected = !isUpgrade && s.mode === b.id;

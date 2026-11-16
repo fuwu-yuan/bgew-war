@@ -8,23 +8,14 @@ import {
   GRID_H,
   GRID_W,
   MAP_H,
-  MAX_HELIS,
-  MAX_SOLDIERS,
-  MAX_TANKS,
   RED,
-  STRIKE_DELAY,
-  STRIKE_DMG_BUILDING,
-  STRIKE_DMG_UNIT,
-  STRIKE_RADIUS,
   TILE,
   VIEW_W,
   enemyOf,
-  soldierUpgradeCost,
-  tankUpgradeCost,
-  turretUpgradeCost,
 } from "../globals";
 import { clamp, pick, rand, randInt, sha256, TAU } from "../utils";
 import { seedSim, srand } from "../sim-rng";
+import { BAL, buildCost, BuildKind, upgradeCost, UpgradeKind } from "../balance";
 import { TileMap } from "../entities/tilemap";
 import { Bullet, Soldier, Tank, Unit } from "../entities/units";
 import { Building, BUILDING_CODE, BuildingType } from "../entities/buildings";
@@ -79,11 +70,6 @@ const GARRISON_CD = 8; // s
 const HQ_ALERT_RADIUS = 240; // px — enemies this close to the HQ trigger panic
 const AI_MIN_RESERVE = 70; // test bot (?bot=1) only — the solo AI uses tun.bank
 const COMBO_CD = 18; // s between insane strike+helico combos
-const HQ_DEFENSE_RADIUS = 340;
-const HQ_DEFENSE_MIN_SOLDIERS = 36;
-const HQ_DEFENSE_MAX_SOLDIERS = 130;
-const HQ_DEFENSE_MIN_TANKS = 4;
-const HQ_DEFENSE_MAX_TANKS = 16;
 
 /* Niveau CLAUDE — cadence du général distant et de son lieutenant local */
 const CLAUDE_FIRST_AT = 1.5; // s — premier tour (la carte est posée)
@@ -95,7 +81,6 @@ const CLAUDE_JOURNAL_MAX = 6;
 
 type NetRole = "solo" | "host" | "guest";
 type AiPosture = "defend" | "counter" | "press" | "tech";
-type UpgradeKind = "soldier" | "tank" | "turret";
 
 interface RedAiIntel {
   posture: AiPosture;
@@ -153,6 +138,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private heliLoopOn = false;
   private effects: GameObject[] = [];
   private buildingAt = new Map<number, Building>();
+  private hqs: Record<Faction, Building | null> = { [RED]: null, [BLUE]: null };
   private topEntities: Entity[] = [];
 
   /* Multiplayer */
@@ -188,7 +174,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private garrisonCd = 0;
   private alertT = 0;
   private hqLastHp: Record<Faction, number> = { [RED]: 0, [BLUE]: 0 };
-  private hqDefenseUsed: Record<Faction, boolean> = { [RED]: false, [BLUE]: false };
+  private hqDefenseUsed: Record<Faction, number> = { [RED]: 0, [BLUE]: 0 }; // vagues de défense déjà levées
 
   /* HudState */
   public mode: BuildMode = null;
@@ -306,7 +292,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   get soldierUpgradeCost(): number {
-    return soldierUpgradeCost(this.levels[this.myFaction]);
+    return upgradeCost("soldier", this.levels[this.myFaction]);
   }
 
   get tankLevel(): number {
@@ -314,7 +300,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   get tankUpgradeCost(): number {
-    return tankUpgradeCost(this.tankLevels[this.myFaction]);
+    return upgradeCost("tank", this.tankLevels[this.myFaction]);
   }
 
   get turretLevel(): number {
@@ -322,7 +308,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   get turretUpgradeCost(): number {
-    return turretUpgradeCost(this.turretLevels[this.myFaction]);
+    return upgradeCost("turret", this.turretLevels[this.myFaction]);
   }
 
   constructor(board: Board) {
@@ -468,7 +454,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.garrisonCd = 0;
     this.alertT = 0;
     this.hqLastHp = { [RED]: 0, [BLUE]: 0 };
-    this.hqDefenseUsed = { [RED]: false, [BLUE]: false };
+    this.hqDefenseUsed = { [RED]: 0, [BLUE]: 0 };
     this.inited = this.role !== "guest";
     this.sfxLast.clear();
     this.sentStatic.clear();
@@ -749,7 +735,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     ) {
       const c = cmd.c;
       const r = cmd.r; // host space on every client
-      const cost = COST[cmd.kind];
+      const cost = this.costOf(f, cmd.kind);
       const i = this.map.idx(c, r);
       if (
         this.gold[f] >= cost &&
@@ -840,7 +826,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     const c = Math.floor(wx / TILE);
     const r = Math.floor(wy / TILE);
     const kind = this.mode;
-    const cost = COST[kind];
+    const cost = this.costOf(mine, kind);
     const i = this.map.idx(c, r);
     const occupied = this.buildingAt.has(i);
     const buildable = this.map.isLand(c, r) && this.map.owner[i] === mine && !occupied && !this.map.hasChest(i);
@@ -877,6 +863,18 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "upgrade", kind });
   }
 
+  /** Prix du prochain bâtiment de ce type pour ce camp (croît avec ceux qu'il possède). */
+  costOf(f: Faction, kind: BuildKind): number {
+    let owned = 0;
+    for (const b of this.buildings) if (!b.dead && b.faction === f && b.type === kind) owned++;
+    return buildCost(kind, owned);
+  }
+
+  /** HUD : prix affiché sur les boutons de construction du joueur. */
+  buildCostOf(kind: BuildKind): number {
+    return this.costOf(this.myFaction, kind);
+  }
+
   private upgradeLevelFor(f: Faction, kind: UpgradeKind): number {
     if (kind === "tank") return this.tankLevels[f];
     if (kind === "turret") return this.turretLevels[f];
@@ -884,9 +882,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   private upgradeCostFor(f: Faction, kind: UpgradeKind): number {
-    if (kind === "tank") return tankUpgradeCost(this.tankLevels[f]);
-    if (kind === "turret") return turretUpgradeCost(this.turretLevels[f]);
-    return soldierUpgradeCost(this.levels[f]);
+    if (kind === "tank") return upgradeCost("tank", this.tankLevels[f]);
+    if (kind === "turret") return upgradeCost("turret", this.turretLevels[f]);
+    return upgradeCost("soldier", this.levels[f]);
   }
 
   /** Solo/host: pay and raise one faction upgrade level. */
@@ -928,6 +926,11 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     return y;
   }
 
+  enemyHq(f: Faction): Building | null {
+    const hq = this.hqs[enemyOf(f)];
+    return hq && !hq.dead ? hq : null;
+  }
+
   nearestEnemy(x: number, y: number, f: Faction, range: number): Target | null {
     const seek = enemyOf(f);
     const c0 = Math.floor(x / TILE);
@@ -957,14 +960,36 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     return best;
   }
 
-  fireBullet(x: number, y: number, target: Target, dmg: number, f: Faction, big: boolean): void {
-    const b = new Bullet(this, x, y, target, dmg, f, big);
+  fireBullet(x: number, y: number, target: Target, dmg: number, f: Faction, big: boolean, splash = 0): void {
+    const b = new Bullet(this, x, y, target, dmg, f, big, splash);
     this.bullets.push(b);
     this.board.addEntity(b);
   }
 
+  /** Dégâts de zone d'un obus (tank, QG) : unités ennemies au sol seulement —
+   *  les bâtiments encaissent le tir direct, pas les éclats. */
+  splashDamage(x: number, y: number, radius: number, dmg: number, f: Faction, except: Target): void {
+    const c0 = Math.floor(x / TILE);
+    const r0 = Math.floor(y / TILE);
+    const span = Math.ceil(radius / TILE);
+    for (let r = r0 - span; r <= r0 + span; r++) {
+      if (r < 0 || r >= GRID_H) continue;
+      for (let c = c0 - span; c <= c0 + span; c++) {
+        if (c < 0 || c >= GRID_W) continue;
+        const cell = this.buckets[r * GRID_W + c];
+        if (!cell) continue;
+        for (const t of cell) {
+          if (t === except || t.dead || t.faction === f || !(t instanceof Unit)) continue;
+          if (Math.hypot(t.cx - x, t.cy - y) > radius + t.radius) continue;
+          t.hp -= dmg;
+          if (t.hp <= 0) this.notifyKill(t, f);
+        }
+      }
+    }
+  }
+
   spawnSoldier(f: Faction, x: number, y: number, level?: number): void {
-    if (this.counts[f].soldiers >= MAX_SOLDIERS) return;
+    if (this.counts[f].soldiers >= BAL.maxSoldiers) return;
     this.counts[f].soldiers++;
     const u = new Soldier(this, f, x, y, level ?? this.levels[f]);
     u.nid = this.nextNid++;
@@ -973,7 +998,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   spawnTank(f: Faction, x: number, y: number, level?: number): void {
-    if (this.counts[f].tanks >= MAX_TANKS) return;
+    if (this.counts[f].tanks >= BAL.maxTanks) return;
     this.counts[f].tanks++;
     const u = new Tank(this, f, x, y, level ?? this.tankLevels[f]);
     u.nid = this.nextNid++;
@@ -983,7 +1008,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
   /** Sortie d'hélico : décolle de la ligne arrière sur la colonne choisie. */
   spawnHeli(f: Faction, x: number): void {
-    if (this.helis.filter((h) => !h.dead && h.faction === f).length >= MAX_HELIS) return;
+    if (this.helis.filter((h) => !h.dead && h.faction === f).length >= BAL.heli.max) return;
     const hq = this.buildings.find((b) => !b.dead && b.type === "hq" && b.faction === f);
     const y = hq ? hq.cy : f === RED ? 80 : MAP_H - 80;
     const h = new Helicopter(this, f, clamp(x, 24, VIEW_W - 24), y);
@@ -1013,7 +1038,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     const res = this.map.convertAtPx(x, y, f);
     if (!res) return;
     this.sfx("capture", 0.16);
-    this.gold[f] += 1;
+    this.gold[f] += BAL.tileGold;
     if (res.chest > 0) {
       this.gold[f] += res.chest;
       this.board.playSound("coin", false, 0.5);
@@ -1040,7 +1065,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
     if (victim instanceof Helicopter) {
       this.explosion(victim.cx, victim.cy, true);
-      this.gold[killer] += 15;
+      this.gold[killer] += BAL.bounty.heli;
       this.killsBy[killer]++;
       return;
     }
@@ -1049,7 +1074,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       const tank = victim instanceof Tank;
       this.counts[victim.faction][tank ? "tanks" : "soldiers"]--;
       this.explosion(victim.cx, victim.cy, tank);
-      this.gold[killer] += tank ? 10 : 3;
+      this.gold[killer] += tank ? BAL.bounty.tank : BAL.bounty.soldier;
       this.killsBy[killer]++;
       return;
     }
@@ -1059,7 +1084,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.buildingAt.delete(this.map.idx(b.col, b.row));
     this.explosion(b.cx, b.cy, true);
     this.board.playSound("explosion_big", false, 0.55);
-    this.gold[killer] += b.type === "turret" ? 25 : b.type === "factory" ? 30 : 20;
+    if (b.type !== "hq") this.gold[killer] += BAL.bounty[b.type];
     if (b.type === "hq") this.endGame(killer);
   }
 
@@ -1081,9 +1106,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
    * ---------------------------------------------------------------- */
 
   private scheduleStrike(x: number, y: number, f: Faction): void {
-    this.strikes.push({ x, y, t: STRIKE_DELAY, faction: f });
-    this.spawnEffect(new StrikeMarker(x, y, STRIKE_RADIUS, STRIKE_DELAY));
-    this.popup(x, y - STRIKE_RADIUS - 8, "FRAPPE !", 1);
+    this.strikes.push({ x, y, t: BAL.strike.delay, faction: f });
+    this.spawnEffect(new StrikeMarker(x, y, BAL.strike.radius, BAL.strike.delay));
+    this.popup(x, y - BAL.strike.radius - 8, "FRAPPE !", 1);
     this.sfx("click", 0.5);
   }
 
@@ -1100,18 +1125,18 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   /** The blast hits EVERYTHING in the radius, both sides included. */
   private applyStrike(x: number, y: number, f: Faction): void {
     this.explosion(x, y, true);
-    this.spawnEffect(new Shockwave(x, y, STRIKE_RADIUS * 2.2, "#ffffff", 0.6, 5));
+    this.spawnEffect(new Shockwave(x, y, BAL.strike.radius * 2.2, "#ffffff", 0.6, 5));
     this.board.playSound("explosion_big", false, 0.6);
 
     for (const u of [...this.units]) {
-      if (u.dead || u.distTo(x, y) > STRIKE_RADIUS + u.radius) continue;
-      u.hp -= STRIKE_DMG_UNIT;
+      if (u.dead || u.distTo(x, y) > BAL.strike.radius + u.radius) continue;
+      u.hp -= BAL.strike.dmgUnit;
       if (u.hp <= 0) this.notifyKill(u, u.faction === f ? enemyOf(f) : f);
     }
     for (const b of [...this.buildings]) {
-      if (b.dead || b.distTo(x, y) > STRIKE_RADIUS + b.radius) continue;
+      if (b.dead || b.distTo(x, y) > BAL.strike.radius + b.radius) continue;
       if (b.type === "hq") continue;
-      b.hp -= STRIKE_DMG_BUILDING;
+      b.hp -= BAL.strike.dmgBuilding;
       if (b.hp <= 0) this.notifyKill(b, b.faction === f ? enemyOf(f) : f);
     }
   }
@@ -1208,8 +1233,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       this.incomeT = INCOME_EVERY;
       // Fair play : même revenu des deux côtés, à TOUS les niveaux — la
       // difficulté n'achète jamais d'or, elle achète de la réflexion.
-      this.gold[BLUE] += 2;
-      this.gold[RED] += 2;
+      this.gold[BLUE] += BAL.income;
+      this.gold[RED] += BAL.income;
     }
 
     if (this.role === "solo") {
@@ -1240,6 +1265,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       }
     }
 
+    this.updateSuddenDeath(TICK_DT);
     this.updateHqDefense(TICK_DT);
     this.blueShare = this.map.share(BLUE);
     this.updateHeliLoop(this.helis.some((h) => !h.dead));
@@ -1293,6 +1319,31 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
    * Red AI (solo only)
    * ---------------------------------------------------------------- */
 
+  /** La mort subite est-elle en cours ? (HUD) */
+  get suddenDeath(): boolean {
+    return !this.ended && this.elapsed >= BAL.suddenDeath.start;
+  }
+
+  /**
+   * Mort subite : le QG du camp qui tient le moins de territoire s'effrite, de
+   * plus en plus vite. Égalité parfaite = personne ne perd de pv.
+   */
+  private updateSuddenDeath(dt: number): void {
+    const sd = BAL.suddenDeath;
+    if (this.ended || this.elapsed < sd.start) return;
+    if (this.elapsed - dt < sd.start) {
+      this.popup(VIEW_W / 2, MAP_H / 2, "MORT SUBITE !", 1);
+      this.board.playSound("explosion_big", false, 0.5);
+    }
+    const blue = this.map.share(BLUE);
+    if (blue === 0.5) return;
+    const loser: Faction = blue < 0.5 ? BLUE : RED;
+    const hq = this.hqs[loser];
+    if (!hq || hq.dead) return;
+    hq.hp -= sd.dps * Math.pow(2, (this.elapsed - sd.start) / sd.doubleEvery) * dt;
+    if (hq.hp <= 0) this.notifyKill(hq, enemyOf(loser));
+  }
+
   private updateHqDefense(_dt: number): void {
     for (const f of [RED, BLUE] as const) {
       const hq = this.buildings.find((b) => !b.dead && b.type === "hq" && b.faction === f);
@@ -1307,8 +1358,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         continue;
       }
 
-      if (hq.hp < last && !this.hqDefenseUsed[f]) {
-        this.hqDefenseUsed[f] = true;
+      // Paliers : 1re vague au premier coup, les suivantes à chaque tranche de pv perdue.
+      const used = this.hqDefenseUsed[f];
+      if (hq.hp < last && used < BAL.hqDefense.waves && hq.hp < hq.maxHp * (1 - used / BAL.hqDefense.waves)) {
+        this.hqDefenseUsed[f] = used + 1;
         this.spawnHqDefenseWave(hq);
       }
       this.hqLastHp[f] = hq.hp;
@@ -1319,21 +1372,21 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     const dir = (hq.faction === RED ? 1 : -1) * this.flipY();
     const enemy = enemyOf(hq.faction);
     const attackers = this.units.filter(
-      (u) => !u.dead && u.faction === enemy && u.distTo(hq.cx, hq.cy) <= HQ_DEFENSE_RADIUS
+      (u) => !u.dead && u.faction === enemy && u.distTo(hq.cx, hq.cy) <= BAL.hqDefense.radius
     );
     const nearest = attackers.sort((a, b) => a.distTo(hq.cx, hq.cy) - b.distTo(hq.cx, hq.cy))[0];
     if (nearest) this.axisCol[hq.faction] = clamp(Math.floor(nearest.cx / TILE), 0, GRID_W - 1);
 
     const attackersPower = attackers.reduce((sum, u) => sum + (u instanceof Tank ? 3 : 1), 0);
     const soldiers = clamp(
-      Math.round(HQ_DEFENSE_MIN_SOLDIERS + attackersPower * 0.45),
-      HQ_DEFENSE_MIN_SOLDIERS,
-      HQ_DEFENSE_MAX_SOLDIERS
+      Math.round(BAL.hqDefense.minSoldiers + attackersPower * 0.45),
+      BAL.hqDefense.minSoldiers,
+      BAL.hqDefense.maxSoldiers
     );
     const tanks = clamp(
-      Math.round(HQ_DEFENSE_MIN_TANKS + attackersPower / 18),
-      HQ_DEFENSE_MIN_TANKS,
-      HQ_DEFENSE_MAX_TANKS
+      Math.round(BAL.hqDefense.minTanks + attackersPower / 18),
+      BAL.hqDefense.minTanks,
+      BAL.hqDefense.maxTanks
     );
 
     for (let i = 0; i < soldiers; i++) {
@@ -1396,13 +1449,13 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     const guards = this.buildings.filter(
       (b) => !b.dead && b.faction === RED && b.type === "turret" && b.distTo(hq.cx, hq.cy) < TILE * 3.2
     ).length;
-    if (guards < 2 && this.gold[RED] >= COST.turret) {
+    if (guards < 2 && this.gold[RED] >= this.costOf(RED, "turret")) {
       for (let tries = 0; tries < 10; tries++) {
         const c = clamp(hq.col + randInt(-2, 2), 0, GRID_W - 1);
         const r = clamp(hq.row + randInt(0, 2), 1, GRID_H - 2);
         const i = this.map.idx(c, r);
         if (this.map.isLand(c, r) && this.map.owner[i] === RED && !this.buildingAt.has(i) && !this.map.hasChest(i)) {
-          this.gold[RED] -= COST.turret;
+          this.gold[RED] -= this.costOf(RED, "turret");
           this.placeBuilding(RED, "turret", c, r);
           break;
         }
@@ -1455,7 +1508,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private redAct(intel: RedAiIntel): boolean {
     const tun = this.tun;
     const bank = tun.bank;
-    const heliFree = this.helis.filter((h) => !h.dead && h.faction === RED).length < MAX_HELIS;
+    const heliFree = this.helis.filter((h) => !h.dead && h.faction === RED).length < BAL.heli.max;
 
     // Imbattable : combo économisé — bombarder les défenseurs de la colonne
     // la plus faible, puis y verser un hélico ET l'axe d'attaque.
@@ -1527,42 +1580,43 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     // consomment que la moitié) — plus jamais de banque vidée en tourelles.
     const bCap = barracksCap(tun, this.elapsed);
     let want: BuildingType | null = null;
-    if (intel.infantryFlood && intel.redTurrets < tun.maxTurrets && this.gold[RED] >= COST.turret + bank * 0.5) {
+    if (intel.infantryFlood && intel.redTurrets < tun.maxTurrets && this.gold[RED] >= this.costOf(RED, "turret") + bank * 0.5) {
       want = "turret";
     } else if (
       intel.infantryFlood &&
       intel.redBarracks < Math.min(bCap + 1, Math.max(5, intel.blueBarracks - 1)) &&
-      this.gold[RED] >= COST.barracks + bank * 0.5
+      this.gold[RED] >= this.costOf(RED, "barracks") + bank * 0.5
     ) {
       want = "barracks";
     } else if (
       intel.posture === "defend" &&
       intel.redTurrets < Math.max(3, tun.maxTurrets - 2) &&
-      this.gold[RED] >= COST.turret + bank * 0.6
+      this.gold[RED] >= this.costOf(RED, "turret") + bank * 0.6
     ) {
       want = "turret";
     } else if (
       (intel.blueTanks >= 2 || intel.blueFactories >= 2) &&
       intel.redFactories < Math.min(2, tun.maxFactories) &&
-      this.gold[RED] >= COST.factory + bank
+      this.gold[RED] >= this.costOf(RED, "factory") + bank
     ) {
       want = "factory";
-    } else if (intel.redBarracks < bCap && this.gold[RED] >= COST.barracks + bank * 0.8) {
+    } else if (intel.redBarracks < bCap && this.gold[RED] >= this.costOf(RED, "barracks") + bank * 0.8) {
       want = "barracks";
-    } else if (intel.redTurrets < Math.max(2, tun.maxTurrets - 3) && this.gold[RED] >= COST.turret + bank) {
+    } else if (intel.redTurrets < Math.max(2, tun.maxTurrets - 3) && this.gold[RED] >= this.costOf(RED, "turret") + bank) {
       want = "turret";
     } else if (
       intel.redFactories < (intel.posture === "tech" ? tun.maxFactories : Math.max(1, tun.maxFactories - 1)) &&
-      this.gold[RED] >= COST.factory + bank
+      this.gold[RED] >= this.costOf(RED, "factory") + bank
     ) {
       want = "factory";
-    } else if (this.gold[RED] >= COST.barracks + bank + 30) {
+    } else if (this.gold[RED] >= this.costOf(RED, "barracks") + bank + 30) {
       want = "barracks";
     }
     if (!want) return false;
 
+    const cost = this.costOf(RED, want); // avant la pose : le prix monte avec le nombre
     const built = this.tryRedBuild(want, intel);
-    if (built) this.gold[RED] -= COST[want];
+    if (built) this.gold[RED] -= cost;
     return built;
   }
 
@@ -1586,7 +1640,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   /** Vise devant un groupe en marche : les bleus montent (~40 px pendant la mèche). */
   private leadStrike(p: { x: number; y: number }): { x: number; y: number } {
     if (!this.tun.strikeLead) return p;
-    return { x: p.x, y: Math.max(TILE, p.y - 38 * STRIKE_DELAY) };
+    return { x: p.x, y: Math.max(TILE, p.y - 38 * BAL.strike.delay) };
   }
 
   private redIntel(): RedAiIntel {
@@ -1708,7 +1762,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       let score = b.type === "turret" ? 2.3 : b.type === "factory" ? 2.8 : 1.6;
       for (const other of this.buildings) {
         if (other.dead || other.faction !== BLUE || other === b || other.type === "hq") continue;
-        if (other.distTo(b.cx, b.cy) < STRIKE_RADIUS * 1.35) score += other.type === "factory" ? 2 : 1;
+        if (other.distTo(b.cx, b.cy) < BAL.strike.radius * 1.35) score += other.type === "factory" ? 2 : 1;
       }
       if (!best || score > best.score) best = { x: b.cx, y: b.cy, score };
     }
@@ -1772,7 +1826,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     const p = this.map.tileCenter(c, r);
     let n = 0;
     for (const b of this.buildings) {
-      if (!b.dead && b.faction === RED && b.distTo(p.x, p.y) < STRIKE_RADIUS * 1.3) n++;
+      if (!b.dead && b.faction === RED && b.distTo(p.x, p.y) < BAL.strike.radius * 1.3) n++;
     }
     return n;
   }
@@ -1957,7 +2011,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     }
     const lieutenant: string[] = [];
     if (this.garrisonCd > 0) lieutenant.push("garnison d'urgence levée récemment (QG menacé)");
-    if (this.hqDefenseUsed[RED]) lieutenant.push("vague de défense du QG déjà utilisée");
+    if (this.hqDefenseUsed[RED] >= BAL.hqDefense.waves) lieutenant.push("vagues de défense du QG épuisées");
     return {
       turn: g.turn,
       t: this.elapsed,
@@ -2073,8 +2127,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       // Faisabilité AVANT l'or : un ordre impossible ne bloque pas la file.
       const spot = this.nearestRedBuildable(o.col, o.ligne);
       if (!spot) return "skip:aucune case rouge libre";
-      if (gold < COST[kind] + reserve) return "wait";
-      this.gold[RED] -= COST[kind];
+      const cost = this.costOf(RED, kind);
+      if (gold < cost + reserve) return "wait";
+      this.gold[RED] -= cost;
       this.placeBuilding(RED, kind, spot.c, spot.r);
       const center = this.map.tileCenter(spot.c, spot.r);
       this.spawnEffect(new Shockwave(center.x, center.y, 50, "#ffffff", 0.35));
@@ -2096,7 +2151,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       return "done";
     }
     if (o.type === "helico") {
-      if (this.helis.filter((h) => !h.dead && h.faction === RED).length >= MAX_HELIS) return "skip:3 helicos deja en vol";
+      if (this.helis.filter((h) => !h.dead && h.faction === RED).length >= BAL.heli.max) return "skip:3 helicos deja en vol";
       if (gold < COST.helico) return "wait";
       this.gold[RED] -= COST.helico;
       this.spawnHeli(RED, this.columnCenter(o.col));
@@ -2225,11 +2280,11 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     // 4) Otherwise expand production / defense behind the front.
     const maxBarracks = Math.min(6, 4 + Math.floor(this.elapsed / 90));
     let want: "barracks" | "factory" | "turret" | null = null;
-    if (foeUnits > myUnits + 10 && myB("turret") < 5 && g >= COST.turret + reserve) want = "turret";
-    else if (myB("barracks") < maxBarracks && g >= COST.barracks + reserve * 0.4) want = "barracks";
-    else if (myB("factory") < 2 && g >= COST.factory + reserve) want = "factory";
-    else if (myB("turret") < 4 && g >= COST.turret + reserve) want = "turret";
-    else if (g >= COST.barracks + reserve + 30) want = "barracks";
+    if (foeUnits > myUnits + 10 && myB("turret") < 5 && g >= this.costOf(me, "turret") + reserve) want = "turret";
+    else if (myB("barracks") < maxBarracks && g >= this.costOf(me, "barracks") + reserve * 0.4) want = "barracks";
+    else if (myB("factory") < 2 && g >= this.costOf(me, "factory") + reserve) want = "factory";
+    else if (myB("turret") < 4 && g >= this.costOf(me, "turret") + reserve) want = "turret";
+    else if (g >= this.costOf(me, "barracks") + reserve + 30) want = "barracks";
     if (want) this.botTryBuild(want);
   }
 
@@ -2243,7 +2298,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       let sx = 0;
       let sy = 0;
       for (const o of us) {
-        if (Math.hypot(o.cx - u.cx, o.cy - u.cy) <= STRIKE_RADIUS) {
+        if (Math.hypot(o.cx - u.cx, o.cy - u.cy) <= BAL.strike.radius) {
           count++;
           sx += o.cx;
           sy += o.cy;
@@ -2338,6 +2393,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     b.soldierLevel = this.levels[f];
     b.tankLevel = this.tankLevels[f];
     b.turretLevel = this.turretLevels[f];
+    if (type === "hq") this.hqs[f] = b;
     this.buildings.push(b);
     this.buildingAt.set(this.map.idx(c, r), b);
     this.map.clearDecor(this.map.idx(c, r)); // a tree/rock no longer blocks — clear it under the building

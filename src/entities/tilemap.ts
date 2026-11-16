@@ -1,4 +1,5 @@
 import { Entity } from "@fuwu-yuan/bgew";
+import { BAL } from "../balance";
 import { BLUE, COLORS, Faction, GRID_H, GRID_W, MAP_H, RED, TILE, VIEW_W } from "../globals";
 import { clamp, rand, randInt, TAU } from "../utils";
 import { drawSprite, SPR } from "../sprites";
@@ -100,7 +101,7 @@ export class TileMap extends Entity {
     this.dirty.add(i);
     if (this.chests.has(i)) {
       this.chests.delete(i);
-      return { chest: 25 };
+      return { chest: BAL.chestGold };
     }
     return { chest: 0 };
   }
@@ -285,14 +286,14 @@ export class TileMap extends Entity {
       const c = randInt(0, GRID_W - 1);
       const r = randInt(0, GRID_H - 1);
       const i = this.idx(c, r);
-      if (this.terrain[i] !== 1 || r >= 10 && r <= 13 || this.hasDecor(i)) continue;
+      if (this.terrain[i] !== 1 || (r >= 9 && r <= 12) || this.hasDecor(i)) continue;
       this.decors.push({ i, spr: sprites[randInt(0, sprites.length - 1)] });
     }
 
     // Gold chests on the contested middle band
     for (let n = 0; n < 6; n++) {
       const c = randInt(1, GRID_W - 2);
-      const r = randInt(10, 13);
+      const r = randInt(9, 12); // symétrique autour du front initial (ligne 11) : 2 rangées par camp
       const i = this.idx(c, r);
       if (this.terrain[i] === 1 && !this.hasDecor(i)) this.chests.add(i);
     }

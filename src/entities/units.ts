@@ -3,6 +3,7 @@ import { GameAPI, Target } from "../api";
 import { BLUE, COLORS, Faction, MAP_H, RED, VIEW_W } from "../globals";
 import { clamp, TAU } from "../utils";
 import { srand } from "../sim-rng";
+import { BAL } from "../balance";
 import { drawSprite, SPR } from "../sprites";
 
 /**
@@ -30,7 +31,7 @@ export abstract class Unit extends GameObject {
 
   private cd = srand(0.2, 1); // sim: fire cooldown
   private convertCd = srand(0.05, 0.3); // sim: tile-conversion timing
-  private lane = srand(-100, 100); // sim: movement lane offset
+  private lane = srand(-BAL.laneSpread, BAL.laneSpread); // sim: movement lane offset
   private walkT = srand(0, TAU); // seeded: feeds the movement wobble (vx), so it MUST be deterministic
   private walking = false;
   private muzzleT = 0;
@@ -89,7 +90,7 @@ export abstract class Unit extends GameObject {
       if (this.cd <= 0) {
         this.cd = this.firePeriod * srand(0.85, 1.15);
         this.muzzleT = 0.06;
-        this.game.fireBullet(this.cx, this.cy, target, this.dmgVal, this.faction, this.isTank);
+        this.game.fireBullet(this.cx, this.cy, target, this.dmgVal, this.faction, this.isTank, this.isTank ? BAL.tank.splash : 0);
         this.game.sfx(this.fireSfx, this.fireSfxVol);
       }
     } else {
@@ -112,12 +113,23 @@ export abstract class Unit extends GameObject {
 
   private move(dt: number): void {
     const dirY = (this.faction === RED ? 1 : -1) * this.game.flipY();
-    const desiredX = this.game.axisX(this.faction) + this.lane;
-    let vx = clamp((desiredX - this.cx) * 1.4, -this.moveSpd, this.moveSpd) + Math.sin(this.walkT * 2.6) * 9;
+    let desiredX = this.game.axisX(this.faction) + this.lane;
     let vy = dirY * this.moveSpd;
+    // Siège : une fois à hauteur du QG adverse (ou passé derrière), l'unité
+    // converge sur lui au lieu de marcher jusqu'au bord de la carte et d'y
+    // rester plantée hors de portée de tout.
+    const hq = this.game.enemyHq(this.faction);
+    if (hq) {
+      const dy = hq.cy - this.cy;
+      if (Math.abs(dy) < BAL.siegeRadius || Math.sign(dy) !== dirY) {
+        desiredX = hq.cx + this.lane * 0.3;
+        vy = clamp(dy * 1.4, -this.moveSpd, this.moveSpd);
+      }
+    }
+    let vx = clamp((desiredX - this.cx) * 1.4, -this.moveSpd, this.moveSpd) + Math.sin(this.walkT * 2.6) * 9;
 
     // March around water: drop the blocked component, slide along the coast
-    if (!this.game.map.isLandPx(this.cx, this.cy + vy * dt + dirY * this.radius)) {
+    if (!this.game.map.isLandPx(this.cx, this.cy + vy * dt + Math.sign(vy || dirY) * this.radius)) {
       vy = 0;
       vx = (VIEW_W / 2 > this.cx ? 1 : -1) * this.moveSpd;
     }
@@ -180,11 +192,11 @@ export class Soldier extends Unit {
   constructor(game: GameAPI, faction: Faction, cx: number, cy: number, level = 1) {
     super(game, faction, cx, cy, {
       radius: 7,
-      hp: 10 + 3 * (level - 1),
-      dmg: 1 + 0.5 * (level - 1),
-      range: 90 + 5 * (level - 1),
-      firePeriod: 1 * Math.pow(0.95, level - 1),
-      speed: srand(48, 62) + 5 * (level - 1),
+      hp: BAL.soldier.hp + BAL.soldier.up.hp * (level - 1),
+      dmg: BAL.soldier.dmg + BAL.soldier.up.dmg * (level - 1),
+      range: BAL.soldier.range + BAL.soldier.up.range * (level - 1),
+      firePeriod: BAL.soldier.firePeriod * Math.pow(BAL.soldier.up.fire, level - 1),
+      speed: srand(BAL.soldier.speedMin, BAL.soldier.speedMax) + BAL.soldier.up.speed * (level - 1),
       spr: faction === BLUE ? SPR.B_SOLDIER : SPR.R_SOLDIER,
       sprSize: 26,
       fireSfx: `shot${1 + Math.floor(Math.random() * 3)}`,
@@ -198,11 +210,11 @@ export class Tank extends Unit {
   constructor(game: GameAPI, faction: Faction, cx: number, cy: number, level = 1) {
     super(game, faction, cx, cy, {
       radius: 12,
-      hp: 52 + 12 * (level - 1),
-      dmg: 4 + 1.5 * (level - 1),
-      range: 120 + 6 * (level - 1),
-      firePeriod: 1.3 * Math.pow(0.94, level - 1),
-      speed: 30 + 2 * (level - 1),
+      hp: BAL.tank.hp + BAL.tank.up.hp * (level - 1),
+      dmg: BAL.tank.dmg + BAL.tank.up.dmg * (level - 1),
+      range: BAL.tank.range + BAL.tank.up.range * (level - 1),
+      firePeriod: BAL.tank.firePeriod * Math.pow(BAL.tank.up.fire, level - 1),
+      speed: BAL.tank.speed + BAL.tank.up.speed * (level - 1),
       spr: faction === BLUE ? SPR.B_TANK : SPR.R_TANK,
       sprSize: 36,
       fireSfx: "tankshot",
@@ -222,17 +234,19 @@ export class Bullet extends GameObject {
   private dmg: number;
   private faction: Faction;
   private big: boolean;
+  private splash: number;
   private vx = 0;
   private vy = 0;
   private life = 1.2;
 
-  constructor(game: GameAPI, x: number, y: number, target: Target, dmg: number, faction: Faction, big: boolean) {
+  constructor(game: GameAPI, x: number, y: number, target: Target, dmg: number, faction: Faction, big: boolean, splash = 0) {
     super(x, y, 2);
     this.game = game;
     this.target = target;
     this.dmg = dmg;
     this.faction = faction;
     this.big = big;
+    this.splash = splash;
   }
 
   update(delta: number): void {
@@ -254,6 +268,10 @@ export class Bullet extends GameObject {
       if (!this.target.dead) {
         this.target.hp -= this.dmg;
         if (this.target.hp <= 0) this.game.notifyKill(this.target, this.faction);
+      }
+      // Obus : l'explosion blesse aussi ce qui se serre autour de la cible.
+      if (this.splash > 0) {
+        this.game.splashDamage(this.target.cx, this.target.cy, this.splash, this.dmg * BAL.splashFrac, this.faction, this.target);
       }
       return;
     }
