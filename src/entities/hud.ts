@@ -1,11 +1,12 @@
 import { Entity } from "@fuwu-yuan/bgew";
 import { BLUE, COLORS, COST, Faction, FONT, MAP_H, VIEW_H, VIEW_W } from "../globals";
 import { clamp } from "../utils";
+import type { UpgradeKind, UpgradeStat } from "../balance";
 import { drawSprite, SPR } from "../sprites";
 import { drawMuteIcon, isMuted } from "../sound";
 
 export type BuildMode = "barracks" | "turret" | "factory" | "axis" | "strike" | "helico" | null;
-export type UpgradeButton = "upgradeSoldier" | "upgradeTank" | "upgradeTurret";
+export type UpgradeButton = `up:${UpgradeKind}:${UpgradeStat}`;
 export type HudButton = Exclude<BuildMode, null> | UpgradeButton;
 
 /** What the HUD needs to read from the game step. */
@@ -18,12 +19,9 @@ export interface HudState {
   suddenDeath: boolean;
   blueShare: number; // 0..1
   axisMarker: { x: number; y: number } | null;
-  soldierLevel: number; // my faction's level
-  soldierUpgradeCost: number;
-  tankLevel: number;
-  tankUpgradeCost: number;
-  turretLevel: number;
-  turretUpgradeCost: number;
+  /** Mon niveau / le prix du niveau suivant, par branche et par voie (force, défense). */
+  upLevel(kind: UpgradeKind, stat: UpgradeStat): number;
+  upCost(kind: UpgradeKind, stat: UpgradeStat): number;
   /** Prix actuel d'un bâtiment (il monte avec le nombre possédé). */
   buildCostOf(kind: "barracks" | "factory" | "turret"): number;
   myName: string; // local player's name (left, my unit color)
@@ -38,6 +36,8 @@ const SAY_FOR = 8; // s
 
 interface Btn {
   id: HudButton;
+  /** Bouton d'amélioration : branche + voie (null pour bâtiments/ordres). */
+  up: { kind: UpgradeKind; stat: UpgradeStat } | null;
   x: number;
   y: number;
   w: number;
@@ -47,13 +47,13 @@ interface Btn {
   sprBlue: number;
 }
 
-const BTN_H = 46;
+const BTN_H = 42;
 const BTN_GAP = 4;
 
 /** Mute toggle — top-right strip of the command panel, above the buttons. */
 const MUTE_R = 15;
 const MUTE_CX = VIEW_W - 26;
-const MUTE_CY = MAP_H + 20;
+const MUTE_CY = MAP_H + 26;
 
 /**
  * Command panel (bottom strip) + territory bar (top) + attack-axis marker.
@@ -70,35 +70,52 @@ export class Hud extends Entity {
     this.disabled = true;
     this.state = state;
     const w = 84;
-    const commandY = MAP_H + 88;
-    const upgradeY = MAP_H + 32;
+    // Trois lignes : DÉFENSE (haut), FORCE (milieu), bâtiments et ordres (bas).
+    const defY = MAP_H + 5;
+    const atkY = MAP_H + 51;
+    const commandY = MAP_H + 97;
     const x0 = 112;
-    // Build/mode keys mirror the French label initials; the three upgrades
-    // get S / R / K (Soldats / touRelle / tanK) to avoid clashing with them.
-    const defs: [HudButton, string, string, number, number][] = [
+    const commands: [HudButton, string, string, number, number][] = [
       ["barracks", "CASERNE", "C", SPR.R_BARRACKS, SPR.B_BARRACKS],
       ["turret", "TOURELLE", "T", SPR.R_TURRET, SPR.B_TURRET],
       ["factory", "USINE", "U", SPR.R_FACTORY, SPR.B_FACTORY],
       ["helico", "HELICO", "H", SPR.R_HELI, SPR.B_HELI],
       ["strike", "FRAPPE", "F", SPR.HEDGEHOG, SPR.HEDGEHOG],
       ["axis", "AXE", "A", SPR.RETICLE, SPR.RETICLE],
-      ["upgradeSoldier", "SOLDATS", "S", SPR.R_SOLDIER, SPR.B_SOLDIER],
-      ["upgradeTurret", "TOUREL.", "R", SPR.R_TURRET, SPR.B_TURRET],
-      ["upgradeTank", "TANKS", "K", SPR.R_TANK, SPR.B_TANK],
     ];
-    this.buttons = defs.map(([id, label, key, sprRed, sprBlue], k) => {
-      const upgrade = id === "upgradeSoldier" || id === "upgradeTank" || id === "upgradeTurret";
-      const rowK = upgrade ? k - 6 : k;
-      return {
-        id,
-        label,
-        key,
-        sprRed,
-        sprBlue,
-        x: x0 + (w + BTN_GAP) * rowK,
-        y: upgrade ? upgradeY : commandY,
-        w,
-      };
+    // Améliorations, mêmes colonnes sur les deux lignes. Raccourcis : force
+    // S / K / R / L (Soldats, tanK, touRelle, héLico), défense 1 / 2 / 3 / 4.
+    const branches: [UpgradeKind, string, string, string, number, number][] = [
+      ["soldier", "SOLDATS", "S", "1", SPR.R_SOLDIER, SPR.B_SOLDIER],
+      ["tank", "TANKS", "K", "2", SPR.R_TANK, SPR.B_TANK],
+      ["turret", "TOUREL.", "R", "3", SPR.R_TURRET, SPR.B_TURRET],
+      ["heli", "HELICOS", "L", "4", SPR.R_HELI, SPR.B_HELI],
+    ];
+    this.buttons = commands.map(([id, label, key, sprRed, sprBlue], k) => ({
+      id,
+      up: null,
+      label,
+      key,
+      sprRed,
+      sprBlue,
+      x: x0 + (w + BTN_GAP) * k,
+      y: commandY,
+      w,
+    }));
+    branches.forEach(([kind, label, atkKey, defKey, sprRed, sprBlue], k) => {
+      for (const stat of ["atk", "def"] as const) {
+        this.buttons.push({
+          id: `up:${kind}:${stat}`,
+          up: { kind, stat },
+          label,
+          key: stat === "atk" ? atkKey : defKey,
+          sprRed,
+          sprBlue,
+          x: x0 + (w + BTN_GAP) * k,
+          y: stat === "atk" ? atkY : defY,
+          w,
+        });
+      }
     });
   }
 
@@ -234,30 +251,37 @@ export class Hud extends Entity {
     ctx.fillStyle = "rgba(255,255,255,0.08)";
     ctx.fillRect(0, MAP_H, VIEW_W, 2);
 
-    // Gold (capped display so 4+ digits never bleed into the buttons)
-    drawSprite(ctx, SPR.GOLD, 18, MAP_H + 44, 24);
+    // Gold — à gauche de la ligne des bâtiments (capped display so 4+ digits never bleed into the buttons)
+    drawSprite(ctx, SPR.GOLD, 18, MAP_H + 112, 24);
     ctx.font = `13px ${FONT}`;
     ctx.fillStyle = COLORS.gold;
     const g = Math.floor(s.myGold);
-    ctx.fillText(g > 99999 ? "99999+" : `${g}`, 33, MAP_H + 49);
+    ctx.fillText(g > 99999 ? "99999+" : `${g}`, 33, MAP_H + 117);
     // My flag under the gold
-    drawSprite(ctx, mine === BLUE ? SPR.B_FLAG : SPR.R_FLAG, 18, MAP_H + 74, 18);
+    drawSprite(ctx, mine === BLUE ? SPR.B_FLAG : SPR.R_FLAG, 18, MAP_H + 132, 16);
     ctx.font = `9px ${FONT}`;
     ctx.fillStyle = "#9fc3e4";
-    ctx.fillText(mine === BLUE ? "BLEU" : "ROUGE", 32, MAP_H + 78);
+    ctx.fillText(mine === BLUE ? "BLEU" : "ROUGE", 32, MAP_H + 136);
+
+    // Intitulés des deux lignes d'améliorations (mêmes couleurs que les galons des unités)
+    ctx.font = `10px ${FONT}`;
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#8fd8ff";
+    ctx.fillText("DEFENSE", 104, MAP_H + 30);
+    ctx.fillStyle = "#ffd95e";
+    ctx.fillText("FORCE", 104, MAP_H + 76);
+    ctx.textAlign = "left";
 
     // Mute toggle
     drawMuteIcon(ctx, MUTE_CX, MUTE_CY, MUTE_R, isMuted());
 
     // Buttons
     for (const b of this.buttons) {
-      const isUpgrade = b.id === "upgradeSoldier" || b.id === "upgradeTank" || b.id === "upgradeTurret";
+      const isUpgrade = b.up !== null;
       let cost = 0;
-      if (b.id === "upgradeTank") cost = s.tankUpgradeCost;
-      else if (b.id === "upgradeTurret") cost = s.turretUpgradeCost;
-      else if (b.id === "upgradeSoldier") cost = s.soldierUpgradeCost;
+      if (b.up) cost = s.upCost(b.up.kind, b.up.stat);
       else if (b.id === "barracks" || b.id === "factory" || b.id === "turret") cost = s.buildCostOf(b.id);
-      else if (b.id !== "axis") cost = COST[b.id];
+      else if (b.id === "strike" || b.id === "helico") cost = COST[b.id];
       const afford = cost === 0 || s.myGold >= cost;
       const selected = !isUpgrade && s.mode === b.id;
       ctx.fillStyle = selected ? "rgba(90, 160, 230, 0.45)" : "rgba(255, 255, 255, 0.07)";
@@ -275,17 +299,15 @@ export class Hud extends Entity {
       drawSprite(ctx, mine === BLUE ? b.sprBlue : b.sprRed, b.x + 13, b.y + BTN_H / 2, 22);
       ctx.fillStyle = "#ffffff";
       ctx.font = `8px ${FONT}`;
-      const level =
-        b.id === "upgradeTank" ? s.tankLevel : b.id === "upgradeTurret" ? s.turretLevel : s.soldierLevel;
-      const label = isUpgrade ? `${b.label} ${level}` : b.label;
-      ctx.fillText(label, b.x + 25, b.y + 18);
+      const label = b.up ? `${b.label} ${s.upLevel(b.up.kind, b.up.stat)}` : b.label;
+      ctx.fillText(label, b.x + 25, b.y + 16);
       if (cost && cost > 0) {
         ctx.fillStyle = COLORS.gold;
         ctx.font = `8px ${FONT}`;
-        ctx.fillText(`${cost} or`, b.x + 25, b.y + 35);
+        ctx.fillText(`${cost} or`, b.x + 25, b.y + 32);
       } else {
         ctx.fillStyle = "#bfe1ff";
-        ctx.fillText("attaque", b.x + 25, b.y + 35);
+        ctx.fillText("attaque", b.x + 25, b.y + 32);
       }
 
       // Keyboard shortcut badge (bottom-right corner — clear of the label at

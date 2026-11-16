@@ -38,7 +38,7 @@
     expander: { w: { barracks: 3, upSoldier: 4 }, forward: true },
     armor: { w: { factory: 4, upTank: 3, barracks: 1 }, forward: false },
     fortress: { w: { turret: 3, upTurret: 2, barracks: 2, upSoldier: 1 }, forward: false },
-    air: { w: { heli: 4, barracks: 2, upSoldier: 1 }, forward: false },
+    air: { w: { heli: 4, upHeli: 1.5, barracks: 2, upSoldier: 1 }, forward: false },
     bomber: { w: { strike: 4, barracks: 2, upSoldier: 1 }, forward: false },
     // Le joueur complet : un peu de tout.
     mixed: {
@@ -228,14 +228,21 @@
       return best;
     }
 
+    const UP_KIND = { upSoldier: "soldier", upTank: "tank", upTurret: "turret", upHeli: "heli" };
+    /** Voie achetée ensuite : imposée par le style (upOnly), sinon la moins avancée. */
+    function upStat(kind) {
+      if (style.upOnly) return style.upOnly;
+      const u = play.ups[f][kind];
+      return u.atk <= u.def ? "atk" : "def";
+    }
     function costOf(cat) {
       if (cat === "barracks" || cat === "factory" || cat === "turret") return play.costOf(f, cat);
       if (cat === "strike") return BAL.cost.strike;
       if (cat === "heli") return BAL.cost.helico;
-      const kind = cat === "upSoldier" ? "soldier" : cat === "upTank" ? "tank" : "turret";
-      const lvl = kind === "soldier" ? play.levels[f] : kind === "tank" ? play.tankLevels[f] : play.turretLevels[f];
-      const u = BAL.upgrade[kind];
-      return Math.round(u.base * Math.pow(lvl, u.exp));
+      const kind = UP_KIND[cat];
+      const stat = upStat(kind);
+      const u = BAL.upgrade[kind][stat];
+      return Math.round(u.base * Math.pow(play.ups[f][kind][stat], u.exp));
     }
     function eligible(cat) {
       // Tourelles « à la demande » : un joueur sensé n'en pose que s'il subit
@@ -248,6 +255,7 @@
       if (cat === "barracks" || cat === "factory" || cat === "turret") return count(f, cat) < CAPS[cat];
       if (cat === "upTank") return count(f, "factory") > 0;
       if (cat === "upTurret") return count(f, "turret") > 0;
+      if (cat === "upHeli") return log.helis > 0;
       if (cat === "heli") return play.helis.filter((h) => !h.dead && h.faction === f).length < BAL.heli.max;
       return true;
     }
@@ -280,7 +288,7 @@
         } else if (cat === "barracks" || cat === "factory" || cat === "turret") {
           if (!place(cat)) continue;
         } else {
-          cmd({ cmd: "upgrade", kind: cat === "upSoldier" ? "soldier" : cat === "upTank" ? "tank" : "turret" });
+          cmd({ cmd: "upgrade", kind: UP_KIND[cat], stat: upStat(UP_KIND[cat]) });
         }
         spent[cat] += cost;
         return;
@@ -311,8 +319,8 @@
     play.redBrain = () => {};
     play.redPanic = () => {};
     w.board.moveToStep("game", { difficulty: "easy" });
-    play.gold[RED] = 80;
-    play.gold[BLUE] = 80;
+    play.gold[RED] = BAL.startGold;
+    play.gold[BLUE] = BAL.startGold;
     return { play, BAL };
   }
 
@@ -333,8 +341,11 @@
     play.counts[BLUE] = { soldiers: 0, tanks: 0 };
     const rng = mulberry32(opts.seed);
     const put = (f, army, y0) => {
-      for (let i = 0; i < (army.soldiers || 0); i++) play.spawnSoldier(f, 200 + rng() * 240, y0 + (rng() - 0.5) * 60, army.level || 1);
-      for (let i = 0; i < (army.tanks || 0); i++) play.spawnTank(f, 200 + rng() * 240, y0 + (rng() - 0.5) * 60, army.tankLevel || 1);
+      // niveaux : { atk, def } par branche (défaut 1/1)
+      play.ups[f].soldier = { atk: army.atk || 1, def: army.def || 1 };
+      play.ups[f].tank = { atk: army.tankAtk || 1, def: army.tankDef || 1 };
+      for (let i = 0; i < (army.soldiers || 0); i++) play.spawnSoldier(f, 200 + rng() * 240, y0 + (rng() - 0.5) * 60);
+      for (let i = 0; i < (army.tanks || 0); i++) play.spawnTank(f, 200 + rng() * 240, y0 + (rng() - 0.5) * 60);
     };
     put(RED, opts.red, MAP_H / 2 - 110);
     put(BLUE, opts.blue, MAP_H / 2 + 110);
@@ -443,7 +454,7 @@
         comeback: winner ? m.minShare[winner] < 0.35 : false,
         minShareWinner: winner ? +m.minShare[winner].toFixed(2) : null,
         hq: { red: +hq(RED).toFixed(2), blue: +hq(BLUE).toFixed(2) },
-        levels: { red: [play.levels[RED], play.tankLevels[RED], play.turretLevels[RED]], blue: [play.levels[BLUE], play.tankLevels[BLUE], play.turretLevels[BLUE]] },
+        levels: { red: play.ups[RED], blue: play.ups[BLUE] },
         logs: { red: m.red.log, blue: m.blue.log },
         tools: { red: this.tools[RED], blue: this.tools[BLUE] },
         peakUnits: m.peakUnits,

@@ -60,3 +60,25 @@ autres (infanterie < blindés < frappes < infanterie à ≈ 60-70 %).
 - Poser ses casernes SUR le front (style `expander`) perd presque toujours : le
   chantier meurt. À 1-2 rangées derrière, c'est viable.
 - Hélicos seuls (`air`) : faibles ; utiles en appoint contre un adversaire sans tourelle.
+
+## v1.11.0 — plus de monde, plus d'or, force/défense séparées
+
+Retours de Steve sur la v1.10.0 : trop peu d'unités à l'écran, trop d'attente
+entre deux achats.
+
+- **Deux fois plus d'unités** (caserne 12 soldats/8 s, usine 4 tanks/12 s) ; pv des
+  bâtiments, cadence des tourelles/QG/hélicos et vagues de défense doublés pour
+  garder le même rythme. Pic médian ≈ 270 unités (≈ 125 en v1.10.0).
+- **Plus d'or** : 120 au départ, +3/s, prime soldat 0,75. La durée vient de la
+  solidité des bases et de la mort subite (6:00), plus de la pénurie.
+- **Améliorations en deux voies** (force / défense) pour 4 branches (soldats,
+  tanks, tourelles, hélicos), achetées séparément : achats plus petits et plus
+  fréquents. HUD sur trois lignes (défense, force, bâtiments).
+- QG 2600 pv, 2 vagues de défense ; tank 95 pv / 5 dégâts / portée 150.
+- Essayé et rejeté : obus à éclats pour les tanks (74-91 % de victoires même à
+  13 px de rayon).
+
+Mesuré sur 400 parties : médiane 5:05, aucun nul, 21 % de remontées. Styles :
+infanterie 71 %, complet 65 %, frappes 56 %. Faibles en style PUR (mais utiles
+dans un mélange) : blindés 15 %, hélicos 13 %. La défense seule ne gagne pas
+(il faut de la force), les deux ensemble battent la force seule.

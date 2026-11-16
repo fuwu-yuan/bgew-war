@@ -3,6 +3,7 @@ import type { Unit } from "./entities/units";
 import type { Building } from "./entities/buildings";
 import type { Helicopter } from "./entities/helicopter";
 import type { Faction } from "./globals";
+import type { UpgradeKind, UpLevels } from "./balance";
 
 export type Target = Unit | Building | Helicopter;
 
@@ -24,8 +25,10 @@ export interface GameAPI {
   fireBullet(x: number, y: number, target: Target, dmg: number, f: Faction, big: boolean, splash?: number): void;
   /** Dégâts de zone au sol autour de (x, y), hors `except` (la cible déjà touchée). */
   splashDamage(x: number, y: number, radius: number, dmg: number, f: Faction, except: Target): void;
-  spawnSoldier(f: Faction, x: number, y: number, level?: number): void;
-  spawnTank(f: Faction, x: number, y: number, level?: number): void;
+  /** Niveaux d'amélioration (force/défense) d'une branche pour ce camp. */
+  upLevels(f: Faction, kind: UpgradeKind): UpLevels;
+  spawnSoldier(f: Faction, x: number, y: number): void;
+  spawnTank(f: Faction, x: number, y: number): void;
   /** Convert the tile under (x, y) — gold, flash and sound handled inside. */
   tryConvert(x: number, y: number, f: Faction): void;
   /** Impact/explosion particles at (x, y). */

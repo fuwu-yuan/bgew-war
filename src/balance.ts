@@ -13,11 +13,13 @@
  */
 export const BAL = {
   /** Or : revenu passif par seconde, par case conquise, par coffre. */
-  income: 2,
+  /** Or de départ de chaque camp (l'IA des bas niveaux en reçoit une fraction : handicap). */
+  startGold: 120,
+  income: 3,
   tileGold: 1,
   chestGold: 25,
   /** Prime versée au tueur. */
-  bounty: { soldier: 1, tank: 8, heli: 15, barracks: 20, turret: 25, factory: 30 },
+  bounty: { soldier: 0.75, tank: 6, heli: 15, barracks: 20, turret: 25, factory: 30 },
 
   /** Prix des ordres. */
   cost: { barracks: 50, turret: 60, factory: 120, strike: 60, helico: 100 },
@@ -35,11 +37,16 @@ export const BAL = {
     turret: { free: 3, mult: 1.15 },
   },
 
-  /** Prix pour passer de `level` à `level + 1` : base × level^exp. */
+  /**
+   * Améliorations : 4 branches (soldats, tanks, tourelles, hélicos) × 2 voies
+   * (atk = force, def = défense), achetées séparément. Prix pour passer de
+   * `level` à `level + 1` : base × level^exp.
+   */
   upgrade: {
-    soldier: { base: 110, exp: 1.35 },
-    tank: { base: 120, exp: 1.3 },
-    turret: { base: 100, exp: 1.2 },
+    soldier: { atk: { base: 60, exp: 1.35 }, def: { base: 60, exp: 1.35 } },
+    tank: { atk: { base: 70, exp: 1.3 }, def: { base: 70, exp: 1.3 } },
+    turret: { atk: { base: 60, exp: 1.2 }, def: { base: 50, exp: 1.2 } },
+    heli: { atk: { base: 60, exp: 1.3 }, def: { base: 60, exp: 1.3 } },
   },
 
   soldier: {
@@ -49,16 +56,17 @@ export const BAL = {
     firePeriod: 1,
     speedMin: 48,
     speedMax: 62,
-    /** Gain par niveau au-dessus de 1 (fire = multiplicateur de période). */
-    up: { hp: 2, dmg: 0.25, range: 4, fire: 0.96, speed: 3 },
+    /** Gain par niveau au-dessus de 1. FORCE : dmg, range, fire (multiplicateur
+     *  de période). DÉFENSE : hp, speed. */
+    up: { hp: 3, dmg: 0.25, range: 4, fire: 0.96, speed: 3 },
   },
   tank: {
-    hp: 52,
-    dmg: 4,
-    range: 140,
+    hp: 95,
+    dmg: 5,
+    range: 150,
     firePeriod: 1.3,
     speed: 30,
-    up: { hp: 10, dmg: 1, range: 6, fire: 0.94, speed: 2 },
+    up: { hp: 16, dmg: 1, range: 6, fire: 0.94, speed: 2 },
     /** Rayon (px) des éclats d'obus autour de la cible. 0 = tir simple. */
     splash: 0,
   },
@@ -66,43 +74,45 @@ export const BAL = {
   splashFrac: 0.5,
 
   /** Le QG est une forteresse qui riposte. */
-  hq: { hp: 1800, range: 170, dmg: 6, firePeriod: 0.7, splash: 40 },
-  barracks: { hp: 120, spawnEvery: 8, waveCount: 6, waveSpacing: 0.18, buildTime: 3 },
-  factory: { hp: 160, spawnEvery: 12, waveCount: 2, waveSpacing: 0.45, buildTime: 5 },
+  hq: { hp: 2600, range: 170, dmg: 6, firePeriod: 0.35, splash: 40 },
+  barracks: { hp: 240, spawnEvery: 8, waveCount: 12, waveSpacing: 0.18, buildTime: 3 },
+  factory: { hp: 320, spawnEvery: 12, waveCount: 4, waveSpacing: 0.45, buildTime: 5 },
   turret: {
-    hp: 240,
+    hp: 480,
     range: 150,
     dmg: 4,
-    firePeriod: 0.5,
+    firePeriod: 0.25,
     buildTime: 4,
-    /** Gain par niveau au-dessus de 1 : +range px, +dmg (fraction), période × fire. */
-    up: { range: 10, dmg: 0.42, fire: 0.88 },
+    /** Gain par niveau au-dessus de 1. FORCE : +range px, +dmg (fraction),
+     *  période × fire. DÉFENSE : +hp (fraction des pv de base). */
+    up: { range: 10, dmg: 0.42, fire: 0.88, hp: 0.3 },
   },
   /** Un chantier démarre à cette fraction de ses pv. */
   siteHp: 0.3,
 
   /** Frappe aérienne : touche LES DEUX camps dans le rayon. */
-  strike: { radius: 105, dmgUnit: 16, dmgBuilding: 60, delay: 0.9 },
+  strike: { radius: 105, dmgUnit: 16, dmgBuilding: 120, delay: 0.9 },
 
-  /** Hélico : traverse, mitraille, revient. Seuls tourelles et QG le touchent. */
   /** Hélico d'appui : ralentit (× strafeSlow) tant qu'il a une cible, `fuel` s
    *  d'autonomie à l'aller, demi-tour à `turnBack` px du bord adverse (il
    *  n'entre pas dans la base). Seuls tourelles et QG le touchent. */
-  heli: { hp: 40, dmg: 7, range: 130, firePeriod: 0.24, speed: 92, max: 3, turnBack: 250, fuel: 22, strafeSlow: 0.2 },
+  heli: { hp: 80, dmg: 7, range: 130, firePeriod: 0.12, speed: 92, max: 3, turnBack: 250, fuel: 22, strafeSlow: 0.2,
+    /** Gain par niveau : FORCE +dmg (fraction), DÉFENSE +hp (fraction). */
+    up: { dmg: 0.25, hp: 0.3 } },
 
   /**
    * Vagues de défense du QG : `waves` par partie et par camp, déclenchées par
    * paliers de pv (1re au premier coup reçu, puis à chaque tranche perdue).
    * Chaque siège donne au défenseur une vraie chance de repousser l'assaut.
    */
-  hqDefense: { waves: 3, radius: 340, minSoldiers: 16, maxSoldiers: 50, minTanks: 1, maxTanks: 5 },
+  hqDefense: { waves: 2, radius: 340, minSoldiers: 24, maxSoldiers: 70, minTanks: 2, maxTanks: 6 },
 
   /**
    * Mort subite : passé `start` secondes, le QG du camp qui tient le MOINS de
    * territoire perd `dps` pv/s (× 2 chaque `doubleEvery` s). Aucune partie ne
    * peut s'éterniser, et le territoire reste l'enjeu jusqu'au bout.
    */
-  suddenDeath: { start: 420, dps: 8, doubleEvery: 60 },
+  suddenDeath: { start: 360, dps: 8, doubleEvery: 60 },
 
   /** Largeur de l'armée : chaque unité marche à ±laneSpread px de l'axe d'attaque. */
   laneSpread: 260,
@@ -117,7 +127,14 @@ export const BAL = {
 
 export type Balance = typeof BAL;
 
-export type UpgradeKind = "soldier" | "tank" | "turret";
+export type UpgradeKind = "soldier" | "tank" | "turret" | "heli";
+/** Voie d'amélioration : force (atk) ou défense (def). */
+export type UpgradeStat = "atk" | "def";
+export const UPGRADE_KINDS: UpgradeKind[] = ["soldier", "tank", "turret", "heli"];
+export interface UpLevels {
+  atk: number;
+  def: number;
+}
 
 export type BuildKind = "barracks" | "factory" | "turret";
 
@@ -127,8 +144,8 @@ export function buildCost(kind: BuildKind, owned: number): number {
   return Math.round(BAL.cost[kind] * Math.pow(g.mult, Math.max(0, owned - g.free)));
 }
 
-/** Prix pour passer de `level` à `level + 1`. */
-export function upgradeCost(kind: UpgradeKind, level: number): number {
-  const u = BAL.upgrade[kind];
+/** Prix pour passer de `level` à `level + 1` dans cette branche et cette voie. */
+export function upgradeCost(kind: UpgradeKind, stat: UpgradeStat, level: number): number {
+  const u = BAL.upgrade[kind][stat];
   return Math.round(u.base * Math.pow(level, u.exp));
 }

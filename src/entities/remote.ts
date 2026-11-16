@@ -240,7 +240,7 @@ export class RemoteWorld extends Entity {
             ? SPR.B_SOLDIER
             : SPR.R_SOLDIER;
       drawSprite(ctx, spr, u.x, u.y + bob, size);
-      if (!lod) drawLevelPips(ctx, u.level, u.x, u.y - size * 0.72);
+      if (!lod) drawLevelPips(ctx, u.level, 1, u.x, u.y - size * 0.72);
       if (u.hp < u.maxHp) {
         const w = size * 0.8;
         ctx.fillStyle = "rgba(0,0,0,0.5)";

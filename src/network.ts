@@ -174,7 +174,9 @@ export interface CmdMsg {
   type: "cmd";
   faction: number; // RED | BLUE — whose order this is
   cmd: "build" | "axis" | "upgrade" | "strike" | "helico";
-  kind?: "barracks" | "turret" | "factory" | "soldier" | "tank";
+  kind?: "barracks" | "turret" | "factory" | "soldier" | "tank" | "heli";
+  /** upgrade : voie achetée — "atk" (force, défaut) ou "def" (défense). */
+  stat?: "atk" | "def";
   c?: number;
   r?: number;
   col?: number;

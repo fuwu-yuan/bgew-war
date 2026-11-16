@@ -47,8 +47,9 @@ export function drawHeli(
  */
 export class Helicopter extends GameObject {
   public faction: Faction;
-  public hp = BAL.heli.hp;
-  public maxHp = BAL.heli.hp;
+  public hp: number;
+  public maxHp: number;
+  private dmg: number;
   public nid = 0;
   public returning = false;
 
@@ -62,6 +63,10 @@ export class Helicopter extends GameObject {
     super(cx, cy, 13);
     this.game = game;
     this.faction = faction;
+    // Niveaux du camp au décollage : force = dégâts, défense = pv.
+    const up = game.upLevels(faction, "heli");
+    this.maxHp = this.hp = Math.round(BAL.heli.hp * (1 + BAL.heli.up.hp * (up.def - 1)));
+    this.dmg = BAL.heli.dmg * (1 + BAL.heli.up.dmg * (up.atk - 1));
   }
 
   update(delta: number): void {
@@ -91,7 +96,7 @@ export class Helicopter extends GameObject {
       this.strafing = !!target;
       if (target) {
         this.fireCd = BAL.heli.firePeriod * srand(0.85, 1.15);
-        this.game.fireBullet(this.cx, this.cy, target, BAL.heli.dmg, this.faction, false);
+        this.game.fireBullet(this.cx, this.cy, target, this.dmg, this.faction, false);
         this.game.sfx("shot2", 0.1);
       }
     }

@@ -15,10 +15,10 @@ import {
 } from "../globals";
 import { clamp, pick, rand, randInt, sha256, TAU } from "../utils";
 import { seedSim, srand } from "../sim-rng";
-import { BAL, buildCost, BuildKind, upgradeCost, UpgradeKind } from "../balance";
+import { BAL, buildCost, BuildKind, upgradeCost, UpgradeKind, UpgradeStat, UpLevels, UPGRADE_KINDS } from "../balance";
 import { TileMap } from "../entities/tilemap";
 import { Bullet, Soldier, Tank, Unit } from "../entities/units";
-import { Building, BUILDING_CODE, BuildingType } from "../entities/buildings";
+import { Building, BUILDING_CODE, BuildingType, turretMaxHp } from "../entities/buildings";
 import { Helicopter } from "../entities/helicopter";
 import { Fader, FpsMeter, Particle, ScorePopup, Shockwave, StrikeMarker, Tracer } from "../entities/effects";
 import { BuildMode, Hud, HudState } from "../entities/hud";
@@ -39,6 +39,19 @@ import {
   ClaudeState,
   loadClaudePassword,
 } from "../claude-general";
+
+/** Niveaux d'amélioration d'un camp en début de partie. */
+function freshUps(): Record<UpgradeKind, UpLevels> {
+  const out = {} as Record<UpgradeKind, UpLevels>;
+  for (const k of UPGRADE_KINDS) out[k] = { atk: 1, def: 1 };
+  return out;
+}
+
+/** Bouton HUD « up:<branche>:<voie> » → branche + voie, sinon null. */
+function parseUpgradeButton(id: string): { kind: UpgradeKind; stat: UpgradeStat } | null {
+  const m = /^up:(soldier|tank|turret|heli):(atk|def)$/.exec(id);
+  return m ? { kind: m[1] as UpgradeKind, stat: m[2] as UpgradeStat } : null;
+}
 
 const BRAIN_EVERY = 3; // s — red AI thinks (solo only)
 const INCOME_EVERY = 1; // s
@@ -185,9 +198,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   public enemyName = "Adversaire";
 
   private gold: Record<Faction, number> = { [RED]: 0, [BLUE]: 0 };
-  private levels: Record<Faction, number> = { [RED]: 1, [BLUE]: 1 };
-  private tankLevels: Record<Faction, number> = { [RED]: 1, [BLUE]: 1 };
-  private turretLevels: Record<Faction, number> = { [RED]: 1, [BLUE]: 1 };
+  /** Améliorations de chaque camp : 4 branches × force/défense (1 = base). */
+  private ups: Record<Faction, Record<UpgradeKind, UpLevels>> = { [RED]: freshUps(), [BLUE]: freshUps() };
   private killsBy: Record<Faction, number> = { [RED]: 0, [BLUE]: 0 };
   private axisCol: Record<Faction, number> = { [RED]: 8, [BLUE]: 8 };
   private counts = {
@@ -287,28 +299,32 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     ].join("\n");
   }
 
-  get soldierLevel(): number {
-    return this.levels[this.myFaction];
+  /** Niveau global d'une branche (force + défense − 1) : ce que l'IA compare. */
+  private branchLevel(f: Faction, kind: UpgradeKind): number {
+    const u = this.ups[f][kind];
+    return u.atk + u.def - 1;
+  }
+  private get levels(): Record<Faction, number> {
+    return { [RED]: this.branchLevel(RED, "soldier"), [BLUE]: this.branchLevel(BLUE, "soldier") };
+  }
+  private get tankLevels(): Record<Faction, number> {
+    return { [RED]: this.branchLevel(RED, "tank"), [BLUE]: this.branchLevel(BLUE, "tank") };
+  }
+  private get turretLevels(): Record<Faction, number> {
+    return { [RED]: this.branchLevel(RED, "turret"), [BLUE]: this.branchLevel(BLUE, "turret") };
   }
 
-  get soldierUpgradeCost(): number {
-    return upgradeCost("soldier", this.levels[this.myFaction]);
+  /** GameAPI : niveaux force/défense d'une branche. */
+  upLevels(f: Faction, kind: UpgradeKind): UpLevels {
+    return this.ups[f][kind];
   }
 
-  get tankLevel(): number {
-    return this.tankLevels[this.myFaction];
+  /** HUD : mon niveau et le prix du suivant, par branche et par voie. */
+  upLevel(kind: UpgradeKind, stat: UpgradeStat): number {
+    return this.ups[this.myFaction][kind][stat];
   }
-
-  get tankUpgradeCost(): number {
-    return upgradeCost("tank", this.tankLevels[this.myFaction]);
-  }
-
-  get turretLevel(): number {
-    return this.turretLevels[this.myFaction];
-  }
-
-  get turretUpgradeCost(): number {
-    return upgradeCost("turret", this.turretLevels[this.myFaction]);
+  upCost(kind: UpgradeKind, stat: UpgradeStat): number {
+    return this.upgradeCostFor(this.myFaction, kind, stat);
   }
 
   constructor(board: Board) {
@@ -339,8 +355,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     }
     const id = this.hud.buttonForKey(e.key);
     if (!id) return;
-    if (id === "upgradeSoldier" || id === "upgradeTank" || id === "upgradeTurret") {
-      this.requestUpgrade(id === "upgradeTank" ? "tank" : id === "upgradeTurret" ? "turret" : "soldier");
+    const upKey = parseUpgradeButton(id);
+    if (upKey) {
+      this.requestUpgrade(upKey.kind, upKey.stat);
       return;
     }
     this.board.playSound("click", false, 0.4);
@@ -423,10 +440,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.buildingAt.clear();
     this.remote = null;
     // Fair play : l'or de départ de l'IA est un HANDICAP (≤ 80), jamais un bonus.
-    this.gold = { [RED]: this.role === "solo" ? this.tun.startGold : 80, [BLUE]: 80 };
-    this.levels = { [RED]: 1, [BLUE]: 1 };
-    this.tankLevels = { [RED]: 1, [BLUE]: 1 };
-    this.turretLevels = { [RED]: 1, [BLUE]: 1 };
+    // tun.startGold est exprimé sur la base historique de 80 : handicap proportionnel.
+    this.gold = { [RED]: this.role === "solo" ? Math.round((this.tun.startGold / 80) * BAL.startGold) : BAL.startGold, [BLUE]: BAL.startGold };
+    this.ups = { [RED]: freshUps(), [BLUE]: freshUps() };
     this.killsBy = { [RED]: 0, [BLUE]: 0 };
     this.mode = null;
     this.elapsed = 0;
@@ -710,7 +726,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       return;
     }
     if (cmd.cmd === "upgrade") {
-      this.buyUpgrade(f, (cmd.kind === "tank" || cmd.kind === "turret" ? cmd.kind : "soldier") as UpgradeKind);
+      const kind: UpgradeKind = cmd.kind === "tank" || cmd.kind === "turret" || cmd.kind === "heli" ? cmd.kind : "soldier";
+      this.buyUpgrade(f, kind, cmd.stat === "def" ? "def" : "atk");
       return;
     }
     if (cmd.cmd === "strike" && typeof cmd.x === "number" && typeof cmd.y === "number") {
@@ -768,12 +785,13 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     if (y >= MAP_H) {
       const btn = this.hud.hitButton(x, y);
       if (!btn) return;
-      if (btn === "upgradeSoldier" || btn === "upgradeTank" || btn === "upgradeTurret") {
-        this.requestUpgrade(btn === "upgradeTank" ? "tank" : btn === "upgradeTurret" ? "turret" : "soldier");
+      const upBtn = parseUpgradeButton(btn);
+      if (upBtn) {
+        this.requestUpgrade(upBtn.kind, upBtn.stat);
         return;
       }
       this.board.playSound("click", false, 0.4);
-      this.mode = this.mode === btn ? null : btn;
+      this.mode = this.mode === btn ? null : (btn as BuildMode);
       return;
     }
 
@@ -853,14 +871,14 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.myActs++;
   }
 
-  private requestUpgrade(kind: UpgradeKind): void {
-    const cost = this.upgradeCostFor(this.myFaction, kind);
+  private requestUpgrade(kind: UpgradeKind, stat: UpgradeStat): void {
+    const cost = this.upgradeCostFor(this.myFaction, kind, stat);
     if (this.myGold < cost) {
       this.board.playSound("error", false, 0.4);
       return;
     }
-    track("upgrade", { kind, level: this.upgradeLevelFor(this.myFaction, kind) + 1, mode: this.role });
-    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "upgrade", kind });
+    track("upgrade", { kind, stat, level: this.ups[this.myFaction][kind][stat] + 1, mode: this.role });
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "upgrade", kind, stat });
   }
 
   /** Prix du prochain bâtiment de ce type pour ce camp (croît avec ceux qu'il possède). */
@@ -875,32 +893,37 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     return this.costOf(this.myFaction, kind);
   }
 
-  private upgradeLevelFor(f: Faction, kind: UpgradeKind): number {
-    if (kind === "tank") return this.tankLevels[f];
-    if (kind === "turret") return this.turretLevels[f];
-    return this.levels[f];
+  /** Voie que l'IA achète ensuite dans une branche : la moins avancée (force d'abord). */
+  private nextStat(f: Faction, kind: UpgradeKind): UpgradeStat {
+    const u = this.ups[f][kind];
+    return u.atk <= u.def ? "atk" : "def";
   }
 
-  private upgradeCostFor(f: Faction, kind: UpgradeKind): number {
-    if (kind === "tank") return upgradeCost("tank", this.tankLevels[f]);
-    if (kind === "turret") return upgradeCost("turret", this.turretLevels[f]);
-    return upgradeCost("soldier", this.levels[f]);
+  /** Prix du prochain niveau ; sans `stat`, celui de la voie que l'IA prendrait. */
+  private upgradeCostFor(f: Faction, kind: UpgradeKind, stat: UpgradeStat = this.nextStat(f, kind)): number {
+    return upgradeCost(kind, stat, this.ups[f][kind][stat]);
   }
 
-  /** Solo/host: pay and raise one faction upgrade level. */
-  private buyUpgrade(f: Faction, kind: UpgradeKind): void {
-    const cost = this.upgradeCostFor(f, kind);
+  /** Paie et monte d'un niveau une voie d'une branche (sans `stat` : choix de l'IA). */
+  private buyUpgrade(f: Faction, kind: UpgradeKind, stat: UpgradeStat = this.nextStat(f, kind)): void {
+    const cost = this.upgradeCostFor(f, kind, stat);
     if (this.gold[f] < cost) return;
     this.gold[f] -= cost;
-    if (kind === "tank") this.tankLevels[f]++;
-    else if (kind === "turret") this.turretLevels[f]++;
-    else this.levels[f]++;
+    const level = ++this.ups[f][kind][stat];
+    // Défense des tourelles : les tourelles déjà posées gagnent les pv tout de suite.
+    if (kind === "turret" && stat === "def") {
+      const gain = turretMaxHp(level) - turretMaxHp(level - 1);
+      for (const b of this.buildings) {
+        if (b.dead || b.faction !== f || b.type !== "turret") continue;
+        b.maxHp += gain;
+        b.hp += gain;
+      }
+    }
     const hq = this.buildings.find((b) => !b.dead && b.type === "hq" && b.faction === f);
     const x = hq ? hq.cx : VIEW_W / 2;
     const y = hq ? hq.cy : MAP_H / 2;
-    const label = kind === "tank" ? "TANKS" : kind === "turret" ? "TOURELLES" : "SOLDATS";
-    const level = kind === "tank" ? this.tankLevels[f] : kind === "turret" ? this.turretLevels[f] : this.levels[f];
-    this.popup(x, y - 30, `${label} NIVEAU ${level}`, 0);
+    const label = kind === "tank" ? "TANKS" : kind === "turret" ? "TOURELLES" : kind === "heli" ? "HELICOS" : "SOLDATS";
+    this.popup(x, y - 30, `${label} ${stat === "atk" ? "FORCE" : "DEFENSE"} ${level}`, 0);
     this.spawnEffect(new Shockwave(x, y, 70, COLORS.gold, 0.45));
     this.sfx("coin", 0.5);
   }
@@ -988,19 +1011,19 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     }
   }
 
-  spawnSoldier(f: Faction, x: number, y: number, level?: number): void {
+  spawnSoldier(f: Faction, x: number, y: number): void {
     if (this.counts[f].soldiers >= BAL.maxSoldiers) return;
     this.counts[f].soldiers++;
-    const u = new Soldier(this, f, x, y, level ?? this.levels[f]);
+    const u = new Soldier(this, f, x, y, this.ups[f].soldier.atk, this.ups[f].soldier.def);
     u.nid = this.nextNid++;
     this.units.push(u);
     this.board.addEntity(u);
   }
 
-  spawnTank(f: Faction, x: number, y: number, level?: number): void {
+  spawnTank(f: Faction, x: number, y: number): void {
     if (this.counts[f].tanks >= BAL.maxTanks) return;
     this.counts[f].tanks++;
-    const u = new Tank(this, f, x, y, level ?? this.tankLevels[f]);
+    const u = new Tank(this, f, x, y, this.ups[f].tank.atk, this.ups[f].tank.def);
     u.nid = this.nextNid++;
     this.units.push(u);
     this.board.addEntity(u);
@@ -1220,11 +1243,6 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
     // 2. Advance the world by exactly one tick.
     this.rebuildBuckets();
-    for (const b of this.buildings) {
-      b.soldierLevel = this.levels[b.faction];
-      b.tankLevel = this.tankLevels[b.faction];
-      b.turretLevel = this.turretLevels[b.faction];
-    }
     super.update(TICK_MS); // every entity + timers, fixed dt
     this.updateStrikes(TICK_DT);
 
@@ -1394,8 +1412,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       this.spawnSoldier(
         hq.faction,
         hq.cx + spread * srand(18, 150),
-        hq.cy + dir * srand(35, 165),
-        this.levels[hq.faction]
+        hq.cy + dir * srand(35, 165)
       );
     }
     for (let i = 0; i < tanks; i++) {
@@ -2380,7 +2397,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   }
 
   private botUpgrade(kind: UpgradeKind): void {
-    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "upgrade", kind });
+    const stat = this.nextStat(this.myFaction, kind);
+    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "upgrade", kind, stat });
   }
 
   /* ---------------------------------------------------------------- *
@@ -2390,9 +2408,6 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private placeBuilding(f: Faction, type: BuildingType, c: number, r: number, instant = false): void {
     const b = new Building(this, f, type, c, r, instant);
     b.nid = this.nextNid++;
-    b.soldierLevel = this.levels[f];
-    b.tankLevel = this.tankLevels[f];
-    b.turretLevel = this.turretLevels[f];
     if (type === "hq") this.hqs[f] = b;
     this.buildings.push(b);
     this.buildingAt.set(this.map.idx(c, r), b);

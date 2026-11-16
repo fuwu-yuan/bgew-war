@@ -34,6 +34,11 @@ interface BuildingStats {
 /** Chiffres de gameplay : BAL (balance.ts). Lus à chaque usage, jamais copiés. */
 const statsOf = (type: BuildingType): BuildingStats => BAL[type];
 
+/** Pv max d'une tourelle au niveau de défense `def`. */
+export function turretMaxHp(def: number): number {
+  return Math.round(BAL.turret.hp * (1 + BAL.turret.up.hp * (def - 1)));
+}
+
 const SPRITES = BUILDING_SPRITE;
 
 /** Petit ouvrier casqué qui martèle (face à droite, vers le chantier). */
@@ -142,13 +147,6 @@ export class Building extends GameObject {
   public row: number;
   /** Network id (multiplayer snapshots) */
   public nid = 0;
-  /** Soldier level its faction spawns at (kept fresh by the game step) */
-  public soldierLevel = 1;
-  /** Tank level factories spawn at (kept fresh by the game step). */
-  public tankLevel = 1;
-  /** Turret upgrade level for damage/range/fire rate (kept fresh by the game step). */
-  public turretLevel = 1;
-
   private game: GameAPI;
   private stats: BuildingStats;
   private spawnT: number;
@@ -171,6 +169,9 @@ export class Building extends GameObject {
     this.row = row;
     this.stats = statsOf(type);
     this.maxHp = this.hp = this.stats.hp;
+    // Tourelle : la voie DÉFENSE du camp augmente ses pv (les tourelles déjà
+    // posées sont rehaussées à l'achat, voir PlayStep.buyUpgrade).
+    if (type === "turret") this.maxHp = this.hp = turretMaxHp(game.upLevels(faction, "turret").def);
     if (!instant && this.stats.buildTime) {
       this.buildTotal = this.buildLeft = this.stats.buildTime;
       this.hp = this.maxHp * BAL.siteHp; // un chantier est fragile
@@ -215,14 +216,14 @@ export class Building extends GameObject {
         const dir = (this.faction === RED ? 1 : -1) * this.game.flipY();
         const x = this.cx + srand(-14, 14); // sim: spawn position jitter
         const y = this.cy + dir * (TILE * 0.8);
-        if (this.type === "barracks") this.game.spawnSoldier(this.faction, x, y, this.soldierLevel);
-        else this.game.spawnTank(this.faction, x, y, this.tankLevel);
+        if (this.type === "barracks") this.game.spawnSoldier(this.faction, x, y);
+        else this.game.spawnTank(this.faction, x, y);
       }
     }
 
     if (this.stats.range) {
       this.cd -= dt;
-      const lvl = this.type === "turret" ? this.turretLevel : 1;
+      const lvl = this.type === "turret" ? this.game.upLevels(this.faction, "turret").atk : 1;
       const range = (this.stats.range ?? 0) + (this.type === "turret" ? BAL.turret.up.range * (lvl - 1) : 0);
       const dmg = (this.stats.dmg ?? 1) * (this.type === "turret" ? 1 + BAL.turret.up.dmg * (lvl - 1) : 1);
       const firePeriod = (this.stats.firePeriod ?? 0.6) * (this.type === "turret" ? Math.pow(BAL.turret.up.fire, lvl - 1) : 1);

@@ -14,8 +14,9 @@ export abstract class Unit extends GameObject {
   public faction: Faction;
   public hp: number;
   public maxHp: number;
-  /** Soldier upgrade level (1 = base). Tanks stay at 1. */
-  public level = 1;
+  /** Niveaux de force / défense reçus à la production (1 = base). */
+  public atk = 1;
+  public def = 1;
   /** Network id (multiplayer snapshots) */
   public nid = 0;
 
@@ -153,7 +154,7 @@ export abstract class Unit extends GameObject {
 
     const bob = this.walking ? Math.sin(this.walkT * 11) * 1.6 : 0;
     drawSprite(ctx, this.spr, this.cx, this.cy + bob, this.sprSize);
-    drawLevelPips(ctx, this.level, this.cx, this.cy - this.sprSize * 0.72);
+    drawLevelPips(ctx, this.atk, this.def, this.cx, this.cy - this.sprSize * 0.72);
 
     if (this.muzzleT > 0) {
       const len = Math.hypot(this.aimX, this.aimY) || 1;
@@ -177,50 +178,56 @@ export abstract class Unit extends GameObject {
   }
 }
 
-/** Gold chevrons above upgraded units (level 2 = 1 pip…). */
-export function drawLevelPips(ctx: CanvasRenderingContext2D, level: number, cx: number, y: number): void {
-  if (level <= 1) return;
-  const n = level - 1;
-  const w = n * 5 - 2;
-  ctx.fillStyle = "#ffd95e";
-  for (let k = 0; k < n; k++) {
-    ctx.fillRect(cx - w / 2 + k * 5, y, 3, 3);
-  }
+/** Galons au-dessus des unités améliorées : or = force, bleu clair = défense. */
+export function drawLevelPips(ctx: CanvasRenderingContext2D, atk: number, def: number, cx: number, y: number): void {
+  const row = (level: number, color: string, yy: number) => {
+    const n = Math.min(level - 1, 8);
+    if (n <= 0) return;
+    const w = n * 5 - 2;
+    ctx.fillStyle = color;
+    for (let k = 0; k < n; k++) ctx.fillRect(cx - w / 2 + k * 5, yy, 3, 3);
+  };
+  row(atk, "#ffd95e", y);
+  row(def, "#8fd8ff", y - 4);
 }
 
 export class Soldier extends Unit {
-  constructor(game: GameAPI, faction: Faction, cx: number, cy: number, level = 1) {
+  constructor(game: GameAPI, faction: Faction, cx: number, cy: number, atk = 1, def = 1) {
+    const b = BAL.soldier;
     super(game, faction, cx, cy, {
       radius: 7,
-      hp: BAL.soldier.hp + BAL.soldier.up.hp * (level - 1),
-      dmg: BAL.soldier.dmg + BAL.soldier.up.dmg * (level - 1),
-      range: BAL.soldier.range + BAL.soldier.up.range * (level - 1),
-      firePeriod: BAL.soldier.firePeriod * Math.pow(BAL.soldier.up.fire, level - 1),
-      speed: srand(BAL.soldier.speedMin, BAL.soldier.speedMax) + BAL.soldier.up.speed * (level - 1),
+      hp: b.hp + b.up.hp * (def - 1),
+      dmg: b.dmg + b.up.dmg * (atk - 1),
+      range: b.range + b.up.range * (atk - 1),
+      firePeriod: b.firePeriod * Math.pow(b.up.fire, atk - 1),
+      speed: srand(b.speedMin, b.speedMax) + b.up.speed * (def - 1),
       spr: faction === BLUE ? SPR.B_SOLDIER : SPR.R_SOLDIER,
       sprSize: 26,
       fireSfx: `shot${1 + Math.floor(Math.random() * 3)}`,
       fireSfxVol: 0.12,
     });
-    this.level = level;
+    this.atk = atk;
+    this.def = def;
   }
 }
 
 export class Tank extends Unit {
-  constructor(game: GameAPI, faction: Faction, cx: number, cy: number, level = 1) {
+  constructor(game: GameAPI, faction: Faction, cx: number, cy: number, atk = 1, def = 1) {
+    const b = BAL.tank;
     super(game, faction, cx, cy, {
       radius: 12,
-      hp: BAL.tank.hp + BAL.tank.up.hp * (level - 1),
-      dmg: BAL.tank.dmg + BAL.tank.up.dmg * (level - 1),
-      range: BAL.tank.range + BAL.tank.up.range * (level - 1),
-      firePeriod: BAL.tank.firePeriod * Math.pow(BAL.tank.up.fire, level - 1),
-      speed: BAL.tank.speed + BAL.tank.up.speed * (level - 1),
+      hp: b.hp + b.up.hp * (def - 1),
+      dmg: b.dmg + b.up.dmg * (atk - 1),
+      range: b.range + b.up.range * (atk - 1),
+      firePeriod: b.firePeriod * Math.pow(b.up.fire, atk - 1),
+      speed: b.speed + b.up.speed * (def - 1),
       spr: faction === BLUE ? SPR.B_TANK : SPR.R_TANK,
       sprSize: 36,
       fireSfx: "tankshot",
       fireSfxVol: 0.2,
     });
-    this.level = level;
+    this.atk = atk;
+    this.def = def;
   }
 }
 
