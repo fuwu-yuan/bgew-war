@@ -1,9 +1,11 @@
 /**
  * Niveau CLAUDE — pont client vers le général (Cloud Function `claudeTurn`).
  *
- * Le modèle ne voit que ce que le joueur voit (carte, bâtiments, unités,
- * niveaux, ordres visibles) et répond par des INTENTIONS. Le lieutenant local
- * (game.step.ts) les exécute avec les règles et l'or communs à tous.
+ * Le général est un STRATÈGE : le commandant local (src/commander.ts) joue
+ * seul, en continu. Toutes les ~20 s, le client envoie un rapport de bataille
+ * (ce que le joueur voit + ce que le joueur a fait) ; le modèle répond par une
+ * DOCTRINE — les réglages du commandant — appliquée aussitôt. Si le général
+ * est injoignable, rien ne s'arrête : le commandant garde sa doctrine.
  *
  * Le mot de passe est demandé au menu, vérifié côté serveur (`ping`) puis
  * mémorisé en localStorage. La clé API Anthropic n'existe que dans la
@@ -12,80 +14,66 @@
 import { FirebaseError } from "firebase/app";
 import { httpsCallable } from "firebase/functions";
 import { functions } from "./firebase";
+import type { UpgradeKind, UpLevels } from "./balance";
+import type { Genome, Spend } from "./commander";
 
-export type ClaudeOrderType = "caserne" | "tourelle" | "usine" | "frappe" | "helico" | "amelioration";
-export type ClaudeTarget = "groupe" | "batiment" | "colonne" | "aucune";
-export type ClaudeUpgrade = "soldats" | "tanks" | "tourelles" | "aucune";
-
-export interface ClaudeOrder {
-  type: ClaudeOrderType;
-  col: number; // -1 = sans objet
-  ligne: number; // -1 = sans objet
-  cible: ClaudeTarget;
-  quoi: ClaudeUpgrade;
-}
-
-export interface ClaudePlan {
-  analyse: string;
-  message: string;
-  axe: number;
-  reserve: number;
-  ordres: ClaudeOrder[];
-}
-
-export interface ClaudeBuildingInfo {
-  type: "hq" | "barracks" | "turret" | "factory";
-  c: number;
-  r: number;
-  hp: number; // 0..1
-  building: boolean; // chantier en cours
-}
-
-/** L'état envoyé au général : strictement ce qui est visible à l'écran. */
-export interface ClaudeState {
-  turn: number;
-  t: number;
-  gold: number; // or ROUGE (le sien)
-  share: number; // part de territoire rouge 0..1
-  axis: number;
-  reserve: number;
-  levels: { red: ClaudeLevels; blue: ClaudeLevels };
-  upgradeCost: { soldiers: number; tanks: number; turrets: number };
-  units: { red: { soldiers: number; tanks: number }; blue: { soldiers: number; tanks: number } };
-  helis: { red: number; blue: number };
-  hq: { red: number; blue: number }; // pv 0..1
-  map: string[]; // 22 lignes × 16 caractères
-  cols: { blueFront: number[]; red: number[]; blue: number[] };
-  redBuildings: ClaudeBuildingInfo[];
-  blueBuildings: ClaudeBuildingInfo[];
-  habits: { strikes: number; helis: number; upSoldier: number; upTank: number; upTurret: number; favoredCol: number };
-  deepestBlueRow: number;
-  pending: string[];
-  lieutenant: string;
-}
-
-export interface ClaudeLevels {
+export interface ClaudeSide {
+  barracks: number;
+  factories: number;
+  turrets: number;
+  /** Tourelles hors de la base (à portée du front) : celles qui gênent un hélico. */
+  frontTurrets: number;
   soldiers: number;
   tanks: number;
-  turrets: number;
+  helis: number;
+  ups: Record<UpgradeKind, UpLevels>;
 }
 
-/** Une décision passée et ce qu'elle a donné (mémoire courte du général). */
+/** Le rapport envoyé au général : ce qui est visible à l'écran + les habitudes du joueur. */
+export interface ClaudeReport {
+  turn: number;
+  t: number;
+  /** Part de territoire rouge 0..1, et son historique (un point toutes les 10 s). */
+  share: number;
+  trend: number[];
+  gold: number; // or ROUGE (le sien)
+  suddenDeathIn: number; // s avant la mort subite (≤ 0 : en cours)
+  hq: { red: number; blue: number }; // pv 0..1
+  me: ClaudeSide;
+  foe: ClaudeSide;
+  habits: {
+    strikes: number;
+    helis: number;
+    barracks: number;
+    forwardBarracks: number;
+    factories: number;
+    turrets: number;
+    upgrades: Record<string, number>;
+    favoredCol: number;
+    recent: string[];
+  };
+  spent: Record<Spend, number>;
+  doctrine: Genome;
+}
+
+/** Une doctrine passée et ce qu'elle a donné (mémoire courte du général). */
 export interface ClaudeJournalEntry {
   t: number;
-  axe: number;
-  reserve: number;
+  analyse: string;
+  changes: string;
+  shareBefore: number;
+  shareAfter: number;
+}
+
+/** Réponse du général : la doctrine est partielle/nullable, le client la borne et la fusionne. */
+export interface ClaudeAdvice {
+  analyse: string;
   message: string;
-  faits: string[];
-  ignores: string[];
-  partAvant: number;
-  partApres: number;
-  orAvant: number;
-  orApres: number;
+  doctrine: { w?: Partial<Record<Spend, number | null>> } & Partial<Record<Exclude<keyof Genome, "w">, number | null>>;
 }
 
 export interface ClaudeTurnResult {
-  plan: ClaudePlan;
+  advice: ClaudeAdvice;
   latencyMs: number;
   model?: string;
 }
@@ -142,21 +130,21 @@ export async function pingClaude(password: string): Promise<void> {
   }
 }
 
-/** Un tour du général : l'état visible + le journal → un plan validé. */
-export async function askClaudeTurn(
+/** Un rapport au général → son conseil (doctrine + réplique). */
+export async function askClaudeAdvice(
   password: string,
-  state: ClaudeState,
+  report: ClaudeReport,
   journal: ClaudeJournalEntry[]
 ): Promise<ClaudeTurnResult> {
-  const fn = httpsCallable<{ password: string; state: ClaudeState; journal: ClaudeJournalEntry[] }, ClaudeTurnResult>(
+  const fn = httpsCallable<{ password: string; report: ClaudeReport; journal: ClaudeJournalEntry[] }, ClaudeTurnResult>(
     functions,
     "claudeTurn",
     { timeout: 50000 }
   );
   try {
-    const res = await fn({ password, state, journal: journal.slice(-6) });
+    const res = await fn({ password, report, journal: journal.slice(-5) });
     const r = res.data;
-    if (!r || !r.plan || !Array.isArray(r.plan.ordres)) throw new ClaudeError("unknown", "plan vide");
+    if (!r || !r.advice || typeof r.advice.doctrine !== "object") throw new ClaudeError("unknown", "conseil vide");
     return r;
   } catch (e) {
     throw toClaudeError(e);

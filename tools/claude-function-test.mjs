@@ -1,10 +1,10 @@
 /**
  * Test Node du module pur du général Claude (functions/claude-general.js) :
- * prompt construit depuis un état réaliste, schéma de sortie, épuration du
- * plan reçu. Sans réseau : un faux client Anthropic rend un JSON canné.
+ * prompt construit depuis un rapport réaliste, schéma de sortie, épuration du
+ * conseil reçu. Sans réseau : un faux client Anthropic rend un JSON canné.
  *
  * Avec ANTHROPIC_API_KEY dans l'environnement (ou `--live`), fait en plus UN
- * vrai appel au modèle sur l'état d'exemple et affiche le plan + la latence.
+ * vrai appel au modèle sur le rapport d'exemple et affiche le conseil + la latence.
  *
  * Usage : node tools/claude-function-test.mjs [--live]
  */
@@ -12,165 +12,100 @@ import { createRequire } from "module";
 import assert from "assert/strict";
 
 const require = createRequire(import.meta.url);
-const { buildPrompt, sanitizePlan, askGeneral, PLAN_SCHEMA, GRID_W, GRID_H } = require("../functions/claude-general.js");
+const { buildPrompt, sanitizeAdvice, askGeneral, DOCTRINE_SCHEMA, SPEND, GENES } = require("../functions/claude-general.js");
 
-/* ---- un état plausible à 95 s de jeu ---------------------------------- */
-const map = [];
-for (let r = 0; r < GRID_H; r++) {
-  let line = "";
-  for (let c = 0; c < GRID_W; c++) {
-    const water = (c === 0 && (r < 3 || r > 18)) || (c === 15 && (r < 2 || r > 19));
-    line += water ? "~" : r < 11 ? "r" : "b";
-  }
-  map.push(line);
-}
-const put = (r, c, ch) => (map[r] = map[r].slice(0, c) + ch + map[r].slice(c + 1));
-put(2, 8, "Q");
-put(4, 4, "C");
-put(4, 8, "C");
-put(4, 12, "C");
-put(3, 6, "T");
-put(3, 10, "T");
-put(19, 8, "q");
-put(17, 4, "c");
-put(17, 8, "c");
-put(17, 12, "c");
-put(18, 6, "t");
-put(18, 10, "t");
-put(16, 7, "u");
-put(9, 3, "$");
-
-const state = {
-  turn: 7,
-  t: 95,
-  gold: 143,
-  share: 0.52,
-  axis: 8,
-  reserve: 120,
-  levels: { red: { soldiers: 2, tanks: 1, turrets: 1 }, blue: { soldiers: 2, tanks: 1, turrets: 2 } },
-  upgradeCost: { soldiers: 181, tanks: 120, turrets: 100 },
-  units: { red: { soldiers: 31, tanks: 0 }, blue: { soldiers: 36, tanks: 3 } },
-  helis: { red: 0, blue: 0 },
-  hq: { red: 1, blue: 1 },
-  map,
-  cols: {
-    blueFront: [22, 12, 11, 11, 10, 10, 9, 9, 10, 11, 11, 12, 12, 12, 13, 22],
-    red: [0, 1, 2, 3, 2, 4, 5, 3, 2, 2, 1, 2, 1, 1, 0, 0],
-    blue: [0, 0, 2, 3, 5, 6, 8, 5, 2, 1, 1, 1, 2, 1, 0, 0],
-  },
-  redBuildings: [
-    { type: "hq", c: 8, r: 2, hp: 1, building: false },
-    { type: "barracks", c: 4, r: 4, hp: 1, building: false },
-    { type: "barracks", c: 8, r: 4, hp: 0.6, building: false },
-    { type: "barracks", c: 12, r: 4, hp: 1, building: false },
-    { type: "turret", c: 6, r: 3, hp: 1, building: false },
-    { type: "turret", c: 10, r: 3, hp: 1, building: false },
-  ],
-  blueBuildings: [
-    { type: "hq", c: 8, r: 19, hp: 1, building: false },
-    { type: "barracks", c: 4, r: 17, hp: 1, building: false },
-    { type: "barracks", c: 8, r: 17, hp: 1, building: false },
-    { type: "barracks", c: 12, r: 17, hp: 1, building: false },
-    { type: "turret", c: 6, r: 18, hp: 1, building: false },
-    { type: "turret", c: 10, r: 18, hp: 1, building: false },
-    { type: "factory", c: 7, r: 16, hp: 0.5, building: true },
-  ],
-  habits: { strikes: 2, helis: 0, upSoldier: 1, upTank: 0, upTurret: 1, favoredCol: 6 },
-  deepestBlueRow: 9,
-  pending: ["usine (5,5)"],
-  lieutenant: "",
+/* ---- un rapport plausible à 95 s de jeu ------------------------------- */
+const ups = (s, t) => ({ soldier: { atk: s, def: s }, tank: { atk: t, def: 1 }, turret: { atk: 1, def: 1 }, heli: { atk: 1, def: 1 } });
+const doctrine = {
+  w: { barracks: 2, factory: 1.5, turret: 1, strike: 1, heli: 0.7, soldierAtk: 1.2, soldierDef: 0.8, tankAtk: 0.5, tankDef: 0.5, turretAtk: 0.3, turretDef: 0.2, heliAtk: 0.2, heliDef: 0.2 },
+  bank: 40, strikeMin: 8, turretShare: 0.47, heliMaxAA: 1, backMin: 2, backSpan: 3, spread: 3, axAdvance: 1.2, axEnemy: 0.6,
+  axisHold: 3, defendRadius: 240, ecoUntil: 60, ecoBoost: 1.5, vsTanks: 1.5, vsMass: 1.5, vsAir: 2, maxBarracks: 10, maxFactories: 4, maxTurrets: 8,
 };
-const journal = [
-  {
-    t: 88,
-    axe: 6,
-    reserve: 120,
-    message: "On tient la gauche.",
-    faits: ["caserne (5,6)", "frappe groupe"],
-    ignores: ["helico colonne 2 (3 helicos deja en vol)"],
-    partAvant: 0.5,
-    partApres: 0.52,
-    orAvant: 210,
-    orApres: 60,
-  },
-];
+const report = {
+  turn: 4,
+  t: 95,
+  share: 0.44,
+  trend: [0.5, 0.49, 0.47, 0.46, 0.44],
+  gold: 133,
+  suddenDeathIn: 265,
+  hq: { red: 1, blue: 1 },
+  me: { barracks: 5, factories: 1, turrets: 2, frontTurrets: 0, soldiers: 88, tanks: 6, helis: 0, ups: ups(2, 1) },
+  foe: { barracks: 7, factories: 0, turrets: 2, frontTurrets: 0, soldiers: 141, tanks: 0, helis: 0, ups: ups(3, 1) },
+  habits: { strikes: 0, helis: 0, barracks: 4, forwardBarracks: 3, factories: 0, turrets: 0, upgrades: { soldierAtk: 2, soldierDef: 2 }, favoredCol: 3, recent: ["t=71 barracks (2,12)", "t=80 amelioration soldierDef", "t=88 barracks (13,12)"] },
+  spent: { barracks: 118, factory: 120, soldierAtk: 60, soldierDef: 60 },
+  doctrine,
+};
+const journal = [{ t: 52, analyse: "Il masse des soldats et monte leurs niveaux.", changes: "soldierAtk 1.2→2.5", shareBefore: 0.49, shareAfter: 0.46 }];
 
 /* ---- prompt -------------------------------------------------------------- */
-const prompt = buildPrompt(state, journal);
-assert.ok(prompt.includes("Tour 7"), "tour");
-assert.ok(prompt.includes(" 2   ~rrrrrrrQrrrrrrr"), "carte avec QG rouge");
-assert.ok(prompt.includes("Front bleu"), "colonnes");
-assert.ok(prompt.includes("usine(7,16) 50% chantier"), "bâtiment bleu en chantier");
-assert.ok(prompt.includes("helicos deja en vol"), "journal");
-assert.ok(prompt.includes("usine (5,5)"), "ordres en attente");
-console.log(prompt);
-console.log(`\n[prompt] ${prompt.length} caractères (~${Math.round(prompt.length / 3.2)} tokens)\n`);
+const prompt = buildPrompt(report, journal);
+assert.match(prompt, /Rapport 4 — 95 s/);
+assert.match(prompt, /mort subite dans 265 s/);
+assert.match(prompt, /rouge 44% \/ bleu 56%/);
+assert.match(prompt, /4 casernes \(dont 3 à moins de 2 rangées de son front\)/);
+assert.match(prompt, /soldierDef ×2/);
+assert.match(prompt, /soldats 3\/3/); // niveaux force/défense du joueur
+assert.match(prompt, /strikeMin : 3 à 30/); // bornes rappelées au modèle
+assert.match(prompt, /soldierAtk 1.2→2.5/); // journal
+assert.ok(!/or du joueur|blueGold/.test(prompt), "le prompt ne doit rien dire de l'or du joueur");
+assert.match(buildPrompt({ ...report, suddenDeathIn: -5 }, []), /MORT SUBITE EN COURS/);
+assert.match(buildPrompt({}, null), /Premier rapport/); // rapport vide : ne plante pas
+console.log(`[buildPrompt] OK — ${prompt.length} caractères`);
 
-/* ---- épuration du plan --------------------------------------------------- */
-const dirty = {
+/* ---- schéma : strict, tous les champs requis -------------------------------- */
+const dp = DOCTRINE_SCHEMA.properties.doctrine;
+assert.equal(DOCTRINE_SCHEMA.additionalProperties, false);
+assert.deepEqual(dp.properties.w.required, SPEND);
+for (const k of Object.keys(GENES)) assert.ok(dp.required.includes(k), `gène ${k} absent du schéma`);
+console.log("[schema] OK");
+
+/* ---- épuration : bornes, champs illisibles → null (= inchangé côté client) -- */
+const clean = sanitizeAdvice({
   analyse: "x".repeat(900),
-  message: "  On   frappe\n le centre !  ",
-  axe: 27,
-  reserve: -40,
-  ordres: [
-    { type: "frappe", col: 99, ligne: -5, cible: "colonne", quoi: "tanks" },
-    { type: "caserne", col: 5, ligne: 6, cible: "groupe", quoi: "soldats" },
-    { type: "amelioration", col: 1, ligne: 1, cible: "aucune", quoi: "aucune" },
-    { type: "helico", col: -1, ligne: -1, cible: "aucune", quoi: "aucune" },
-    { type: "frappe", col: -1, ligne: -1, cible: "batiment", quoi: "aucune" },
-    { type: "bombe", col: 1, ligne: 1 },
-    { type: "usine", col: 2, ligne: 2, cible: "aucune", quoi: "aucune" },
-  ],
-};
-const clean = sanitizePlan(dirty);
+  message: "  Vos   casernes   avancées\nvont brûler.  ",
+  doctrine: { w: { strike: 99, heli: -3, barracks: "abc" }, bank: 5000, strikeMin: "5", heliMaxAA: null, intrus: 12 },
+});
 assert.equal(clean.analyse.length, 400);
-assert.equal(clean.message, "On frappe le centre !");
-assert.equal(clean.axe, 15);
-assert.equal(clean.reserve, 0);
-assert.equal(clean.ordres.length, 4, "4 ordres max, amélioration vide et type inconnu écartés");
-assert.deepEqual(clean.ordres[0], { type: "frappe", col: 15, ligne: -1, cible: "colonne", quoi: "aucune" });
-assert.deepEqual(clean.ordres[1], { type: "caserne", col: 5, ligne: 6, cible: "aucune", quoi: "aucune" });
-assert.deepEqual(clean.ordres[2], { type: "helico", col: 8, ligne: -1, cible: "aucune", quoi: "aucune" });
-assert.deepEqual(clean.ordres[3], { type: "frappe", col: -1, ligne: -1, cible: "groupe", quoi: "aucune" });
-assert.deepEqual(sanitizePlan(null), { analyse: "", message: "", axe: 8, reserve: 100, ordres: [] });
-console.log("[sanitizePlan] OK");
+assert.equal(clean.message, "Vos casernes avancées vont brûler.");
+assert.equal(clean.doctrine.w.strike, 6);
+assert.equal(clean.doctrine.w.heli, 0);
+assert.equal(clean.doctrine.w.barracks, null);
+assert.equal(clean.doctrine.bank, 200);
+assert.equal(clean.doctrine.strikeMin, 5);
+assert.equal(clean.doctrine.heliMaxAA, null); // absent = inchangé, pas 0
+assert.ok(!("intrus" in clean.doctrine));
+assert.equal(sanitizeAdvice(null).message, "");
+console.log("[sanitizeAdvice] OK");
 
 /* ---- askGeneral avec un faux client ------------------------------------- */
 const canned = {
-  analyse: "Le bleu masse à gauche (colonnes 4-7) avec une usine en chantier. Je frappe le paquet, je pousse à droite.",
-  message: "Votre usine ne verra pas le jour.",
-  axe: 12,
-  reserve: 120,
-  ordres: [
-    { type: "frappe", col: 7, ligne: 16, cible: "batiment", quoi: "aucune" },
-    { type: "tourelle", col: 6, ligne: 7, cible: "aucune", quoi: "aucune" },
-    { type: "amelioration", col: -1, ligne: -1, cible: "aucune", quoi: "tourelles" },
-  ],
+  analyse: "Masse de soldats niveau 3 avec casernes avancées : je frappe ses chantiers et je suis ses niveaux.",
+  message: "Vos casernes avancées vont brûler.",
+  doctrine: { ...doctrine, w: { ...doctrine.w, strike: 3, soldierAtk: 2.5 }, strikeMin: 5 },
 };
 let captured = null;
 const fake = {
   messages: {
     create: async (params) => {
       captured = params;
-      return { stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify(canned) }], usage: { input_tokens: 1900, output_tokens: 180 } };
+      return { stop_reason: "end_turn", content: [{ type: "text", text: JSON.stringify(canned) }], usage: { input_tokens: 2400, output_tokens: 260 } };
     },
   },
 };
-const out = await askGeneral(fake, { state, journal, model: "claude-opus-5-5", effort: "medium" });
+const out = await askGeneral(fake, { report, journal, model: "claude-opus-5-5", effort: "low" });
 assert.equal(captured.model, "claude-opus-5-5");
-assert.equal(captured.output_config.effort, "medium");
+assert.equal(captured.output_config.effort, "low");
 assert.equal(captured.output_config.format.type, "json_schema");
-assert.equal(captured.output_config.format.schema, PLAN_SCHEMA);
+assert.equal(captured.output_config.format.schema, DOCTRINE_SCHEMA);
 assert.equal(captured.system[0].cache_control.type, "ephemeral");
-assert.equal(out.plan.axe, 12);
-assert.equal(out.plan.ordres.length, 3);
-assert.equal(out.plan.ordres[2].quoi, "tourelles");
-console.log("[askGeneral/fake] OK —", JSON.stringify(out.plan));
+assert.equal(out.advice.doctrine.w.strike, 3);
+assert.equal(out.advice.doctrine.strikeMin, 5);
+console.log("[askGeneral/fake] OK —", out.advice.message);
 
 const refusing = { messages: { create: async () => ({ stop_reason: "refusal", stop_details: { explanation: "test" }, content: [] }) } };
-await assert.rejects(() => askGeneral(refusing, { state, journal }), /refusal/);
+await assert.rejects(() => askGeneral(refusing, { report, journal }), /refusal/);
 const garbage = { messages: { create: async () => ({ stop_reason: "max_tokens", content: [{ type: "text", text: "{not json" }] }) } };
-await assert.rejects(() => askGeneral(garbage, { state, journal }), /illisible/);
+await assert.rejects(() => askGeneral(garbage, { report, journal }), /illisible/);
 console.log("[askGeneral/erreurs] OK");
 
 /* ---- appel réel (optionnel) ---------------------------------------------- */
@@ -179,7 +114,7 @@ if (process.argv.includes("--live") || process.env.ANTHROPIC_API_KEY) {
   const client = new Anthropic();
   for (const effort of ["low", "medium"]) {
     const t0 = Date.now();
-    const live = await askGeneral(client, { state, journal, model: process.env.CLAUDE_MODEL || "claude-opus-5-5", effort });
+    const live = await askGeneral(client, { report, journal, model: process.env.CLAUDE_MODEL || "claude-opus-5-5", effort });
     console.log(`\n[live ${effort}] ${Date.now() - t0} ms — usage ${JSON.stringify(live.usage)}`);
     console.log(JSON.stringify(live.raw, null, 2));
   }

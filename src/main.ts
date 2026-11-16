@@ -1,5 +1,6 @@
 import { Board } from "@fuwu-yuan/bgew";
 import { BAL } from "./balance";
+import { BASE_GENOME, Commander, GENE_BOUNDS, sanitizeGenome, SPEND, WEIGHT_BOUNDS } from "./commander";
 import { COLORS, GAME_NAME, GAME_VERSION, VIEW_H, VIEW_W } from "./globals";
 import { loadSprites } from "./sprites";
 import { preloadMenuData } from "./firebase";
@@ -148,7 +149,10 @@ const skipSplash = params.get("splash") === "off" || !!params.get("join");
 board.step = skipSplash ? menu : splash;
 
 /* Test hook for the headless smoke test (harmless in production) */
-(window as unknown as Record<string, unknown>).__bgewwar = { board, steps: { splash, menu, play, lobby, salon, end }, balance: BAL };
+(window as unknown as Record<string, unknown>).__bgewwar = { board, steps: { splash, menu, play, lobby, salon, end }, balance: BAL,
+  // IA locale : exposée pour le banc d'essai et l'entraînement (tools/)
+  ai: { Commander, BASE_GENOME, sanitizeGenome, SPEND, GENE_BOUNDS, WEIGHT_BOUNDS },
+};
 
 board.canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 

@@ -1,13 +1,14 @@
 /**
  * Difficulté de l'IA solo — réglages + persistance du choix du joueur.
  *
- * Règle d'or : l'IA NE TRICHE JAMAIS. Aucun niveau ne lui donne plus d'or,
- * plus de revenus ou des unités gratuites que le joueur n'aurait pas.
- * Chaque cran est soit un handicap (or de départ réduit, réflexion lente,
- * hésitations), soit une décision plus intelligente (anticipation des
- * frappes, lecture des habitudes du joueur, combos économisés). Le revenu
- * de base est identique des deux côtés à tous les niveaux.
+ * Règle d'or : l'IA NE TRICHE JAMAIS. Elle joue par le même chemin de
+ * commandes qu'un humain (src/commander.ts) : même or, mêmes prix, mêmes
+ * validations, aucune unité gratuite. Chaque cran est soit un handicap (or
+ * de départ réduit, réflexion lente, hésitations, doctrine de débutant),
+ * soit une meilleure doctrine (celle issue de l'auto-jeu, src/trained.ts).
  */
+import { BASE_GENOME, Genome, sanitizeGenome } from "./commander";
+import { TRAINED_GENOME } from "./trained";
 
 export type Difficulty = "easy" | "medium" | "hard" | "insane" | "claude";
 export const DIFFICULTIES: Difficulty[] = ["easy", "medium", "hard", "insane", "claude"];
@@ -22,42 +23,18 @@ export interface AiTuning {
   label: string;
   /** Accent du bouton dans le menu. */
   color: string;
-  /** Or de départ de l'IA — toujours ≤ aux 80 du joueur (handicap, jamais bonus). */
+  /** Or de départ de l'IA sur la base historique de 80 — toujours ≤ au joueur (handicap, jamais bonus). */
   startGold: number;
   /** s avant que l'IA ne commence à dépenser (laisse l'initiative au joueur). */
   grace: number;
-  /** s entre deux plans — sa vitesse de réflexion. */
+  /** s entre deux réflexions du commandant (au plus un achat par réflexion). */
   brainEvery: number;
-  /** Ordres qu'un même plan peut enchaîner (son "APM"). */
-  actionsPerPlan: number;
-  /** Chance qu'un plan hésite et ne fasse rien (bas niveaux). */
+  /** Chance qu'une réflexion hésite et ne fasse rien (bas niveaux). */
   skipChance: number;
-  /** Chance que l'axe d'attaque dérive au hasard au lieu de la meilleure colonne. */
-  axisJitter: number;
-  /** Or gardé en banque pour frapper/réagir : les constructions n'y touchent
-   *  pas. C'est LE levier de force — les frappes gagnent les guerres, et une
-   *  IA qui vide sa banque dans des bâtiments de front ne frappe jamais. */
-  bank: number;
-  /** Équivalents-soldats groupés (tank = 2.5) pour qu'une frappe vaille 100 d'or. */
-  strikeMinPack: number;
-  /** Vise devant un groupe en marche (compense la mèche de 0.9 s). */
-  strikeLead: boolean;
-  /** Lit les habitudes du joueur (ordres visibles à l'écran) et les contre. */
-  adapt: boolean;
-  /** Économise pour des combos frappe + hélico + bascule d'axe. */
-  combo: boolean;
-  /** Chance par plan de lancer un hélico quand la DCA adverse est faible. */
-  heliChance: number;
-  /** s entre deux sondages de menace sur son QG (réflexe défensif). */
-  panicEvery: number;
-  /** Soldats par garnison d'urgence — payés 10 d'or pièce, jamais gratuits. */
-  garrison: number;
-  maxTurrets: number;
-  maxFactories: number;
-  /** Plafond de casernes : base, puis +1 toutes les rampEvery secondes. */
-  barracksBase: number;
-  barracksRampEvery: number;
-  barracksMax: number;
+  /** Doctrine du commandant : celle issue de l'auto-jeu, ou la doctrine de base. */
+  genome: "trained" | "base";
+  /** Retouches de doctrine propres au niveau (ex. le niveau facile n'utilise ni frappe ni hélico). */
+  tweak?: (g: Genome) => void;
   /** Niveau verrouillé par mot de passe (menu). */
   locked?: boolean;
 }
@@ -68,124 +45,65 @@ export const AI_TUNING: Record<Difficulty, AiTuning> = {
     color: "#7fe08a",
     startGold: 30,
     grace: 14,
-    brainEvery: 5,
-    actionsPerPlan: 1,
-    skipChance: 0.35,
-    axisJitter: 0.55,
-    bank: 0,
-    strikeMinPack: 8,
-    strikeLead: false,
-    adapt: false,
-    combo: false,
-    heliChance: 0.15,
-    panicEvery: 1.1,
-    garrison: 3,
-    maxTurrets: 3,
-    maxFactories: 1,
-    barracksBase: 3,
-    barracksRampEvery: 150,
-    barracksMax: 4,
+    brainEvery: 7,
+    skipChance: 0.4,
+    genome: "base",
+    // un débutant : ni frappe ni hélico, peu de niveaux, tout sur le front
+    tweak: (g) => {
+      g.w.strike = 0;
+      g.w.heli = 0;
+      g.w.soldierAtk *= 0.5;
+      g.w.soldierDef *= 0.5;
+      g.backMin = 0;
+      g.vsTanks = g.vsMass = g.vsAir = 1;
+    },
   },
   medium: {
     label: "MOYEN",
     color: "#ffe27a",
     startGold: 60,
     grace: 8,
-    brainEvery: 3,
-    actionsPerPlan: 1,
-    skipChance: 0.12,
-    axisJitter: 0.35,
-    bank: 30,
-    strikeMinPack: 5,
-    strikeLead: false,
-    adapt: false,
-    combo: false,
-    heliChance: 0.38,
-    panicEvery: 0.4,
-    garrison: 5,
-    maxTurrets: 6,
-    maxFactories: 2,
-    barracksBase: 4,
-    barracksRampEvery: 90,
-    barracksMax: 6,
+    brainEvery: 4,
+    skipChance: 0.15,
+    genome: "base",
   },
   hard: {
     label: "DIFFICILE",
     color: "#ffb13d",
     startGold: 80,
-    grace: 5,
-    brainEvery: 1.6,
-    actionsPerPlan: 2,
-    skipChance: 0.03,
-    axisJitter: 0.15,
-    bank: 60,
-    strikeMinPack: 5,
-    strikeLead: true,
-    adapt: true,
-    combo: false,
-    heliChance: 0.5,
-    panicEvery: 0.35,
-    garrison: 6,
-    maxTurrets: 8,
-    maxFactories: 3,
-    barracksBase: 5,
-    barracksRampEvery: 75,
-    barracksMax: 7,
+    grace: 4,
+    brainEvery: 1.5,
+    skipChance: 0,
+    genome: "trained",
   },
   insane: {
     label: "IMBATTABLE",
     color: "#ff6a5a",
     startGold: 80,
-    grace: 2,
-    brainEvery: 0.8,
-    actionsPerPlan: 3,
+    grace: 0,
+    brainEvery: 0.5,
     skipChance: 0,
-    axisJitter: 0.05,
-    bank: 70,
-    strikeMinPack: 4,
-    strikeLead: true,
-    adapt: true,
-    combo: true,
-    heliChance: 0.6,
-    panicEvery: 0.25,
-    garrison: 8,
-    maxTurrets: 10,
-    maxFactories: 4,
-    barracksBase: 6,
-    barracksRampEvery: 60,
-    barracksMax: 9,
+    genome: "trained",
   },
-  // Le général est Claude : ces réglages ne servent qu'au LIEUTENANT local
-  // (réflexes du QG, visée des frappes, repli hors-ligne) — même fair-play.
+  // Le commandant entraîné joue seul, au rythme du niveau imbattable ; le
+  // général Claude ajuste sa doctrine en cours de partie (voir claude-general.ts).
   claude: {
     label: "CLAUDE",
     color: "#d97757",
     startGold: 80,
     grace: 0,
-    brainEvery: 3,
-    actionsPerPlan: 3,
+    brainEvery: 0.5,
     skipChance: 0,
-    axisJitter: 0,
-    bank: 60,
-    strikeMinPack: 4,
-    strikeLead: true,
-    adapt: true,
-    combo: true,
-    heliChance: 0.5,
-    panicEvery: 0.25,
-    garrison: 8,
-    maxTurrets: 10,
-    maxFactories: 4,
-    barracksBase: 6,
-    barracksRampEvery: 60,
-    barracksMax: 9,
+    genome: "trained",
     locked: true,
   },
 };
 
-/** Casernes autorisées à `elapsed` secondes de jeu. */
-export function barracksCap(t: AiTuning, elapsed: number): number {
-  return Math.min(t.barracksMax, t.barracksBase + Math.floor(elapsed / t.barracksRampEvery));
+/** Doctrine de départ du commandant pour ce niveau (copie indépendante). */
+export function genomeFor(t: AiTuning): Genome {
+  const g = sanitizeGenome(t.genome === "trained" ? TRAINED_GENOME : BASE_GENOME);
+  t.tweak?.(g);
+  return sanitizeGenome(g);
 }
 
 const DIFF_KEY = "bgew-war.difficulty";

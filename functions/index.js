@@ -155,9 +155,9 @@ exports.submitMatchResult = onCall(async (request) => {
  *
  * `claudeTurn` est un callable protégé par MOT DE PASSE (le niveau est
  * privé pour le moment) : la clé API ne quitte jamais le serveur, et le mot
- * de passe borne la facture. Le client envoie l'état du jeu tel que le
- * joueur le voit ; le modèle répond par des intentions (axe, réserve,
- * 0-4 ordres) que le lieutenant local exécute avec les règles communes.
+ * de passe borne la facture. Le client envoie un rapport de bataille (ce
+ * que le joueur voit + ce que le joueur a fait) ; le modèle répond par une
+ * DOCTRINE (réglages du commandant local, qui joue seul en continu).
  *
  * Secrets (firebase functions:secrets:set) : ANTHROPIC_API_KEY,
  * CLAUDE_LEVEL_PASSWORD. Réglages (.env) : CLAUDE_MODEL, CLAUDE_EFFORT,
@@ -199,9 +199,9 @@ exports.claudeTurn = onCall(
     // Le menu vérifie le mot de passe avant de lancer la partie : pas d'appel modèle.
     if (d.ping === true) return { ok: true };
 
-    const state = d.state && typeof d.state === "object" ? d.state : null;
-    if (!state || !Array.isArray(state.map)) throw new HttpsError("invalid-argument", "state");
-    const journal = Array.isArray(d.journal) ? d.journal.slice(-6) : [];
+    const report = d.report && typeof d.report === "object" ? d.report : null;
+    if (!report || typeof report.doctrine !== "object") throw new HttpsError("invalid-argument", "report");
+    const journal = Array.isArray(d.journal) ? d.journal.slice(-5) : [];
 
     // Coupe-circuit budget : N appels par jour, tous joueurs confondus.
     const cap = Math.max(1, Number(process.env.CLAUDE_DAILY_CALLS) || 3000);
@@ -211,11 +211,11 @@ exports.claudeTurn = onCall(
     if (calls >= cap) throw new HttpsError("resource-exhausted", "Quota du jour atteint.");
 
     const model = process.env.CLAUDE_MODEL || "claude-opus-5-5";
-    const effort = process.env.CLAUDE_EFFORT || "medium";
+    const effort = process.env.CLAUDE_EFFORT || "low";
     const t0 = Date.now();
     let out;
     try {
-      out = await askGeneral(anthropic(), { state, journal, model, effort });
+      out = await askGeneral(anthropic(), { report, journal, model, effort });
     } catch (e) {
       console.error("claudeTurn failed", e && e.message);
       throw new HttpsError("unavailable", `Général injoignable : ${e && e.message ? String(e.message).slice(0, 120) : "erreur"}`);
@@ -235,7 +235,7 @@ exports.claudeTurn = onCall(
         { merge: true }
       )
       .catch((e) => console.error("claudeUsage write failed", e && e.message));
-    return { plan: out.plan, latencyMs, model, usage: u };
+    return { advice: out.advice, latencyMs, model, usage: u };
   }
 );
 

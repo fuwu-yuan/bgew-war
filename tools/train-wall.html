@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <title>BGEW WAR — entraînement</title>
+  <style>
+    @font-face {
+      font-family: 'Black Ops One';
+      src: url('/assets/fonts/blackops.woff2') format('woff2');
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; background: #060d1a; color: #dbe9f7; font-family: 'Black Ops One', sans-serif; overflow: hidden; }
+    #head {
+      height: 30px; line-height: 30px; padding: 0 14px; font-size: 14px; letter-spacing: 1px;
+      background: linear-gradient(90deg, #132b45, #0a1428); border-bottom: 1px solid #23486e;
+      display: flex; justify-content: space-between; white-space: nowrap;
+    }
+    #head b { color: #ffd95e; font-weight: 400; }
+    #grid { display: grid; height: calc(100% - 30px); gap: 3px; padding: 3px; }
+    .cell { position: relative; background: #0a1428; border: 1px solid #1b3350; overflow: hidden; display: flex; flex-direction: column; min-height: 0; }
+    .cap {
+      height: 20px; line-height: 20px; font-size: 11px; padding: 0 6px; display: flex; justify-content: space-between;
+      background: #0d1c30; white-space: nowrap; overflow: hidden;
+    }
+    .cap .r { color: #ff8b7a; }
+    .cap .b { color: #6fc1ff; }
+    .cap .v { color: #7d93a8; }
+    .cell iframe { flex: 1; width: 100%; min-height: 0; border: 0; display: block; }
+    .cell.won-r { border-color: #e8533f; }
+    .cell.won-b { border-color: #3a9ade; }
+    .flash { position: absolute; left: 0; right: 0; top: 45%; text-align: center; font-size: 20px; text-shadow: 0 2px 6px #000; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <div id="head"><span id="hl">BGEW WAR — entraînement par auto-jeu</span><span id="hr"></span></div>
+  <div id="grid"></div>
+  <script>
+    // Mur de batailles : une grille d'iframes, chacune sur son propre sous-domaine
+    // (wN.localhost) pour que Chrome donne à chaque bataille son propre processus.
+    const q = new URLSearchParams(location.search);
+    const cols = Number(q.get("cols") || 5);
+    const rows = Number(q.get("rows") || 2);
+    const first = Number(q.get("first") || 0); // index global de la première cellule
+    const grid = document.getElementById("grid");
+    grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+    grid.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
+    for (let k = 0; k < cols * rows; k++) {
+      const cell = document.createElement("div");
+      cell.className = "cell";
+      cell.id = `cell${k}`;
+      cell.innerHTML = `<div class="cap"><span class="r"></span><span class="v">en attente</span><span class="b"></span></div><div class="flash"></div>`;
+      const f = document.createElement("iframe");
+      f.src = `http://w${first + k}.localhost:${location.port}/?firebase=off&splash=off`;
+      cell.appendChild(f);
+      grid.appendChild(cell);
+    }
+    /** Appelé par l'entraîneur (train.mjs). */
+    window.wall = {
+      caption(k, red, blue, mid) {
+        const c = document.getElementById(`cell${k}`);
+        c.className = "cell";
+        c.querySelector(".r").textContent = red;
+        c.querySelector(".b").textContent = blue;
+        c.querySelector(".v").textContent = mid;
+        c.querySelector(".flash").textContent = "";
+      },
+      result(k, winner, text) {
+        const c = document.getElementById(`cell${k}`);
+        c.classList.add(winner === 1 ? "won-r" : winner === 2 ? "won-b" : "x");
+        const fl = c.querySelector(".flash");
+        fl.textContent = text;
+        fl.style.color = winner === 1 ? "#ff8b7a" : winner === 2 ? "#6fc1ff" : "#dbe9f7";
+      },
+      head(left, right) {
+        document.getElementById("hl").innerHTML = left;
+        document.getElementById("hr").innerHTML = right;
+      },
+    };
+  </script>
+</body>
+</html>

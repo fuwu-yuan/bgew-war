@@ -134,7 +134,7 @@ const errors = [];
     return {
       ended: play.ended,
       redBuildings: play.buildings.filter((b) => b.faction === 1 && !b.dead).length,
-      redLevel: play.levels[1],
+      redLevel: play.ups[1].soldier.atk + play.ups[1].soldier.def - 1,
       redGold: Math.round(play.gold[1]),
     };
   });

@@ -12,7 +12,10 @@
     "test": "npm run build && node tools/smoke-test.mjs",
     "server": "node tools/server.mjs",
     "test:multi": "npm run build && node tools/multi-test.mjs",
-    "test:claude": "npm run build && node tools/claude-test.mjs && node tools/claude-function-test.mjs"
+    "test:claude": "npm run build && node tools/claude-test.mjs && node tools/claude-function-test.mjs",
+    "train": "npm run build && node tools/train.mjs",
+    "train:show": "npm run build && node tools/train.mjs --show",
+    "lab": "npm run build && node tools/balance-lab.mjs"
   },
   "keywords": [
     "game",

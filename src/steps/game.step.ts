@@ -13,8 +13,9 @@ import {
   VIEW_W,
   enemyOf,
 } from "../globals";
-import { clamp, pick, rand, randInt, sha256, TAU } from "../utils";
+import { clamp, pick, rand, sha256, TAU } from "../utils";
 import { seedSim, srand } from "../sim-rng";
+import { BASE_GENOME, BattleView, Commander, GENE_BOUNDS, Genome, sanitizeGenome, SPEND } from "../commander";
 import { BAL, buildCost, BuildKind, upgradeCost, UpgradeKind, UpgradeStat, UpLevels, UPGRADE_KINDS } from "../balance";
 import { TileMap } from "../entities/tilemap";
 import { Bullet, Soldier, Tank, Unit } from "../entities/units";
@@ -28,15 +29,14 @@ import { CmdMsg, EndMsg, FrameMsg, GameMsg, gameData, InitMsg, IpMsg, MultiData,
 import { track, trackScreen } from "../analytics";
 import { toggleMute } from "../sound";
 import { currentUser, displayName } from "../firebase";
-import { AI_TUNING, AiTuning, barracksCap, CLAUDE_DIFFICULTY, DIFFICULTIES, Difficulty } from "../ai";
+import { AI_TUNING, AiTuning, CLAUDE_DIFFICULTY, DIFFICULTIES, Difficulty, genomeFor } from "../ai";
 import {
-  askClaudeTurn,
-  ClaudeBuildingInfo,
+  askClaudeAdvice,
+  ClaudeAdvice,
   ClaudeError,
   ClaudeJournalEntry,
-  ClaudeOrder,
-  ClaudePlan,
-  ClaudeState,
+  ClaudeReport,
+  ClaudeSide,
   loadClaudePassword,
 } from "../claude-general";
 
@@ -53,7 +53,7 @@ function parseUpgradeButton(id: string): { kind: UpgradeKind; stat: UpgradeStat 
   return m ? { kind: m[1] as UpgradeKind, stat: m[2] as UpgradeStat } : null;
 }
 
-const BRAIN_EVERY = 3; // s — red AI thinks (solo only)
+const BOT_EVERY = 3; // s — the test bot (?bot=1) thinks
 const INCOME_EVERY = 1; // s
 const SNAP_EVERY = 0.1; // s — host → guest snapshots (legacy; unused under lockstep)
 
@@ -77,65 +77,48 @@ function newMatchId(): string {
   if (c && typeof c.randomUUID === "function") return c.randomUUID();
   return `m-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
 }
-const AI_GRACE = 6; // s before the test bot (?bot=1) starts spending
-const GARRISON_UNIT_COST = 10; // gold per emergency soldier — the AI PAYS its garrison
-const GARRISON_CD = 8; // s
-const HQ_ALERT_RADIUS = 240; // px — enemies this close to the HQ trigger panic
-const AI_MIN_RESERVE = 70; // test bot (?bot=1) only — the solo AI uses tun.bank
-const COMBO_CD = 18; // s between insane strike+helico combos
+const BOT_GRACE = 6; // s before the test bot (?bot=1) starts spending
 
-/* Niveau CLAUDE — cadence du général distant et de son lieutenant local */
-const CLAUDE_FIRST_AT = 1.5; // s — premier tour (la carte est posée)
-const CLAUDE_MIN_GAP = 2.5; // s — repos minimal entre deux tours (après la réponse)
-const CLAUDE_RETRY = 4; // s — après un échec réseau
-const CLAUDE_OFFLINE_AFTER = 14; // s sans réponse → le lieutenant (IA imbattable) prend le relais
-const CLAUDE_ORDER_EVERY = 0.35; // s — au plus un ordre exécuté par ce laps (rythme naturel)
-const CLAUDE_JOURNAL_MAX = 6;
+/* Niveau CLAUDE — cadence du général-stratège (le commandant local, lui, joue en continu) */
+const CLAUDE_FIRST_AT = 10; // s — premier rapport (le joueur a montré son ouverture)
+const CLAUDE_EVERY = 20; // s entre la réponse du général et le rapport suivant
+const CLAUDE_RETRY = 8; // s — après un échec réseau
+const CLAUDE_JOURNAL_MAX = 5;
+const TREND_EVERY = 10; // s — un point d'historique de territoire
 
 type NetRole = "solo" | "host" | "guest";
-type AiPosture = "defend" | "counter" | "press" | "tech";
 
-interface RedAiIntel {
-  posture: AiPosture;
-  axis: number;
-  pressureCol: number;
-  opportunityCol: number;
-  /** Colonne d'attaque favorite du joueur (adapt) — -1 si rien de marquant. */
-  favoredCol: number;
-  blueTanks: number;
-  blueSoldiers: number;
-  blueTurrets: number;
-  blueFactories: number;
-  blueBarracks: number;
-  blueHelis: number;
-  redSoldiers: number;
-  redTurrets: number;
-  redFactories: number;
-  redBarracks: number;
-  redShare: number;
-  deepestBlueRow: number;
-  infantryFlood: boolean;
+/** Ce que le joueur a MONTRÉ (ses ordres exécutés, visibles à l'écran) — lu par le général Claude. */
+interface PlayerHabits {
+  strikes: number;
+  helis: number;
+  barracks: number;
+  forwardBarracks: number;
+  factories: number;
+  turrets: number;
+  upgrades: Record<string, number>;
+  axisHist: number[];
+  recent: string[];
+}
+function freshHabits(): PlayerHabits {
+  return { strikes: 0, helis: 0, barracks: 0, forwardBarracks: 0, factories: 0, turrets: 0, upgrades: {}, axisHist: new Array<number>(GRID_W).fill(0), recent: [] };
 }
 
-/** Niveau CLAUDE : état du général distant + de ses ordres en cours. */
+/** Niveau CLAUDE : état du général distant (stratège). */
 interface GeneralState {
   password: string;
   match: number; // jeton : ignore les réponses d'une partie précédente
   turn: number;
   inFlight: boolean;
-  nextAt: number; // elapsed (s) du prochain appel
-  lastOkAt: number; // elapsed du dernier plan reçu
+  nextAt: number; // elapsed (s) du prochain rapport
   failures: number;
-  plan: ClaudePlan | null;
-  pending: ClaudeOrder[];
-  reserve: number;
-  orderT: number;
+  /** Conseils reçus et appliqués depuis le début de la partie. */
+  applied: number;
   journal: ClaudeJournalEntry[];
   current: ClaudeJournalEntry | null;
   latencyMs: number;
   lastError: string;
-  /** Cycles joués par l'IA locale pendant que le général était muet. */
-  lieutenantRuns: number;
+  lastChanges: string;
 }
 
 export class PlayStep extends GameStep implements GameAPI, HudState {
@@ -182,10 +165,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private matchSeed = 0;
   private nextNid = 1;
 
-  /* Airstrikes in flight + solo-AI panic state */
+  /* Airstrikes in flight */
   private strikes: { x: number; y: number; t: number; faction: Faction }[] = [];
-  private garrisonCd = 0;
-  private alertT = 0;
   private hqLastHp: Record<Faction, number> = { [RED]: 0, [BLUE]: 0 };
   private hqDefenseUsed: Record<Faction, number> = { [RED]: 0, [BLUE]: 0 }; // vagues de défense déjà levées
 
@@ -212,15 +193,19 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
    *  in update() while the sim is frozen — see the `ended` branch. */
   private endTransitionT = -1;
   private endData: any = null;
-  private brainT = BRAIN_EVERY;
-  private aiPosture: AiPosture = "counter";
+  /** Solo : le commandant rouge (src/commander.ts) — il joue par le chemin de commandes. */
+  private redCmd: Commander | null = null;
+  private brainT = 0;
+  /** Coupe l'IA rouge (banc d'essai : deux commandants pilotés de l'extérieur). */
+  public aiOff = false;
   /* Solo difficulty: every knob is a handicap or smarter play — never free gold. */
   private difficulty: Difficulty = "medium";
   private tun: AiTuning = AI_TUNING.medium;
-  private comboCd = 0;
-  /** What the human has SHOWN so far (their executed, on-screen orders — the
-   *  adaptive AI reads nothing the player couldn't see of it in reverse). */
-  private habits = { strikes: 0, helis: 0, upSoldier: 0, upTank: 0, upTurret: 0, axisHist: new Array<number>(GRID_W).fill(0) };
+  /** What the human has SHOWN so far (their executed, on-screen orders). */
+  private habits: PlayerHabits = freshHabits();
+  /** Historique de la part de territoire rouge (un point toutes les TREND_EVERY s). */
+  private shareTrend: number[] = [];
+  private trendT = TREND_EVERY;
   /** Niveau CLAUDE : le général (modèle distant) — null aux autres niveaux. */
   private general: GeneralState | null = null;
   /* HudState — réplique du général et témoin « réfléchit » */
@@ -228,8 +213,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   public enemySayAge = 0;
   public enemyThinking = false;
   /** `?bot=1` — auto-play MY faction through the command path (desync tests). */
-  private botMode = false;
-  private botT = BRAIN_EVERY;
+  private botCmd: Commander | null = null;
+  private botT = BOT_EVERY;
 
   /* Deterministic lockstep state */
   private simTick = 0; // ticks executed locally
@@ -284,34 +269,47 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     const bR = b.filter((x) => x.faction === RED).length;
     const bB = b.filter((x) => x.faction === BLUE).length;
     const corr = this.role === "guest" ? `  corr ${(this.lastSnapBytes / 1024).toFixed(1)}KB` : "";
+    const lv = (f: Faction, k: UpgradeKind): string => `${this.ups[f][k].atk}/${this.ups[f][k].def}`;
     return [
       `${this.role} t${Math.round(this.elapsed)}  share B ${Math.round(this.blueShare * 100)}%${corr}`,
       `units  R ${uR.length} (tk ${tk(uR)})  B ${uB.length} (tk ${tk(uB)})`,
       `heli   R ${h.filter((x) => x.faction === RED).length}  B ${h.filter((x) => x.faction === BLUE).length}`,
       `bldg   R ${bR}  B ${bB}`,
       `gold   R ${Math.floor(this.gold[RED])}  B ${Math.floor(this.gold[BLUE])}`,
-      `lvl  s R${this.levels[RED]} B${this.levels[BLUE]}  tk R${this.tankLevels[RED]} B${this.tankLevels[BLUE]}  tu R${this.turretLevels[RED]} B${this.turretLevels[BLUE]}`,
+      `lvl atk/def  s R${lv(RED, "soldier")} B${lv(BLUE, "soldier")}  tk R${lv(RED, "tank")} B${lv(BLUE, "tank")}  tu R${lv(RED, "turret")} B${lv(BLUE, "turret")}`,
       ...(this.general
         ? [
-            `claude tours ${this.general.turn}  ${this.general.inFlight ? "pense" : "attend"}  ${this.general.latencyMs}ms  ko ${this.general.failures}${this.generalOnline() ? "" : "  LIEUTENANT"}`,
+            `claude rapports ${this.general.turn}  conseils ${this.general.applied}  ${this.general.inFlight ? "pense" : "attend"}  ${this.general.latencyMs}ms  ko ${this.general.failures}`,
           ]
         : []),
     ].join("\n");
   }
 
-  /** Niveau global d'une branche (force + défense − 1) : ce que l'IA compare. */
-  private branchLevel(f: Faction, kind: UpgradeKind): number {
-    const u = this.ups[f][kind];
-    return u.atk + u.def - 1;
-  }
-  private get levels(): Record<Faction, number> {
-    return { [RED]: this.branchLevel(RED, "soldier"), [BLUE]: this.branchLevel(BLUE, "soldier") };
-  }
-  private get tankLevels(): Record<Faction, number> {
-    return { [RED]: this.branchLevel(RED, "tank"), [BLUE]: this.branchLevel(BLUE, "tank") };
-  }
-  private get turretLevels(): Record<Faction, number> {
-    return { [RED]: this.branchLevel(RED, "turret"), [BLUE]: this.branchLevel(BLUE, "turret") };
+  /** Ce qu'un commandant (IA locale, banc d'essai) peut lire de la bataille. */
+  battleView(): BattleView {
+    const self = this;
+    return {
+      get units() {
+        return self.units;
+      },
+      get buildings() {
+        return self.buildings;
+      },
+      get helis() {
+        return self.helis;
+      },
+      get map() {
+        return self.map;
+      },
+      get elapsed() {
+        return self.elapsed;
+      },
+      gold: (f) => self.gold[f],
+      ups: (f) => self.ups[f],
+      axis: (f) => self.axisCol[f],
+      buildingAt: (i) => self.buildingAt.has(i),
+      costOf: (f, kind) => self.costOf(f, kind),
+    };
   }
 
   /** GameAPI : niveaux force/défense d'une branche. */
@@ -390,17 +388,13 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
             turn: 0,
             inFlight: false,
             nextAt: CLAUDE_FIRST_AT,
-            lastOkAt: 0,
             failures: 0,
-            plan: null,
-            pending: [],
-            reserve: this.tun.bank,
-            orderT: 0,
+            applied: 0,
             journal: [],
             current: null,
             latencyMs: 0,
             lastError: "",
-            lieutenantRuns: 0,
+            lastChanges: "",
           }
         : null;
     this.enemySay = "";
@@ -454,9 +448,13 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.endTransitionT = -1;
     this.endData = null;
     this.brainT = this.tun.brainEvery;
-    this.aiPosture = "counter";
-    this.comboCd = 0;
-    this.habits = { strikes: 0, helis: 0, upSoldier: 0, upTank: 0, upTurret: 0, axisHist: new Array<number>(GRID_W).fill(0) };
+    this.aiOff = false;
+    // Solo : l'armée rouge est jouée par un commandant, avec la doctrine du niveau.
+    this.redCmd =
+      this.role === "solo" ? new Commander(this.battleView(), RED, genomeFor(this.tun), (c) => this.executeCommand(c)) : null;
+    this.habits = freshHabits();
+    this.shareTrend = [];
+    this.trendT = TREND_EVERY;
     this.incomeT = INCOME_EVERY;
     this.snapT = 0;
     this.readyT = 0;
@@ -467,8 +465,6 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.outgoing = [];
     this.nextNid = 1;
     this.strikes = [];
-    this.garrisonCd = 0;
-    this.alertT = 0;
     this.hqLastHp = { [RED]: 0, [BLUE]: 0 };
     this.hqDefenseUsed = { [RED]: 0, [BLUE]: 0 };
     this.inited = this.role !== "guest";
@@ -506,8 +502,11 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.fpsMeter = null;
     const qs = new URLSearchParams(window.location.search);
     this.debug = qs.get("debug") === "1";
-    this.botMode = qs.get("bot") === "1";
-    this.botT = BRAIN_EVERY;
+    // `?bot=1` : MON camp est joué par un commandant (doctrine de base), par la file
+    // d'ordres réseau comme un humain — c'est le test de désynchronisation.
+    this.botCmd =
+      qs.get("bot") === "1" ? new Commander(this.battleView(), this.myFaction, sanitizeGenome(BASE_GENOME), (c) => this.queueCmd(c)) : null;
+    this.botT = BOT_EVERY;
     this.lastSnapBytes = 0;
     if (this.debug) {
       this.fpsMeter = new FpsMeter();
@@ -893,19 +892,12 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     return this.costOf(this.myFaction, kind);
   }
 
-  /** Voie que l'IA achète ensuite dans une branche : la moins avancée (force d'abord). */
-  private nextStat(f: Faction, kind: UpgradeKind): UpgradeStat {
-    const u = this.ups[f][kind];
-    return u.atk <= u.def ? "atk" : "def";
-  }
-
-  /** Prix du prochain niveau ; sans `stat`, celui de la voie que l'IA prendrait. */
-  private upgradeCostFor(f: Faction, kind: UpgradeKind, stat: UpgradeStat = this.nextStat(f, kind)): number {
+  private upgradeCostFor(f: Faction, kind: UpgradeKind, stat: UpgradeStat): number {
     return upgradeCost(kind, stat, this.ups[f][kind][stat]);
   }
 
-  /** Paie et monte d'un niveau une voie d'une branche (sans `stat` : choix de l'IA). */
-  private buyUpgrade(f: Faction, kind: UpgradeKind, stat: UpgradeStat = this.nextStat(f, kind)): void {
+  /** Paie et monte d'un niveau une voie (force/défense) d'une branche. */
+  private buyUpgrade(f: Faction, kind: UpgradeKind, stat: UpgradeStat): void {
     const cost = this.upgradeCostFor(f, kind, stat);
     if (this.gold[f] < cost) return;
     this.gold[f] -= cost;
@@ -1255,31 +1247,23 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       this.gold[RED] += BAL.income;
     }
 
-    if (this.role === "solo") {
-      this.comboCd -= TICK_DT;
+    if (this.role === "solo" && this.redCmd && !this.aiOff) {
       this.brainT -= TICK_DT;
       if (this.brainT <= 0) {
         this.brainT = this.tun.brainEvery;
-        // Niveau CLAUDE : le cerveau local ne joue que si le général est muet.
-        if (!this.generalOnline()) {
-          this.redBrain();
-          if (this.general) {
-            this.general.lieutenantRuns++;
-            this.publishGeneralDebug();
-          }
-        }
+        // Les handicaps des bas niveaux : délai de grâce et hésitations.
+        if (this.elapsed >= this.tun.grace && Math.random() >= this.tun.skipChance) this.redCmd.think();
       }
-      this.redPanic(TICK_DT);
       if (this.general) this.updateGeneral(TICK_DT);
     }
 
-    // `?bot=1`: drive MY faction with the solo AI's reflexes through the command
-    // path, so both clients play a real, escalating game (the lockstep test).
-    if (this.botMode) {
+    // `?bot=1`: drive MY faction through the command path, so both clients
+    // play a real, escalating game (the lockstep test).
+    if (this.botCmd) {
       this.botT -= TICK_DT;
       if (this.botT <= 0) {
-        this.botT = BRAIN_EVERY;
-        this.playerBot();
+        this.botT = BOT_EVERY;
+        if (this.elapsed >= BOT_GRACE) this.botCmd.think();
       }
     }
 
@@ -1423,490 +1407,47 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.sfx("build", 0.5);
   }
 
-  /**
-   * Anti-rush reflex, checked every frame: blue troops close to the red HQ
-   * (or the HQ taking hits) trigger an instant garrison + axis recall.
-   */
-  private redPanic(dt: number): void {
-    this.garrisonCd -= dt;
-    this.alertT -= dt;
-    if (this.alertT > 0) return;
-    this.alertT = this.tun.panicEvery; // réflexe défensif : plus vif aux hauts niveaux
-
-    const hq = this.buildings.find((b) => !b.dead && b.type === "hq" && b.faction === RED);
-    if (!hq) return;
-    // A lone scout is not an assault: panic on real pressure only
-    let threats = 0;
-    let threatX = hq.cx;
-    for (const u of this.units) {
-      if (!u.dead && u.faction === BLUE && u.distTo(hq.cx, hq.cy) < HQ_ALERT_RADIUS) {
-        threats++;
-        threatX = u.cx;
-      }
-    }
-    const underFire = hq.hp < hq.maxHp;
-    if (threats < 3 && !underFire) return;
-
-    // Recall the army toward the breach
-    this.axisCol[RED] = clamp(Math.floor(threatX / TILE), 0, GRID_W - 1);
-
-    // Emergency garrison around the HQ — paid at full price, never free
-    const gCost = this.tun.garrison * GARRISON_UNIT_COST;
-    if (this.garrisonCd <= 0 && this.gold[RED] >= gCost) {
-      this.garrisonCd = GARRISON_CD;
-      this.gold[RED] -= gCost;
-      for (let i = 0; i < this.tun.garrison; i++) {
-        this.spawnSoldier(RED, hq.cx + rand(-50, 50), hq.cy + rand(20, 60));
-      }
-      this.popup(hq.cx, hq.cy - 44, "GARNISON !", 1);
-      this.sfx("build", 0.45);
-    }
-
-    // A turret at the gates if the walls are bare
-    const guards = this.buildings.filter(
-      (b) => !b.dead && b.faction === RED && b.type === "turret" && b.distTo(hq.cx, hq.cy) < TILE * 3.2
-    ).length;
-    if (guards < 2 && this.gold[RED] >= this.costOf(RED, "turret")) {
-      for (let tries = 0; tries < 10; tries++) {
-        const c = clamp(hq.col + randInt(-2, 2), 0, GRID_W - 1);
-        const r = clamp(hq.row + randInt(0, 2), 1, GRID_H - 2);
-        const i = this.map.idx(c, r);
-        if (this.map.isLand(c, r) && this.map.owner[i] === RED && !this.buildingAt.has(i) && !this.map.hasChest(i)) {
-          this.gold[RED] -= this.costOf(RED, "turret");
-          this.placeBuilding(RED, "turret", c, r);
-          break;
-        }
-      }
-    }
-  }
-
-  /** Le joueur vient de donner un ordre visible : l'IA adaptative le note. */
-  private observeBlue(cmd: CmdMsg): void {
-    if (cmd.cmd === "strike") this.habits.strikes++;
-    else if (cmd.cmd === "helico") this.habits.helis++;
-    else if (cmd.cmd === "upgrade") {
-      if (cmd.kind === "tank") this.habits.upTank++;
-      else if (cmd.kind === "turret") this.habits.upTurret++;
-      else this.habits.upSoldier++;
-    } else if (cmd.cmd === "axis" && typeof cmd.col === "number") {
-      this.habits.axisHist[clamp(Math.round(cmd.col), 0, GRID_W - 1)] += 1;
-    }
-  }
-
-  /**
-   * Un plan de l'IA rouge. La difficulté ne change QUE la qualité et la
-   * cadence des décisions : hésitations et axe brouillon en facile,
-   * enchaînements d'ordres + contres ciblés + combos en imbattable.
-   */
-  private redBrain(): void {
-    const tun = this.tun;
-    // Les vieilles habitudes du joueur s'estompent — seules les récentes comptent.
-    for (let c = 0; c < GRID_W; c++) this.habits.axisHist[c] *= 0.985;
-
-    const intel = this.redIntel();
-    this.aiPosture = intel.posture;
-    this.axisCol[RED] = intel.axis;
-
-    // Grace so the player can take the early initiative, then hesitation.
-    if (this.elapsed < tun.grace) return;
-    if (Math.random() < tun.skipChance) return;
-
-    for (let i = 0; i < tun.actionsPerPlan; i++) {
-      if (!this.redAct(intel)) break;
-    }
-  }
-
-  /** One spending decision; true = gold committed (high levels chain a few).
-   *
-   *  Gestion d'or : la frappe (100) est l'arme qui gagne les guerres ici —
-   *  une IA forte garde donc une BANQUE intouchable par les constructions et
-   *  frappe dès qu'une cible la rentabilise. Une IA faible (bank 0) vide tout
-   *  dans des bâtiments et ne peut jamais riposter — comme un débutant. */
-  private redAct(intel: RedAiIntel): boolean {
-    const tun = this.tun;
-    const bank = tun.bank;
-    const heliFree = this.helis.filter((h) => !h.dead && h.faction === RED).length < BAL.heli.max;
-
-    // Imbattable : combo économisé — bombarder les défenseurs de la colonne
-    // la plus faible, puis y verser un hélico ET l'axe d'attaque.
-    if (
-      tun.combo &&
-      this.comboCd <= 0 &&
-      heliFree &&
-      intel.posture !== "defend" &&
-      this.gold[RED] >= COST.strike + COST.helico + 40
-    ) {
-      this.comboCd = COMBO_CD;
-      const hole = intel.opportunityCol;
-      const pack = this.densestBluePack(3);
-      if (pack) {
-        this.gold[RED] -= COST.strike;
-        const aim = this.leadStrike(pack);
-        this.scheduleStrike(aim.x, aim.y, RED);
-      }
-      this.gold[RED] -= COST.helico;
-      this.spawnHeli(RED, this.columnCenter(hole));
-      this.axisCol[RED] = hole;
-      return true;
-    }
-
-    // Strike only when it really changes the fight: packed troops first,
-    // then exposed production/defense clusters if the player turtles. The
-    // bank exists FOR this — fire as soon as a worthwhile target shows up.
-    if (this.gold[RED] >= COST.strike + 20) {
-      const target = this.bestRedStrikeTarget(intel);
-      if (target) {
-        this.gold[RED] -= COST.strike;
-        this.scheduleStrike(target.x, target.y, RED);
-        return true;
-      }
-    }
-
-    // Helico punishes players who skip anti-air, but it becomes rarer once
-    // blue has built enough turrets to avoid wasting gold.
-    const antiAirGap = intel.blueTurrets < 2 || intel.blueFactories + intel.blueBarracks >= intel.blueTurrets + 3;
-    const heliP = intel.blueTurrets === 0 ? Math.min(0.85, tun.heliChance * 2) : tun.heliChance;
-    if (heliFree && antiAirGap && intel.posture !== "defend" && Math.random() < heliP && this.gold[RED] >= COST.helico + bank * 0.4) {
-      this.gold[RED] -= COST.helico;
-      this.spawnHeli(RED, this.columnCenter(intel.opportunityCol + randInt(-1, 1)));
-      return true;
-    }
-
-    // Upgrade whatever answers the current pressure best. The adaptive AI
-    // also follows a tech curve — a permanent army multiplier beats a
-    // disposable building once the surplus allows it.
-    const upgradeKind = this.redUpgradeKind(intel);
-    const upCost = this.upgradeCostFor(RED, upgradeKind);
-    const techBehind = tun.adapt && this.levels[RED] + this.tankLevels[RED] + this.turretLevels[RED] < 3 + Math.floor(this.elapsed / 60);
-    const wantsUpgrade =
-      (intel.blueBarracks >= 5 ||
-        intel.redShare > 0.54 ||
-        this.levels[BLUE] > this.levels[RED] ||
-        this.tankLevels[BLUE] > this.tankLevels[RED] ||
-        this.turretLevels[BLUE] > this.turretLevels[RED] ||
-        techBehind ||
-        // Haut niveau : l'or qui dort ne gagne pas de guerre.
-        (tun.adapt && this.gold[RED] >= upCost + bank + 120)) &&
-      this.gold[RED] >= upCost + bank * 0.7;
-    if (wantsUpgrade) {
-      this.buyUpgrade(RED, upgradeKind);
-      return true;
-    }
-
-    // Constructions : toutes respectent la banque (les urgences n'en
-    // consomment que la moitié) — plus jamais de banque vidée en tourelles.
-    const bCap = barracksCap(tun, this.elapsed);
-    let want: BuildingType | null = null;
-    if (intel.infantryFlood && intel.redTurrets < tun.maxTurrets && this.gold[RED] >= this.costOf(RED, "turret") + bank * 0.5) {
-      want = "turret";
-    } else if (
-      intel.infantryFlood &&
-      intel.redBarracks < Math.min(bCap + 1, Math.max(5, intel.blueBarracks - 1)) &&
-      this.gold[RED] >= this.costOf(RED, "barracks") + bank * 0.5
-    ) {
-      want = "barracks";
-    } else if (
-      intel.posture === "defend" &&
-      intel.redTurrets < Math.max(3, tun.maxTurrets - 2) &&
-      this.gold[RED] >= this.costOf(RED, "turret") + bank * 0.6
-    ) {
-      want = "turret";
-    } else if (
-      (intel.blueTanks >= 2 || intel.blueFactories >= 2) &&
-      intel.redFactories < Math.min(2, tun.maxFactories) &&
-      this.gold[RED] >= this.costOf(RED, "factory") + bank
-    ) {
-      want = "factory";
-    } else if (intel.redBarracks < bCap && this.gold[RED] >= this.costOf(RED, "barracks") + bank * 0.8) {
-      want = "barracks";
-    } else if (intel.redTurrets < Math.max(2, tun.maxTurrets - 3) && this.gold[RED] >= this.costOf(RED, "turret") + bank) {
-      want = "turret";
-    } else if (
-      intel.redFactories < (intel.posture === "tech" ? tun.maxFactories : Math.max(1, tun.maxFactories - 1)) &&
-      this.gold[RED] >= this.costOf(RED, "factory") + bank
-    ) {
-      want = "factory";
-    } else if (this.gold[RED] >= this.costOf(RED, "barracks") + bank + 30) {
-      want = "barracks";
-    }
-    if (!want) return false;
-
-    const cost = this.costOf(RED, want); // avant la pose : le prix monte avec le nombre
-    const built = this.tryRedBuild(want, intel);
-    if (built) this.gold[RED] -= cost;
-    return built;
-  }
-
-  /** Which upgrade answers the board — the adaptive AI counters the PLAYER. */
-  private redUpgradeKind(intel: RedAiIntel): UpgradeKind {
-    if (this.tun.adapt) {
-      // Les tourelles répondent aux hélicos ET aux marées d'infanterie ;
-      // les tanks répondent au blindé ; les soldats sont l'épée par défaut.
-      if (intel.blueHelis > 0 || this.habits.helis >= 2) return "turret";
-      if (intel.blueTanks >= 2 || intel.blueFactories >= 2 || this.habits.upTank >= 2) return "tank";
-      if (intel.infantryFlood || intel.blueSoldiers > intel.redSoldiers + 8) return "turret";
-      return this.levels[RED] <= this.tankLevels[RED] ? "soldier" : "tank";
-    }
-    return intel.infantryFlood || intel.blueSoldiers > intel.redSoldiers + 8
-      ? "turret"
-      : intel.blueTanks >= 2 || intel.blueFactories >= 2
-        ? "tank"
-        : "soldier";
-  }
-
-  /** Vise devant un groupe en marche : les bleus montent (~40 px pendant la mèche). */
-  private leadStrike(p: { x: number; y: number }): { x: number; y: number } {
-    if (!this.tun.strikeLead) return p;
-    return { x: p.x, y: Math.max(TILE, p.y - 38 * BAL.strike.delay) };
-  }
-
-  private redIntel(): RedAiIntel {
-    let pressureCol = 8;
-    let pressureScore = -Infinity;
-    let opportunityCol = 8;
-    let opportunityScore = -Infinity;
-    let deepestBlueRow = GRID_H;
-
-    for (let c = 0; c < GRID_W; c++) {
-      if (!this.map.isLand(c, 1) && !this.map.isLand(c, GRID_H - 2)) continue;
-      const front = this.map.blueFrontRow(c);
-      if (front < deepestBlueRow) deepestBlueRow = front;
-      let blueUnits = 0;
-      let redUnits = 0;
-      for (const u of this.units) {
-        if (u.dead || Math.abs(Math.floor(u.cx / TILE) - c) > 1) continue;
-        if (u.faction === BLUE) blueUnits += u instanceof Tank ? 2.2 : 1;
-        else redUnits += u instanceof Tank ? 2 : 1;
-      }
-      const blueDepth = front < GRID_H ? GRID_H - front : 0;
-      const pressure = blueDepth * 1.7 + blueUnits * 1.8 - redUnits * 0.7;
-      const opportunity = front < GRID_H ? front * 1.2 - blueUnits * 0.6 : -Infinity;
-      if (pressure > pressureScore) {
-        pressureScore = pressure;
-        pressureCol = c;
-      }
-      if (opportunity > opportunityScore) {
-        opportunityScore = opportunity;
-        opportunityCol = c;
-      }
-    }
-
-    const redShare = this.map.share(RED);
-    const alive = this.buildings.filter((b) => !b.dead);
-    const count = (f: Faction, t: BuildingType) => alive.filter((b) => b.faction === f && b.type === t).length;
-    const blueTanks = this.units.filter((u) => !u.dead && u.faction === BLUE && u instanceof Tank).length;
-    const blueSoldiers = this.units.filter((u) => !u.dead && u.faction === BLUE && !(u instanceof Tank)).length;
-    const redSoldiers = this.units.filter((u) => !u.dead && u.faction === RED && !(u instanceof Tank)).length;
-    const blueHelis = this.helis.filter((h) => !h.dead && h.faction === BLUE).length;
-    const blueTurrets = count(BLUE, "turret");
-    const blueFactories = count(BLUE, "factory");
-    const blueBarracks = count(BLUE, "barracks");
-    const redTurrets = count(RED, "turret");
-    const redFactories = count(RED, "factory");
-    const redBarracks = count(RED, "barracks");
-    const infantryFlood =
-      blueBarracks >= redBarracks + 2 ||
-      blueBarracks >= 5 ||
-      blueSoldiers >= redSoldiers + 10 ||
-      (blueSoldiers >= 18 && blueTanks === 0);
-
-    let posture: AiPosture = "counter";
-    if (redShare < 0.46 || deepestBlueRow <= 7 || blueHelis > 0 || infantryFlood) posture = "defend";
-    else if (redShare > 0.57) posture = "press";
-    else if (blueFactories >= 2 || blueTanks >= 3 || blueTurrets >= 5) posture = "tech";
-
-    // Adapt : la colonne que le joueur privilégie (historique décroissant de
-    // ses ordres d'axe) — l'IA y pré-positionne ses tourelles.
-    let favoredCol = -1;
-    if (this.tun.adapt) {
-      let best = 0.75;
-      for (let c = 0; c < GRID_W; c++) {
-        if (this.habits.axisHist[c] > best) {
-          best = this.habits.axisHist[c];
-          favoredCol = c;
-        }
-      }
-    }
-
-    // Le choix d'axe qui GAGNE dans ce jeu : attaquer là où l'ennemi est
-    // faible (les tuiles capturées paient tout), jamais empiler son armée
-    // dans la colonne la plus forte de l'adversaire — sauf urgence profonde,
-    // où l'armée est rappelée sur la percée (redPanic gère le QG lui-même).
-    let axis: number;
-    if (this.tun.adapt) {
-      axis = deepestBlueRow <= 6 ? pressureCol : opportunityCol;
-    } else {
-      axis = posture === "press" ? opportunityCol : pressureCol;
-      if (posture === "tech" && Math.random() < 0.45) axis = opportunityCol;
-    }
-    // Facile dérive souvent (et plus loin) ; imbattable presque jamais.
-    if (Math.random() < this.tun.axisJitter) {
-      const amp = this.tun.adapt ? 1 : 2;
-      axis = clamp(axis + randInt(-amp, amp), 0, GRID_W - 1);
-    }
-
-    return {
-      posture,
-      axis,
-      pressureCol,
-      opportunityCol,
-      favoredCol,
-      blueTanks,
-      blueSoldiers,
-      blueTurrets,
-      blueFactories,
-      blueBarracks,
-      blueHelis,
-      redSoldiers,
-      redTurrets,
-      redFactories,
-      redBarracks,
-      redShare,
-      deepestBlueRow,
-      infantryFlood,
-    };
-  }
-
-  private bestRedStrikeTarget(intel: RedAiIntel): { x: number; y: number } | null {
-    const urgent = intel.infantryFlood || intel.posture === "defend";
-    const pack = this.densestBluePack(Math.max(2, this.tun.strikeMinPack - (urgent ? 1 : 0)));
-    if (pack) return this.leadStrike(pack);
-
-    if (intel.blueTurrets + intel.blueFactories + intel.blueBarracks < 5) return null;
-    let best: { x: number; y: number; score: number } | null = null;
-    for (const b of this.buildings) {
-      if (b.dead || b.faction !== BLUE || b.type === "hq") continue;
-      let score = b.type === "turret" ? 2.3 : b.type === "factory" ? 2.8 : 1.6;
-      for (const other of this.buildings) {
-        if (other.dead || other.faction !== BLUE || other === b || other.type === "hq") continue;
-        if (other.distTo(b.cx, b.cy) < BAL.strike.radius * 1.35) score += other.type === "factory" ? 2 : 1;
-      }
-      if (!best || score > best.score) best = { x: b.cx, y: b.cy, score };
-    }
-    return best && best.score >= 4.4 ? { x: best.x, y: best.y } : null;
-  }
-
-  private tryRedBuild(kind: BuildingType, intel: RedAiIntel): boolean {
-    // Adapt : une tourelle sur deux part sur la colonne favorite du joueur
-    // (défense anticipée), le reste sur la colonne sous pression.
-    const axis =
-      kind === "turret"
-        ? intel.favoredCol >= 0 && Math.random() < 0.45
-          ? intel.favoredCol
-          : intel.pressureCol
-        : this.axisCol[RED];
-    // Adapt : les tourelles naissent un cran plus en retrait — un chantier de
-    // tourelle (30 pv, 4 s) posé SUR le front meurt avant de tirer et paie
-    // l'ennemi ; deux rangées plus haut, il finit sa construction et tient.
-    const rowBias =
-      kind === "turret"
-        ? this.tun.adapt
-          ? [2, 3, 4, 5]
-          : [1, 2, 3, 4]
-        : kind === "factory"
-          ? [4, 5, 6, 3]
-          : [2, 3, 4, 5];
-    // Adapt : contre un joueur qui frappe souvent, s'étaler pour qu'une seule
-    // frappe ne paie jamais deux bâtiments.
-    const spread = this.tun.adapt && this.habits.strikes >= 2;
-    for (let tries = 0; tries < 18; tries++) {
-      const c = clamp(axis + randInt(-3, 3), 0, GRID_W - 1);
-      const front = this.map.blueFrontRow(c);
-      const r = clamp(front - pick(rowBias), 1, GRID_H - 2);
-      if (this.canRedBuildAt(c, r) && (!spread || this.redClusterAt(c, r) < 2)) {
-        this.placeBuilding(RED, kind, c, r);
-        return true;
-      }
-    }
-
-    // Fallback around the HQ so saved gold still becomes useful defense.
-    const hq = this.buildings.find((b) => !b.dead && b.type === "hq" && b.faction === RED);
-    if (!hq) return false;
-    for (let tries = 0; tries < 12; tries++) {
-      const c = clamp(hq.col + randInt(-4, 4), 0, GRID_W - 1);
-      const r = clamp(hq.row + randInt(1, 5), 1, GRID_H - 2);
-      if (this.canRedBuildAt(c, r)) {
-        this.placeBuilding(RED, kind, c, r);
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private canRedBuildAt(c: number, r: number): boolean {
-    const i = this.map.idx(c, r);
-    return this.map.isLand(c, r) && this.map.owner[i] === RED && !this.buildingAt.has(i) && !this.map.hasChest(i);
-  }
-
-  /** Bâtiments rouges à portée d'une même frappe autour de cette case. */
-  private redClusterAt(c: number, r: number): number {
-    const p = this.map.tileCenter(c, r);
-    let n = 0;
-    for (const b of this.buildings) {
-      if (!b.dead && b.faction === RED && b.distTo(p.x, p.y) < BAL.strike.radius * 1.3) n++;
-    }
-    return n;
-  }
-
-  private columnCenter(c: number): number {
-    return clamp(c, 0, GRID_W - 1) * TILE + TILE / 2;
-  }
-
-  /** Densest blue pack in a 3×3-tile window, scored in soldier-equivalents
-   *  (tank = 2.5). The adaptive AI also subtracts its OWN units in the blast
-   *  (a strike hits both sides) — its frappes deviennent chirurgicales. */
-  private densestBluePack(minScore = 4, onlyCol = -1): { x: number; y: number } | null {
-    let best: { x: number; y: number } | null = null;
-    let bestScore = minScore;
-    for (let r = 1; r < GRID_H - 1; r++) {
-      for (let c = 1; c < GRID_W - 1; c++) {
-        if (onlyCol >= 0 && Math.abs(c - onlyCol) > 1) continue; // niveau CLAUDE : frappe « colonne »
-        let score = 0;
-        let w = 0;
-        let sx = 0;
-        let sy = 0;
-        for (let dr = -1; dr <= 1; dr++) {
-          for (let dc = -1; dc <= 1; dc++) {
-            const cell = this.buckets[(r + dr) * GRID_W + c + dc];
-            if (!cell) continue;
-            for (const t of cell) {
-              if (t.dead || !(t instanceof Unit)) continue;
-              if (t.faction === BLUE) {
-                const v = t instanceof Tank ? 2.5 : 1;
-                score += v;
-                w += v;
-                sx += t.cx * v;
-                sy += t.cy * v;
-              } else if (this.tun.adapt) {
-                score -= t instanceof Tank ? 2 : 0.8; // friendly fire awareness
-              }
-            }
-          }
-        }
-        if (w > 0 && score > bestScore) {
-          bestScore = score;
-          best = { x: sx / w, y: sy / w };
-        }
-      }
-    }
-    return best;
-  }
-
   /* ---------------------------------------------------------------- *
-   * Niveau CLAUDE — le général (modèle distant) et son lieutenant
+   * Solo : ce que le joueur montre, et le général Claude (stratège)
    *
-   * Le général reçoit l'état VISIBLE du jeu et répond par des intentions
-   * (axe, réserve, 0-4 ordres). Le lieutenant, ici, les exécute au rythme
-   * de l'or avec exactement les validations du joueur, vise les frappes au
-   * moment du tir (l'état envoyé a déjà quelques secondes), et garde ses
-   * réflexes (redPanic). Hors-ligne, l'IA imbattable locale prend le relais
-   * pour que la partie ne se fige jamais.
+   * L'armée rouge est jouée par un Commander (src/commander.ts) à tous les
+   * niveaux. Au niveau CLAUDE, un modèle distant reçoit un rapport toutes
+   * les ~20 s et renvoie une doctrine que le commandant applique aussitôt.
+   * Le commandant n'attend jamais le général : si celui-ci est lent ou
+   * injoignable, la partie continue avec la doctrine courante.
    * ---------------------------------------------------------------- */
 
-  /** Le général est joignable : le cerveau local se tait. */
-  private generalOnline(): boolean {
-    const g = this.general;
-    return !!g && this.elapsed - g.lastOkAt < CLAUDE_OFFLINE_AFTER;
+  /** Le joueur vient de donner un ordre visible : on le note (lu par le général). */
+  private observeBlue(cmd: CmdMsg): void {
+    const h = this.habits;
+    const t = Math.round(this.elapsed);
+    let note = "";
+    if (cmd.cmd === "strike" && typeof cmd.x === "number" && typeof cmd.y === "number") {
+      h.strikes++;
+      note = `frappe (${Math.floor(cmd.x / TILE)},${Math.floor(cmd.y / TILE)})`;
+    } else if (cmd.cmd === "helico" && typeof cmd.x === "number") {
+      h.helis++;
+      note = `helico col ${Math.floor(cmd.x / TILE)}`;
+    } else if (cmd.cmd === "upgrade") {
+      const key = `${cmd.kind ?? "soldier"}${cmd.stat === "def" ? "Def" : "Atk"}`;
+      h.upgrades[key] = (h.upgrades[key] ?? 0) + 1;
+      note = `amelioration ${key}`;
+    } else if (cmd.cmd === "axis" && typeof cmd.col === "number") {
+      h.axisHist[clamp(Math.round(cmd.col), 0, GRID_W - 1)] += 1;
+      note = `axe col ${Math.round(cmd.col)}`;
+    } else if (cmd.cmd === "build" && typeof cmd.c === "number" && typeof cmd.r === "number") {
+      if (cmd.kind === "barracks") {
+        h.barracks++;
+        // « avancée » : à 2 rangées ou moins de son front dans cette colonne
+        if (cmd.r - this.map.blueFrontRow(cmd.c) <= 2) h.forwardBarracks++;
+      } else if (cmd.kind === "factory") h.factories++;
+      else if (cmd.kind === "turret") h.turrets++;
+      note = `${cmd.kind} (${cmd.c},${cmd.r})`;
+    }
+    if (note) {
+      h.recent.push(`t=${t} ${note}`);
+      if (h.recent.length > 20) h.recent.shift();
+    }
   }
 
   private updateGeneral(dt: number): void {
@@ -1914,31 +1455,29 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     if (!g) return;
     this.enemySayAge += dt;
     this.enemyThinking = g.inFlight;
-    if (!g.inFlight && !this.ended && this.elapsed >= g.nextAt) this.requestGeneralTurn();
-
-    g.orderT -= dt;
-    if (g.orderT <= 0 && g.pending.length) {
-      g.orderT = CLAUDE_ORDER_EVERY;
-      this.runGeneralOrder();
+    this.trendT -= dt;
+    if (this.trendT <= 0) {
+      this.trendT = TREND_EVERY;
+      this.shareTrend.push(this.map.share(RED));
+      if (this.shareTrend.length > 12) this.shareTrend.shift();
     }
+    if (!g.inFlight && !this.ended && this.elapsed >= g.nextAt) this.requestGeneralAdvice();
   }
 
-  private requestGeneralTurn(): void {
+  private requestGeneralAdvice(): void {
     const g = this.general;
-    if (!g || g.inFlight) return;
+    if (!g || g.inFlight || !this.redCmd) return;
     g.inFlight = true;
     g.turn++;
     const match = g.match;
-    const state = this.claudeSnapshot(g);
-    askClaudeTurn(g.password, state, g.journal)
+    askClaudeAdvice(g.password, this.claudeReport(g), g.journal)
       .then((res) => {
         if (this.general !== g || g.match !== match || this.board.step !== this) return;
         g.inFlight = false;
         g.failures = 0;
-        g.lastOkAt = this.elapsed;
         g.latencyMs = res.latencyMs;
-        g.nextAt = this.elapsed + CLAUDE_MIN_GAP;
-        if (!this.ended) this.applyGeneralPlan(res.plan);
+        g.nextAt = this.elapsed + CLAUDE_EVERY;
+        if (!this.ended) this.applyAdvice(res.advice);
         this.publishGeneralDebug();
       })
       .catch((e: ClaudeError) => {
@@ -1946,459 +1485,143 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
         g.inFlight = false;
         g.failures++;
         g.lastError = `${e.code}: ${e.message}`;
-        // Mauvais mot de passe / quota : inutile d'insister, le lieutenant joue.
-        g.nextAt = this.elapsed + (e.code === "password" || e.code === "quota" ? 1e9 : CLAUDE_RETRY * Math.min(4, g.failures));
+        // mot de passe refusé : inutile d'insister, le commandant finit la partie seul
+        g.nextAt = e.code === "password" ? Infinity : this.elapsed + CLAUDE_RETRY;
         if (g.failures === 1 || e.code === "password") console.warn("[claude] général injoignable —", g.lastError);
         this.publishGeneralDebug();
       });
+    this.publishGeneralDebug();
   }
 
-  /** L'état envoyé au général : rien que le joueur ne voie pas à l'écran. */
-  private claudeSnapshot(g: GeneralState): ClaudeState {
-    const map: string[] = [];
-    for (let r = 0; r < GRID_H; r++) {
-      let line = "";
-      for (let c = 0; c < GRID_W; c++) {
-        const i = this.map.idx(c, r);
-        let ch = "~";
-        if (this.map.isLand(c, r)) {
-          const o = this.map.owner[i];
-          ch = o === RED ? "r" : o === BLUE ? "b" : "-";
-          if (this.map.hasChest(i)) ch = "$";
-          const b = this.buildingAt.get(i);
-          if (b && !b.dead) {
-            const code = b.type === "hq" ? "q" : b.type === "barracks" ? "c" : b.type === "turret" ? "t" : "u";
-            ch = b.faction === RED ? code.toUpperCase() : code;
-          }
-        }
-        line += ch;
+  /** Un camp vu de l'écran : bâtiments, unités, niveaux. */
+  private claudeSide(f: Faction): ClaudeSide {
+    const side: ClaudeSide = { barracks: 0, factories: 0, turrets: 0, frontTurrets: 0, soldiers: 0, tanks: 0, helis: 0, ups: this.ups[f] };
+    for (const b of this.buildings) {
+      if (b.dead || b.faction !== f) continue;
+      if (b.type === "barracks") side.barracks++;
+      else if (b.type === "factory") side.factories++;
+      else if (b.type === "turret") {
+        side.turrets++;
+        // hors de la base : une tourelle qu'un hélico adverse croisera
+        const edge = f === RED ? b.cy : MAP_H - b.cy;
+        if (edge >= BAL.heli.turnBack - BAL.turret.range) side.frontTurrets++;
       }
-      map.push(line);
     }
+    side.soldiers = this.counts[f].soldiers;
+    side.tanks = this.counts[f].tanks;
+    side.helis = this.helis.filter((h) => !h.dead && h.faction === f).length;
+    return side;
+  }
 
-    const blueFront: number[] = [];
-    const redCol = new Array<number>(GRID_W).fill(0);
-    const blueCol = new Array<number>(GRID_W).fill(0);
-    let deepestBlueRow = GRID_H;
-    for (let c = 0; c < GRID_W; c++) {
-      const f = this.map.blueFrontRow(c);
-      blueFront.push(f);
-      if (f < deepestBlueRow) deepestBlueRow = f;
-    }
-    let redS = 0;
-    let redT = 0;
-    let blueS = 0;
-    let blueT = 0;
-    for (const u of this.units) {
-      if (u.dead) continue;
-      const c = clamp(Math.floor(u.cx / TILE), 0, GRID_W - 1);
-      const tank = u instanceof Tank;
-      const v = tank ? 2.5 : 1;
-      if (u.faction === RED) {
-        redCol[c] += v;
-        if (tank) redT++;
-        else redS++;
-      } else {
-        blueCol[c] += v;
-        if (tank) blueT++;
-        else blueS++;
-      }
-    }
-    const info = (f: Faction): ClaudeBuildingInfo[] =>
-      this.buildings
-        .filter((b) => !b.dead && b.faction === f)
-        .map((b) => ({
-          type: b.type,
-          c: b.col,
-          r: b.row,
-          hp: Math.round((b.hp / b.maxHp) * 100) / 100,
-          building: b.buildProgress < 1,
-        }));
-    const hqOf = (f: Faction): number => {
-      const hq = this.buildings.find((b) => !b.dead && b.type === "hq" && b.faction === f);
-      return hq ? hq.hp / hq.maxHp : 0;
-    };
+  /** Le rapport de bataille : strictement ce qui est visible à l'écran, plus l'or ROUGE. */
+  private claudeReport(g: GeneralState): ClaudeReport {
+    const h = this.habits;
     let favoredCol = -1;
     let best = 0.75;
     for (let c = 0; c < GRID_W; c++) {
-      if (this.habits.axisHist[c] > best) {
-        best = this.habits.axisHist[c];
+      if (h.axisHist[c] > best) {
+        best = h.axisHist[c];
         favoredCol = c;
       }
+      h.axisHist[c] *= 0.8; // les vieilles habitudes s'estompent
     }
-    const lieutenant: string[] = [];
-    if (this.garrisonCd > 0) lieutenant.push("garnison d'urgence levée récemment (QG menacé)");
-    if (this.hqDefenseUsed[RED] >= BAL.hqDefense.waves) lieutenant.push("vagues de défense du QG épuisées");
+    const hp = (f: Faction): number => {
+      const hq = this.hqs[f];
+      return hq && !hq.dead ? clamp(hq.hp / hq.maxHp, 0, 1) : 0;
+    };
     return {
       turn: g.turn,
       t: this.elapsed,
-      gold: this.gold[RED],
       share: this.map.share(RED),
-      axis: this.axisCol[RED],
-      reserve: g.reserve,
-      levels: {
-        red: { soldiers: this.levels[RED], tanks: this.tankLevels[RED], turrets: this.turretLevels[RED] },
-        blue: { soldiers: this.levels[BLUE], tanks: this.tankLevels[BLUE], turrets: this.turretLevels[BLUE] },
-      },
-      upgradeCost: {
-        soldiers: this.upgradeCostFor(RED, "soldier"),
-        tanks: this.upgradeCostFor(RED, "tank"),
-        turrets: this.upgradeCostFor(RED, "turret"),
-      },
-      units: { red: { soldiers: redS, tanks: redT }, blue: { soldiers: blueS, tanks: blueT } },
-      helis: {
-        red: this.helis.filter((h) => !h.dead && h.faction === RED).length,
-        blue: this.helis.filter((h) => !h.dead && h.faction === BLUE).length,
-      },
-      hq: { red: hqOf(RED), blue: hqOf(BLUE) },
-      map,
-      cols: { blueFront, red: redCol.map((v) => Math.round(v)), blue: blueCol.map((v) => Math.round(v)) },
-      redBuildings: info(RED),
-      blueBuildings: info(BLUE),
+      trend: this.shareTrend.slice(-8),
+      gold: this.gold[RED],
+      suddenDeathIn: BAL.suddenDeath.start - this.elapsed,
+      hq: { red: hp(RED), blue: hp(BLUE) },
+      me: this.claudeSide(RED),
+      foe: this.claudeSide(BLUE),
       habits: {
-        strikes: this.habits.strikes,
-        helis: this.habits.helis,
-        upSoldier: this.habits.upSoldier,
-        upTank: this.habits.upTank,
-        upTurret: this.habits.upTurret,
+        strikes: h.strikes,
+        helis: h.helis,
+        barracks: h.barracks,
+        forwardBarracks: h.forwardBarracks,
+        factories: h.factories,
+        turrets: h.turrets,
+        upgrades: { ...h.upgrades },
         favoredCol,
+        recent: h.recent.slice(-12),
       },
-      deepestBlueRow,
-      pending: g.pending.map((o) => this.describeOrder(o)),
-      lieutenant: lieutenant.join(" ; "),
+      spent: { ...this.redCmd!.spent },
+      doctrine: this.redCmd!.genome,
     };
   }
 
-  private describeOrder(o: ClaudeOrder): string {
-    switch (o.type) {
-      case "frappe":
-        return o.cible === "colonne" ? `frappe colonne ${o.col}` : o.cible === "batiment" ? `frappe batiment (${o.col},${o.ligne})` : "frappe groupe";
-      case "helico":
-        return `helico colonne ${o.col}`;
-      case "amelioration":
-        return `amelioration ${o.quoi}`;
-      default:
-        return `${o.type} (${o.col},${o.ligne})`;
-    }
-  }
-
-  /** Un nouveau plan remplace l'ancien : axe immédiat, ordres en file. */
-  private applyGeneralPlan(plan: ClaudePlan): void {
+  /** Applique la doctrine reçue : fusionnée sur la doctrine courante, puis bornée. */
+  private applyAdvice(advice: ClaudeAdvice): void {
     const g = this.general;
-    if (!g) return;
-    // Clôture du journal du plan précédent : ce qu'il a donné.
+    const cmd = this.redCmd;
+    if (!g || !cmd) return;
+    // Clôture du journal du conseil précédent : ce qu'il a donné.
     if (g.current) {
-      g.current.partApres = this.map.share(RED);
-      g.current.orApres = this.gold[RED];
+      g.current.shareAfter = this.map.share(RED);
       g.journal.push(g.current);
       if (g.journal.length > CLAUDE_JOURNAL_MAX) g.journal.splice(0, g.journal.length - CLAUDE_JOURNAL_MAX);
     }
-    g.plan = plan;
-    g.pending = plan.ordres.slice();
-    g.reserve = plan.reserve;
-    g.orderT = 0;
-    this.axisCol[RED] = clamp(Math.round(plan.axe), 0, GRID_W - 1);
+    const old = cmd.genome;
+    const d = advice.doctrine ?? {};
+    const merged: Genome = { ...old, w: { ...old.w } };
+    for (const k of SPEND) {
+      const v = d.w?.[k];
+      if (typeof v === "number") merged.w[k] = v;
+    }
+    for (const k of Object.keys(GENE_BOUNDS) as (keyof typeof GENE_BOUNDS)[]) {
+      const v = d[k];
+      if (typeof v === "number") merged[k] = v;
+    }
+    const next = sanitizeGenome(merged, old);
+    // Résumé des vrais changements (≥ 15 %) pour le journal et le debug.
+    const changes: string[] = [];
+    const diff = (label: string, a: number, b: number): void => {
+      if (Math.abs(a - b) > Math.max(0.05, Math.abs(a) * 0.15)) changes.push(`${label} ${+a.toFixed(2)}→${+b.toFixed(2)}`);
+    };
+    for (const k of SPEND) diff(k, old.w[k], next.w[k]);
+    for (const k of Object.keys(GENE_BOUNDS) as (keyof typeof GENE_BOUNDS)[]) diff(k, old[k], next[k]);
+    cmd.genome = next;
+    g.applied++;
+    g.lastChanges = changes.join(", ") || "aucun";
     g.current = {
       t: this.elapsed,
-      axe: this.axisCol[RED],
-      reserve: plan.reserve,
-      message: plan.message,
-      faits: [],
-      ignores: [],
-      partAvant: this.map.share(RED),
-      partApres: 0,
-      orAvant: this.gold[RED],
-      orApres: 0,
+      analyse: advice.analyse,
+      changes: g.lastChanges,
+      shareBefore: this.map.share(RED),
+      shareAfter: 0,
     };
-    if (plan.message) {
-      this.enemySay = plan.message;
+    if (advice.message) {
+      this.enemySay = advice.message;
       this.enemySayAge = 0;
     }
   }
 
-  /** Exécute le premier ordre en file s'il est possible ET payable. */
-  private runGeneralOrder(): void {
-    const g = this.general;
-    if (!g || !g.pending.length || this.ended) return;
-    const o = g.pending[0];
-    const verdict = this.execGeneralOrder(o, g.reserve);
-    if (verdict === "wait") return; // pas encore l'or : on garde l'ordre en tête de file
-    g.pending.shift();
-    if (g.current) {
-      const label = this.describeOrder(o);
-      if (verdict === "done") g.current.faits.push(label);
-      else g.current.ignores.push(`${label} (${verdict.slice(5)})`);
-    }
-    this.publishGeneralDebug();
-  }
-
-  /**
-   * Même or, mêmes validations que pour un humain. Les constructions et
-   * améliorations respectent la réserve du général ; frappes et hélicos
-   * (l'usage de la réserve) ne le font pas.
-   */
-  private execGeneralOrder(o: ClaudeOrder, reserve: number): "done" | "wait" | `skip:${string}` {
-    const gold = this.gold[RED];
-    if (o.type === "caserne" || o.type === "tourelle" || o.type === "usine") {
-      const kind: BuildingType = o.type === "caserne" ? "barracks" : o.type === "tourelle" ? "turret" : "factory";
-      // Faisabilité AVANT l'or : un ordre impossible ne bloque pas la file.
-      const spot = this.nearestRedBuildable(o.col, o.ligne);
-      if (!spot) return "skip:aucune case rouge libre";
-      const cost = this.costOf(RED, kind);
-      if (gold < cost + reserve) return "wait";
-      this.gold[RED] -= cost;
-      this.placeBuilding(RED, kind, spot.c, spot.r);
-      const center = this.map.tileCenter(spot.c, spot.r);
-      this.spawnEffect(new Shockwave(center.x, center.y, 50, "#ffffff", 0.35));
-      this.sfx("build", 0.5);
-      return "done";
-    }
-    if (o.type === "amelioration") {
-      const kind: UpgradeKind = o.quoi === "tanks" ? "tank" : o.quoi === "tourelles" ? "turret" : "soldier";
-      if (gold < this.upgradeCostFor(RED, kind) + reserve) return "wait";
-      this.buyUpgrade(RED, kind);
-      return "done";
-    }
-    if (o.type === "frappe") {
-      if (gold < COST.strike) return "wait";
-      const target = this.resolveStrikeTarget(o);
-      if (!target) return "skip:aucune cible rentable";
-      this.gold[RED] -= COST.strike;
-      this.scheduleStrike(target.x, target.y, RED);
-      return "done";
-    }
-    if (o.type === "helico") {
-      if (this.helis.filter((h) => !h.dead && h.faction === RED).length >= BAL.heli.max) return "skip:3 helicos deja en vol";
-      if (gold < COST.helico) return "wait";
-      this.gold[RED] -= COST.helico;
-      this.spawnHeli(RED, this.columnCenter(o.col));
-      return "done";
-    }
-    return "skip:ordre inconnu";
-  }
-
-  /** Vise au moment du tir (l'état envoyé date de quelques secondes). */
-  private resolveStrikeTarget(o: ClaudeOrder): { x: number; y: number } | null {
-    if (o.cible === "batiment") {
-      const p = this.map.tileCenter(clamp(o.col, 0, GRID_W - 1), clamp(o.ligne, 0, GRID_H - 1));
-      let best: Building | null = null;
-      let bestD = TILE * 4;
-      for (const b of this.buildings) {
-        if (b.dead || b.faction !== BLUE || b.type === "hq") continue;
-        const d = b.distTo(p.x, p.y);
-        if (d < bestD) {
-          bestD = d;
-          best = b;
-        }
-      }
-      return best ? { x: best.cx, y: best.cy } : null;
-    }
-    const pack = this.densestBluePack(3, o.cible === "colonne" ? clamp(o.col, 0, GRID_W - 1) : -1);
-    return pack ? this.leadStrike(pack) : null;
-  }
-
-  /** Case rouge libre la plus proche de (c, r) — l'intention prime sur la case exacte. */
-  private nearestRedBuildable(c: number, r: number): { c: number; r: number } | null {
-    if (c < 0 || r < 0) {
-      // Sans case : derrière le front sur l'axe courant, comme l'IA locale.
-      const ac = this.axisCol[RED];
-      const front = this.map.blueFrontRow(ac);
-      c = ac;
-      r = clamp(front - 3, 1, GRID_H - 2);
-    }
-    c = clamp(c, 0, GRID_W - 1);
-    r = clamp(r, 0, GRID_H - 1);
-    let best: { c: number; r: number } | null = null;
-    let bestD = Infinity;
-    for (let rr = 1; rr < GRID_H - 1; rr++) {
-      for (let cc = 0; cc < GRID_W; cc++) {
-        if (!this.canRedBuildAt(cc, rr)) continue;
-        const d = (cc - c) * (cc - c) + (rr - r) * (rr - r) * 1.5;
-        if (d < bestD) {
-          bestD = d;
-          best = { c: cc, r: rr };
-        }
-      }
-    }
-    // Au-delà de 4 cases, l'intention n'a plus de sens (ex. case en zone bleue).
-    return best && bestD <= 16 ? best : null;
-  }
-
+  /** Expose l'état du général aux tests headless (aucun secret). */
   private publishGeneralDebug(): void {
     const g = this.general;
-    if (!g) return;
     const w = window as unknown as { __bgewClaude?: unknown };
-    const step = this;
-    w.__bgewClaude = {
-      turn: g.turn,
-      failures: g.failures,
-      lastError: g.lastError,
-      latencyMs: g.latencyMs,
-      lieutenantRuns: g.lieutenantRuns,
-      get online() {
-        return step.generalOnline();
-      },
-      plan: g.plan,
-      pending: g.pending.length,
-      journal: g.journal,
-      current: g.current,
-      say: this.enemySay,
-    };
-  }
-
-  /* ---------------------------------------------------------------- *
-   * Test bot (`?bot=1`) — plays MY faction via the command path
-   *
-   * The mirror means that, on every screen, "my faction" sits at the
-   * bottom and pushes upward, so one faction-generic brain works for the
-   * host (blue) and the guest (red) alike. Decisions use Math.random/
-   * randInt (NOT the sim RNG), so the bot's thinking never perturbs the
-   * deterministic srand stream — only the orders it emits do, exactly as
-   * a human tap would. Every order goes through bot* emitters that apply
-   * locally AND broadcast, so both sims run the same escalating game.
-   * ---------------------------------------------------------------- */
-
-  private playerBot(): void {
-    if (this.elapsed < AI_GRACE) return;
-    const me = this.myFaction;
-    const foe = enemyOf(me);
-    const g = this.gold[me];
-    const reserve = AI_MIN_RESERVE;
-
-    // Keep the attack axis on the hottest column (free, like the solo AI).
-    this.botAxis(this.contestedCol());
-
-    const alive = this.buildings.filter((b) => !b.dead);
-    const myB = (t: BuildingType) => alive.filter((b) => b.faction === me && b.type === t).length;
-    const myUnits = this.units.filter((u) => !u.dead && u.faction === me).length;
-    const foeUnits = this.units.filter((u) => !u.dead && u.faction === foe).length;
-
-    // 1) Airstrike a dense enemy pack.
-    if (g >= COST.strike + reserve) {
-      const pack = this.densestPack(foe, 4);
-      if (pack) {
-        this.botStrike(pack.x, pack.y);
-        return;
-      }
-    }
-    // 2) Helico raid now and then, down a contested column.
-    if (g >= COST.helico + reserve && Math.random() < 0.32) {
-      this.botHeli(this.columnCenter(this.contestedCol()));
+    if (!g) {
+      delete w.__bgewClaude;
       return;
     }
-    // 3) Upgrade to answer the current pressure.
-    if (Math.random() < 0.4) {
-      const kind: UpgradeKind = foeUnits > myUnits + 8 ? "turret" : Math.random() < 0.5 ? "soldier" : "tank";
-      if (g >= this.upgradeCostFor(me, kind) + reserve) {
-        this.botUpgrade(kind);
-        return;
-      }
-    }
-    // 4) Otherwise expand production / defense behind the front.
-    const maxBarracks = Math.min(6, 4 + Math.floor(this.elapsed / 90));
-    let want: "barracks" | "factory" | "turret" | null = null;
-    if (foeUnits > myUnits + 10 && myB("turret") < 5 && g >= this.costOf(me, "turret") + reserve) want = "turret";
-    else if (myB("barracks") < maxBarracks && g >= this.costOf(me, "barracks") + reserve * 0.4) want = "barracks";
-    else if (myB("factory") < 2 && g >= this.costOf(me, "factory") + reserve) want = "factory";
-    else if (myB("turret") < 4 && g >= this.costOf(me, "turret") + reserve) want = "turret";
-    else if (g >= this.costOf(me, "barracks") + reserve + 30) want = "barracks";
-    if (want) this.botTryBuild(want);
-  }
-
-  /** Centre of mass of the densest cluster of `f`'s units (≥ minUnits within a strike radius). */
-  private densestPack(f: Faction, minUnits: number): { x: number; y: number } | null {
-    const us = this.units.filter((u) => !u.dead && u.faction === f);
-    let best: { x: number; y: number } | null = null;
-    let bestCount = minUnits;
-    for (const u of us) {
-      let count = 0;
-      let sx = 0;
-      let sy = 0;
-      for (const o of us) {
-        if (Math.hypot(o.cx - u.cx, o.cy - u.cy) <= BAL.strike.radius) {
-          count++;
-          sx += o.cx;
-          sy += o.cy;
-        }
-      }
-      if (count > bestCount) {
-        bestCount = count;
-        best = { x: sx / count, y: sy / count };
-      }
-    }
-    return best;
-  }
-
-  /** The column where my front and the enemy's are closest — the live battle line. */
-  private contestedCol(): number {
-    const me = this.myFaction;
-    const foe = enemyOf(me);
-    let best = 8;
-    let bestGap = Infinity;
-    for (let c = 0; c < GRID_W; c++) {
-      if (!this.map.isLand(c, 1) && !this.map.isLand(c, GRID_H - 2)) continue;
-      const gap = this.map.frontRowFromTop(me, c) - this.map.frontRowFromTop(foe, c);
-      if (gap < bestGap) {
-        bestGap = gap;
-        best = c;
-      }
-    }
-    return clamp(best + randInt(-1, 1), 0, GRID_W - 1);
-  }
-
-  /** Find an owned, buildable tile just behind my front and raise `kind` there. */
-  private botTryBuild(kind: "barracks" | "factory" | "turret"): void {
-    const me = this.myFaction;
-    const axis = this.axisCol[me];
-    for (let tries = 0; tries < 20; tries++) {
-      const c = clamp(axis + randInt(-4, 4), 0, GRID_W - 1);
-      const front = this.map.frontRowFromTop(me, c); // smallest row I own (toward the enemy)
-      const r = clamp(front + randInt(0, 3), 1, GRID_H - 2); // a touch behind it
-      if (this.canBotBuildAt(me, c, r)) {
-        this.botBuild(kind, c, r);
-        return;
-      }
-    }
-    // Fallback: spread out around my HQ so saved gold still becomes useful.
-    const hq = this.buildings.find((b) => !b.dead && b.type === "hq" && b.faction === me);
-    if (!hq) return;
-    for (let tries = 0; tries < 12; tries++) {
-      const c = clamp(hq.col + randInt(-4, 4), 0, GRID_W - 1);
-      const r = clamp(hq.row + randInt(-5, -1), 1, GRID_H - 2); // toward the enemy = up = smaller row
-      if (this.canBotBuildAt(me, c, r)) {
-        this.botBuild(kind, c, r);
-        return;
-      }
-    }
-  }
-
-  private canBotBuildAt(f: Faction, c: number, r: number): boolean {
-    const i = this.map.idx(c, r);
-    return this.map.isLand(c, r) && this.map.owner[i] === f && !this.buildingAt.has(i) && !this.map.hasChest(i);
-  }
-
-  /* Bot order emitters — queue exactly like a human tap (host space, scheduled
-   * to execute at simTick+INPUT_DELAY on both clients). */
-  private botBuild(kind: "barracks" | "factory" | "turret", c: number, r: number): void {
-    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "build", kind, c, r });
-  }
-
-  private botStrike(x: number, y: number): void {
-    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "strike", x: Math.round(x), y: Math.round(y) });
-  }
-
-  private botHeli(x: number): void {
-    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "helico", x: Math.round(x) });
-  }
-
-  private botAxis(c: number): void {
-    if (this.axisCol[this.myFaction] === c) return;
-    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "axis", col: c });
-  }
-
-  private botUpgrade(kind: UpgradeKind): void {
-    const stat = this.nextStat(this.myFaction, kind);
-    this.queueCmd({ type: "cmd", faction: this.myFaction, cmd: "upgrade", kind, stat });
+    w.__bgewClaude = {
+      turn: g.turn,
+      applied: g.applied,
+      failures: g.failures,
+      inFlight: g.inFlight,
+      latencyMs: g.latencyMs,
+      lastError: g.lastError,
+      lastChanges: g.lastChanges,
+      journal: g.journal,
+      say: this.enemySay,
+      doctrine: this.redCmd?.genome ?? null,
+      spent: this.redCmd?.spent ?? null,
+    };
   }
 
   /* ---------------------------------------------------------------- *

@@ -40,14 +40,17 @@ firebase emulators:start --only functions,firestore   # full local run
 
 # Niveau CLAUDE — `claudeTurn`
 
-Le dernier niveau solo (**CLAUDE (PRIVE)** dans le menu) fait jouer le général
-rouge par un vrai modèle Claude (Anthropic). Le client envoie, toutes les
-quelques secondes, l'état du jeu **tel que le joueur le voit** (carte ASCII,
-bâtiments, unités par colonne, niveaux, ordres visibles) plus un court journal
-des décisions précédentes ; le modèle répond un plan structuré (axe, réserve
-d'or, 0 à 4 ordres, une réplique) que le **lieutenant local** (`game.step.ts`)
-exécute avec exactement les règles et l'or d'un joueur humain. Fair-play
-inchangé : aucun or, aucune information, aucune unité en plus.
+Le dernier niveau solo (**CLAUDE (PRIVE)** dans le menu) donne au commandant
+rouge un stratège : un vrai modèle Claude (Anthropic). Le commandant local
+(`src/commander.ts`, entraîné par auto-jeu) joue en continu sans jamais
+attendre. Toutes les ~20 s, le client envoie un **rapport** (ce que le joueur
+voit : territoire, bâtiments, unités, niveaux — plus ce que le joueur a fait :
+bâtiments posés, améliorations, frappes, axe) et un court journal des doctrines
+précédentes ; le modèle répond une **doctrine** structurée (poids de dépense,
+seuils, réactions, une réplique) que le client borne puis applique au
+commandant. Fair-play inchangé : aucun or, aucune information, aucune unité en
+plus. Réglage conseillé : `CLAUDE_EFFORT=low` (un conseil toutes les 20 s n'a
+pas besoin d'une longue réflexion, et la latence compte).
 
 Le niveau est **protégé par mot de passe** pour le moment : le mot de passe
 borne la facture API et la clé Anthropic ne quitte jamais la fonction.

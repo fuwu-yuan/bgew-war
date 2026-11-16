@@ -54,44 +54,63 @@ http://<ip-locale>:5050/?server=<ip-locale>:8090
 Sans `?server=`, le jeu vise le serveur officiel — rien à changer le jour où il
 revient.
 
-## Améliorer les soldats
+## Comment jouer
 
-Le bouton **SOLDATS+** monte le niveau de vos soldats (1 → 5) : +1 PV, +0,5
-dégât, +5 portée, +5 vitesse et cadence +5 % par niveau. Le coût croît
-(80, 160, 240, 320 or) et chaque caserne produit au niveau courant — les
-vétérans déjà déployés gardent le leur (chevrons dorés au-dessus du casque).
-En solo, l'IA rouge achète aussi ses niveaux.
+- Les unités sortent toutes seules des casernes et des usines et poussent le
+  front. Votre armée se déploie sur ≈ 6 colonnes de part et d'autre de l'**AXE**
+  (touchez le bouton puis une colonne).
+- **L'or** : 120 au départ, +3/s, +1 par case conquise, +25 par coffre, primes
+  sur les ennemis abattus.
+- **Ligne du bas — bâtiments et ordres** : CASERNE, TOURELLE, USINE (le prix
+  monte avec le nombre que vous possédez, et retombe si on vous en détruit),
+  HELICO (appui-feu sur une colonne, seules les tourelles l'abattent), FRAPPE
+  (bombardement de zone, alliés compris).
+- **Ligne du milieu — FORCE** et **ligne du haut — DÉFENSE** : deux voies
+  d'amélioration séparées pour les soldats, les tanks, les tourelles et les
+  hélicos. Galons dorés (force) et bleus (défense) au-dessus des unités.
+- **Le QG est une forteresse** qui tire des obus à éclats et lève deux vagues
+  de défense. **Mort subite à 6:00** : le QG du camp qui tient le moins de
+  territoire s'effrite.
+
+Tous les chiffres sont dans `src/balance.ts` ; la méthode d'équilibrage et les
+mesures dans `BALANCE.md`.
+
+## L'IA : un commandant entraîné par auto-jeu
+
+En solo, l'armée rouge est jouée par un **commandant** (`src/commander.ts`) qui
+donne ses ordres par le même chemin qu'un humain : même or, mêmes prix, aucune
+unité gratuite. Son comportement tient dans un **génome** (poids de dépense,
+seuils, réactions). Les niveaux FACILE et MOYEN utilisent une doctrine de base
+avec des handicaps (réflexion lente, hésitations, moins d'or au départ) ;
+DIFFICILE et IMBATTABLE utilisent la doctrine **entraînée** (`src/trained.ts`).
+
+```bash
+npm run train          # entraînement sans affichage (le plus rapide, pour la nuit)
+npm run train:show     # mur de batailles sur tous les écrans (10 par écran)
+node tools/train.mjs --show --screens 2,3 --cols 6 --rows 3 --speed 8
+npm run lab            # tournoi d'équilibrage entre styles de jeu
+```
+
+L'entraînement ne coûte rien (aucun appel à l'API) : une population de génomes
+s'affronte, les meilleurs survivent, se croisent et mutent. L'état est sauvé
+dans `training/` à chaque génération (relancer reprend où on en était, `--fresh`
+repart de zéro) et le champion est écrit dans `src/trained.ts`. Ctrl+C sauve
+et exporte.
 
 ## Niveau CLAUDE (privé)
 
-Cinquième niveau solo : le général rouge est un **vrai modèle Claude** (Anthropic),
-interrogé via la Cloud Function `claudeTurn` (voir `functions/README.md`). Il ne
-voit que ce que vous voyez et joue avec vos règles et votre revenu ; ses ordres
-sont exécutés par un « lieutenant » local qui garde les réflexes du niveau
-IMBATTABLE (défense du QG, visée des frappes) et reprend seul la partie si le
-serveur ne répond plus. Ses répliques s'affichent sous la barre de territoire.
-Le niveau est protégé par **mot de passe** pour le moment (clé API et facture).
+Cinquième niveau solo : le commandant entraîné joue en continu, et un **vrai
+modèle Claude** (Anthropic) est son stratège. Toutes les ~20 s, le jeu envoie à
+la Cloud Function `claudeTurn` un rapport (ce que vous voyez à l'écran + ce que
+VOUS avez fait : bâtiments, améliorations, frappes, axe) ; Claude renvoie une
+**doctrine** que le commandant applique aussitôt, et une réplique affichée sous
+la barre de territoire. Le commandant n'attend jamais le général : si le
+serveur ne répond pas, la partie continue. Le niveau est protégé par **mot de
+passe** pour le moment (clé API et facture). Voir `functions/README.md`.
 
 Tests : `node tools/claude-test.mjs` (Chromium headless, fonction simulée :
-menu, mot de passe, tours du général, mode dégradé, refus) et
+menu, mot de passe, rapports, doctrine appliquée, mode dégradé, refus) et
 `node tools/claude-function-test.mjs` (module de la fonction, sans réseau).
-
-## Comment jouer
-
-- Les unités sortent toutes seules des casernes et poussent le front.
-- **L'or** vient des cases conquises (+1), des coffres (+25) et des ennemis
-  abattus (+3 soldat, +10 tank, +20/30 bâtiment).
-- **CASERNE** (50), **TOURELLE** (75), **USINE** (120) : touchez le bouton puis
-  une case à vous, libre.
-- **SOLDATS+** : améliore vos soldats (5 niveaux, voir plus bas).
-- **FRAPPE** (100) : bombardement de zone après un court délai — dégâts pour
-  TOUT le monde dans le rayon, alliés compris.
-- **AXE** : touchez une colonne — vos troupes convergeront dessus.
-- **Le QG est une forteresse** : 150 PV et il tire. Le rush direct meurt sur
-  ses canons — il faut gagner le front d'abord.
-- L'IA rouge pense toutes les 3 s, lève une **garnison d'urgence** quand son
-  QG est menacé, achète ses propres améliorations et frappes, et son revenu
-  augmente avec le temps : traîner, c'est perdre.
 
 ## Assets (tous CC0 / libres)
 

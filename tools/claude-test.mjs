@@ -1,13 +1,14 @@
 /**
  * Test headless du niveau CLAUDE (client) — sans réseau ni clé API : la
  * Cloud Function `claudeTurn` est interceptée (Playwright route) et jouée par
- * un faux général scripté qui lit l'état reçu et répond des plans plausibles.
+ * un faux général scripté qui lit le rapport reçu et répond une doctrine.
  *
  * Vérifie, dans Chromium :
  *   1. le menu : bouton CLAUDE (PRIVE) → invite mot de passe → ping → partie ;
- *   2. la boucle général/lieutenant : tours, journal, ordres exécutés, réplique
- *      affichée, aucun appel concurrent, état envoyé = carte + colonnes ;
- *   3. le mode dégradé : fonction en panne → le lieutenant (IA locale) joue ;
+ *   2. la boucle stratège/commandant : rapports envoyés, doctrine appliquée et
+ *      bornée, journal, réplique affichée, aucun appel concurrent, et le
+ *      commandant local qui joue sans attendre le général ;
+ *   3. le mode dégradé : fonction en panne → le commandant joue quand même ;
  *   4. le refus : mauvais mot de passe → message, pas de partie.
  * Captures dans /tmp/bgew-war-claude-*.png. Échec sur toute erreur console.
  *
@@ -52,44 +53,24 @@ const errors = [];
 const PASSWORD = "sesame-test";
 
 /* ------------------------------------------------------------------ *
- * Faux général : lit l'état (carte, colonnes, bâtiments) et répond un plan
- * crédible — comme le ferait le modèle — avec une latence simulée.
+ * Faux général : lit le rapport et répond une doctrine — comme le ferait le
+ * modèle — avec une latence simulée. Il glisse exprès une valeur hors bornes
+ * (maxTurrets 99) et un champ illisible (heliMaxAA null) : le client doit
+ * borner la première et laisser le second inchangé.
  * ------------------------------------------------------------------ */
 const calls = [];
 let concurrent = 0;
 let maxConcurrent = 0;
-function fakeGeneral(state) {
-  const cols = state.cols;
-  // Axe : colonne terrestre où les bleus sont les plus rares et le front le plus haut.
-  let axe = 8;
-  let best = -Infinity;
-  for (let c = 0; c < 16; c++) {
-    if (cols.blueFront[c] >= 22) continue;
-    const score = cols.blueFront[c] * 1.2 - cols.blue[c] * 0.6;
-    if (score > best) {
-      best = score;
-      axe = c;
-    }
-  }
-  const front = cols.blueFront[axe];
-  const blueTurrets = state.blueBuildings.filter((b) => b.type === "turret").length;
-  const ordres = [];
-  const turn = state.turn;
-  // v1.10 (économie plus lente) : caserne aux tours impairs, frappe aux tours pairs —
-  // sinon la frappe (sans réserve) mange l'or de la caserne à chaque tour.
-  if (turn % 2 === 1) ordres.push({ type: "caserne", col: axe, ligne: Math.max(1, front - 3), cible: "aucune", quoi: "aucune" });
-  if (turn % 4 === 2) ordres.push({ type: "tourelle", col: axe, ligne: Math.max(1, front - 4), cible: "aucune", quoi: "aucune" });
-  if (turn % 2 === 0) ordres.push({ type: "frappe", col: axe, ligne: -1, cible: "groupe", quoi: "aucune" });
-  if (turn % 5 === 3) ordres.push({ type: "amelioration", col: -1, ligne: -1, cible: "aucune", quoi: "soldats" });
-  if (blueTurrets < 2 && turn % 4 === 0) ordres.push({ type: "helico", col: axe, ligne: -1, cible: "aucune", quoi: "aucune" });
-  // Un ordre volontairement impossible : case en zone bleue (doit être ignoré proprement).
-  if (turn === 6) ordres.unshift({ type: "usine", col: 8, ligne: 20, cible: "aucune", quoi: "aucune" });
+function fakeGeneral(report) {
+  const d = JSON.parse(JSON.stringify(report.doctrine));
+  d.w.strike = 5.5;
+  d.bank = 77;
+  d.maxTurrets = 99;
+  d.heliMaxAA = null;
   return {
-    analyse: `Tour ${turn} : je pousse colonne ${axe}.`,
-    message: turn === 1 ? "Je vois votre jeu. Commençons." : `Colonne ${axe}, en avant.`,
-    axe,
-    reserve: 20, // v1.10 : économie plus lente — la 1re caserne (50) doit passer avec les 80 or de départ
-    ordres: ordres.slice(0, 4),
+    analyse: `Rapport ${report.turn} : le joueur a posé ${report.habits.barracks} caserne(s), je frappe plus.`,
+    message: report.turn === 1 ? "Je vois votre jeu. Commençons." : "Mes frappes vous attendent.",
+    doctrine: d,
   };
 }
 
@@ -128,11 +109,11 @@ async function routeFunction(page, mode) {
     calls.push(body);
     await new Promise((r) => setTimeout(r, 900)); // latence modèle simulée
     concurrent--;
-    const plan = fakeGeneral(body.state);
+    const advice = fakeGeneral(body.report);
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify({ result: { plan, latencyMs: 900, model: "fake" } }),
+      body: JSON.stringify({ result: { advice, latencyMs: 900, model: "fake" } }),
     });
   });
 }
@@ -178,13 +159,15 @@ function hook(page, tag, expectHttpErrors = false) {
   await page.waitForTimeout(3000);
   await page.mouse.click(...at(157, 992)); // CASERNE
   await page.waitForTimeout(200);
-  await page.mouse.click(...at(320, 700));
+  await page.mouse.click(...at(240, 700)); // case bleue libre (6,17)
   await page.mouse.click(...at(587, 992)); // AXE
   await page.waitForTimeout(200);
   await page.mouse.click(...at(140, 480));
   await page.waitForTimeout(4000);
   await page.screenshot({ path: "/tmp/bgew-war-claude-3-say.png" });
-  await page.waitForTimeout(22000);
+  await page.waitForTimeout(8000);
+  await page.screenshot({ path: "/tmp/bgew-war-claude-3b-first-advice.png" });
+  await page.waitForTimeout(24000); // 2e rapport (≈ 31 s) + sa réponse
   await page.screenshot({ path: "/tmp/bgew-war-claude-4-midgame.png" });
 
   const g = await page.evaluate(() => {
@@ -198,39 +181,41 @@ function hook(page, tag, expectHttpErrors = false) {
     };
   });
   const c = g.claude || {};
-  console.log("[claude] tours", c.turn, "échecs", c.failures, "journal", (c.journal || []).length, "say:", JSON.stringify(c.say));
-  for (const j of c.journal || []) console.log("   ", `t=${Math.round(j.t)}`, "axe", j.axe, "faits:", j.faits.join(", ") || "-", "| ignorés:", j.ignores.join(", ") || "-");
+  console.log("[claude] rapports", c.turn, "conseils", c.applied, "échecs", c.failures, "journal", (c.journal || []).length, "say:", JSON.stringify(c.say));
+  console.log("   changements du dernier conseil :", c.lastChanges);
+  for (const j of c.journal || []) console.log("   ", `t=${Math.round(j.t)}`, j.changes, `| territoire ${Math.round(j.shareBefore * 100)} → ${Math.round(j.shareAfter * 100)} %`);
   if (!g.enemyName.includes("CLAUDE")) errors.push(`GAME: nom adverse inattendu « ${g.enemyName} »`);
-  if (!c.turn || c.turn < 5) errors.push(`GAME: trop peu de tours du général (${c.turn})`);
+  if (!c.turn || c.turn < 2) errors.push(`GAME: trop peu de rapports au général (${c.turn})`);
   if (c.failures) errors.push(`GAME: échecs d'appel (${c.failures}) ${c.lastError}`);
-  if (!c.online) errors.push("GAME: général considéré hors-ligne");
-  if ((c.journal || []).length < 3) errors.push("GAME: journal trop court");
-  const faits = (c.journal || []).flatMap((j) => j.faits);
-  const ignores = (c.journal || []).flatMap((j) => j.ignores);
-  // Le journal ne garde que 6 tours : une caserne posée plus tôt se voit au nombre de
-  // bâtiments rouges (6 au départ) ; une frappe traitée peut avoir été écartée faute de cible.
-  if (!faits.some((f) => f.startsWith("caserne")) && g.redBuildings <= 6) errors.push("GAME: aucune caserne construite par le général");
-  if (![...faits, ...ignores].some((f) => f.startsWith("frappe"))) errors.push("GAME: aucun ordre de frappe traité");
-  if (!ignores.some((f) => f.startsWith("usine (8,20) (aucune case"))) errors.push(`GAME: l'ordre impossible n'a pas été ignoré (${ignores.join(" | ")})`);
+  if (!c.applied || c.applied < 2) errors.push(`GAME: conseils non appliqués (${c.applied})`);
+  if ((c.journal || []).length < 1) errors.push("GAME: journal vide");
   if (!c.say) errors.push("GAME: aucune réplique reçue");
   if (maxConcurrent > 1) errors.push(`GAME: ${maxConcurrent} appels concurrents`);
-  // (pas de seuil sur les bâtiments vivants : le faux général pose ses casernes
-  // trop près du front et le joueur-test les détruit — c'est son jeu, pas un bug)
-  // L'état envoyé ressemble bien à ce que le modèle attend.
-  const st = calls[calls.length - 1]?.state;
-  if (!st || st.map.length !== 22 || st.map.some((l) => l.length !== 16)) errors.push("GAME: carte envoyée malformée");
+  // La doctrine reçue est appliquée, bornée, et les champs illisibles sont ignorés.
+  const d = c.doctrine || { w: {} };
+  if (d.w.strike !== 5.5 || d.bank !== 77) errors.push(`GAME: doctrine non appliquée (strike ${d.w.strike}, bank ${d.bank})`);
+  if (d.maxTurrets !== 12) errors.push(`GAME: valeur hors bornes non ramenée (maxTurrets ${d.maxTurrets})`);
+  if (typeof d.heliMaxAA !== "number") errors.push("GAME: un champ illisible a écrasé la doctrine (heliMaxAA)");
+  // Le commandant local joue sans attendre le général.
+  const spent = Object.values(c.spent || {}).reduce((a, b) => a + b, 0);
+  if (!(spent > 0)) errors.push("GAME: le commandant local n'a rien dépensé");
+  // Le rapport envoyé ressemble bien à ce que le modèle attend.
+  const last = calls[calls.length - 1];
+  const rp = last?.report;
+  if (!rp) errors.push("GAME: aucun rapport reçu par la fonction");
   else {
-    if (!st.map[2].includes("Q") || !st.map.some((l) => l.includes("q"))) errors.push("GAME: QG absents de la carte envoyée");
-    if (st.cols.blueFront.length !== 16) errors.push("GAME: colonnes malformées");
-    if (typeof st.gold !== "number" || "blueGold" in st) errors.push("GAME: état malformé (or)");
-    if (!Array.isArray(calls[calls.length - 1].journal)) errors.push("GAME: journal absent de la requête");
+    if (typeof rp.gold !== "number" || "blueGold" in rp || "gold" in (rp.foe || {})) errors.push("GAME: rapport malformé (or)");
+    if (!rp.foe || rp.foe.barracks < 3 || !rp.me || !rp.me.ups) errors.push("GAME: rapport malformé (camps)");
+    if (!rp.doctrine || typeof rp.doctrine.w?.barracks !== "number") errors.push("GAME: doctrine absente du rapport");
+    if (!rp.habits || rp.habits.barracks < 1 || !rp.habits.recent.length) errors.push(`GAME: l'ordre du joueur n'a pas été observé (${JSON.stringify(rp.habits)})`);
+    if (!Array.isArray(last.journal)) errors.push("GAME: journal absent de la requête");
   }
-  console.log(`[claude] ${calls.length} appels, max concurrents ${maxConcurrent}, dernière carte :\n   ` + st.map.join("\n   "));
+  console.log(`[claude] ${calls.length} appels, max concurrents ${maxConcurrent}`);
   await page.close();
 }
 
 /* ------------------------------------------------------------------ *
- * 3 — fonction en panne pendant la partie : le lieutenant prend le relais
+ * 3 — fonction en panne pendant la partie : le commandant joue quand même
  * ------------------------------------------------------------------ */
 {
   const page = await browser.newPage({ viewport: { width: 760, height: 1100 } });
@@ -244,26 +229,26 @@ function hook(page, tag, expectHttpErrors = false) {
   await page.waitForTimeout(1200);
   await page.evaluate(() => window.__bgewwar.board.moveToStep("game", {}));
   await page.waitForTimeout(34000);
-  await page.screenshot({ path: "/tmp/bgew-war-claude-5-lieutenant.png" });
+  await page.screenshot({ path: "/tmp/bgew-war-claude-5-down.png" });
   const d = await page.evaluate(() => {
     const play = window.__bgewwar.steps.play;
     const c = window.__bgewClaude || {};
     return {
+      turn: c.turn,
       failures: c.failures,
-      online: c.online,
+      applied: c.applied,
       lastError: c.lastError,
-      lieutenantRuns: c.lieutenantRuns,
+      spent: Object.values(c.spent || {}).reduce((a, b) => a + b, 0),
       elapsed: Math.round(play.elapsed),
       redBuildings: play.buildings.filter((b) => b.faction === 1 && !b.dead).length,
-      redLevels: play.levels[1] + play.tankLevels[1] + play.turretLevels[1],
       redGold: Math.round(play.gold[1]),
     };
   });
-  console.log("[down] t", d.elapsed, "échecs", d.failures, "online", d.online, "cycles lieutenant", d.lieutenantRuns, "bâtiments rouges", d.redBuildings, "niveaux", d.redLevels, "or", d.redGold, "—", d.lastError);
+  console.log("[down] t", d.elapsed, "rapports", d.turn, "échecs", d.failures, "or dépensé par le commandant", d.spent, "bâtiments rouges", d.redBuildings, "or", d.redGold, "—", d.lastError);
   if (!d.failures) errors.push("DOWN: aucun échec enregistré alors que la fonction est en panne");
-  if (d.online) errors.push("DOWN: le général devrait être hors-ligne");
-  // Après 14 s de silence, l'IA locale pense toutes les 3 s.
-  if (!d.lieutenantRuns || d.lieutenantRuns < 3) errors.push(`DOWN: le lieutenant n'a pas pris le relais (${d.lieutenantRuns} cycles)`);
+  if (d.applied) errors.push("DOWN: un conseil a été appliqué alors que la fonction est en panne");
+  // Le général est muet, mais le commandant local joue : il doit avoir dépensé son or.
+  if (!(d.spent > 100)) errors.push(`DOWN: le commandant n'a pas joué sans le général (or dépensé ${d.spent})`);
   await page.close();
 }
 
