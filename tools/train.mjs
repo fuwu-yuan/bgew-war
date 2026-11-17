@@ -397,11 +397,14 @@ async function shutdown() {
   await Promise.all(closers.map((c) => c().catch(() => {})));
   server.close();
 }
-process.on("SIGINT", () => {
-  if (stopping) process.exit(1);
-  stopping = true;
-  console.log("\nArrêt demandé : je sauve l'état et j'exporte le champion…");
-});
+// Ctrl+C ou arrêt de la tâche : on finit proprement (état sauvé, champion exporté).
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, () => {
+    if (stopping) process.exit(1);
+    stopping = true;
+    console.log("\nArrêt demandé : je sauve l'état et j'exporte le champion…");
+  });
+}
 
 // --snap fichier.png : capture du premier mur après 25 s (vérification sans regarder l'écran)
 if (SHOW && arg("snap", "")) {

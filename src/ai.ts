@@ -35,6 +35,8 @@ export interface AiTuning {
   genome: "trained" | "base";
   /** Retouches de doctrine propres au niveau (ex. le niveau facile n'utilise ni frappe ni hélico). */
   tweak?: (g: Genome) => void;
+  /** Part de doctrine entraînée mélangée à la doctrine de base (0 à 1). */
+  mix?: number;
   /** Niveau verrouillé par mot de passe (menu). */
   locked?: boolean;
 }
@@ -75,6 +77,7 @@ export const AI_TUNING: Record<Difficulty, AiTuning> = {
     brainEvery: 1.5,
     skipChance: 0,
     genome: "trained",
+    mix: 0.5,
   },
   insane: {
     label: "IMBATTABLE",
@@ -102,6 +105,18 @@ export const AI_TUNING: Record<Difficulty, AiTuning> = {
 /** Doctrine de départ du commandant pour ce niveau (copie indépendante). */
 export function genomeFor(t: AiTuning): Genome {
   const g = sanitizeGenome(t.genome === "trained" ? TRAINED_GENOME : BASE_GENOME);
+  // `mix` : part de la doctrine entraînée (le reste = doctrine de base) — un
+  // niveau intermédiaire entre le commandant « moyen » et le champion.
+  if (t.mix !== undefined) {
+    const a = sanitizeGenome(BASE_GENOME) as unknown as Record<string, number | Record<string, number>>;
+    const b = sanitizeGenome(TRAINED_GENOME) as unknown as Record<string, number | Record<string, number>>;
+    const out = g as unknown as Record<string, number | Record<string, number>>;
+    const lerp = (x: number, y: number) => x + (y - x) * t.mix!;
+    for (const k of Object.keys(a)) {
+      if (k === "w") for (const c of Object.keys(a.w)) (out.w as Record<string, number>)[c] = lerp((a.w as Record<string, number>)[c], (b.w as Record<string, number>)[c]);
+      else out[k] = lerp(a[k] as number, b[k] as number);
+    }
+  }
   t.tweak?.(g);
   return sanitizeGenome(g);
 }
