@@ -25,6 +25,7 @@ import {
   where,
 } from "firebase/firestore";
 import { getFunctions, httpsCallable } from "firebase/functions";
+import type { SoloRecord } from "./solo-record";
 
 const firebaseConfig = {
   apiKey: "AIzaSyBPMtXSVhT68iJbdnrZKyQ58LPmHJm1E6c",
@@ -233,6 +234,22 @@ export async function submitMatchResult(s: MatchSubmission): Promise<MatchOutcom
   const fn = httpsCallable<MatchSubmission, MatchOutcome>(functions, "submitMatchResult");
   const res = await fn({ ...s, time: Math.round(s.time) });
   return res.data;
+}
+
+/**
+ * Envoie une partie solo terminée à l'historique d'apprentissage (collection
+ * `soloMatches`, écrite par la fonction `recordSoloMatch`). Silencieux : un
+ * échec réseau ne doit jamais gêner le joueur.
+ */
+export async function recordSoloMatch(record: SoloRecord): Promise<void> {
+  if (DISABLED) return;
+  try {
+    const { map, cmds, ...meta } = record;
+    const fn = httpsCallable(functions, "recordSoloMatch");
+    await fn({ ...meta, map: JSON.stringify(map), cmds: JSON.stringify(cmds) });
+  } catch {
+    /* hors ligne, quota… : tant pis pour cette partie */
+  }
 }
 
 export async function loadLeaderboard(n = 10): Promise<LeaderboardEntry[]> {

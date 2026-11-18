@@ -90,8 +90,9 @@ export const BAL = {
   /** Un chantier démarre à cette fraction de ses pv. */
   siteHp: 0.3,
 
-  /** Frappe aérienne : touche LES DEUX camps dans le rayon. */
-  strike: { radius: 105, dmgUnit: 16, dmgBuilding: 120, delay: 0.9 },
+  /** Frappe aérienne : touche LES DEUX camps dans le rayon. `cooldown` = temps de
+   *  rechargement (s) entre deux frappes d'un même camp : pas de bombardement en chaîne. */
+  strike: { radius: 105, dmgUnit: 16, dmgBuilding: 120, delay: 0.9, cooldown: 20 },
 
   /** Hélico d'appui : ralentit (× strafeSlow) tant qu'il a une cible, `fuel` s
    *  d'autonomie à l'aller, demi-tour à `turnBack` px du bord adverse (il

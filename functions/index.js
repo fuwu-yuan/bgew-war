@@ -241,3 +241,56 @@ exports.claudeTurn = onCall(
 
 /** Exposé pour les tests Node (tools/claude-function-test.mjs). */
 exports._claudePrompt = buildPrompt;
+
+/* ------------------------------------------------------------------ *
+ * Historique des parties SOLO (apprentissage du bot)
+ *
+ * Le jeu envoie, à la fin d'une partie solo, de quoi la rejouer : graine,
+ * carte, équilibrage et ordres des deux camps. Aucune donnée personnelle hors
+ * l'uid du joueur s'il est connecté. Écriture uniquement ici (Admin SDK) ; la
+ * collection `soloMatches` est fermée aux clients par les règles Firestore.
+ * ------------------------------------------------------------------ */
+const SOLO_LEVELS = ["easy", "medium", "hard", "insane", "claude"];
+const SOLO_DAILY_CAP = 5000; // garde-fou : parties enregistrées par jour, tous joueurs confondus
+
+exports.recordSoloMatch = onCall({ memory: "256MiB" }, async (request) => {
+  const d = request.data || {};
+  const str = (v, max) => typeof v === "string" && v.length > 0 && v.length <= max;
+  const num = (v, lo, hi) => typeof v === "number" && Number.isFinite(v) && v >= lo && v <= hi;
+  if (!str(d.version, 20) || !SOLO_LEVELS.includes(d.difficulty)) throw new HttpsError("invalid-argument", "meta");
+  if (!num(d.seed, 0, 0xffffffff) || !num(d.ticks, 1, 60 * 3600) || !num(d.time, 30, 3600) || !num(d.share, 0, 1)) throw new HttpsError("invalid-argument", "nombres");
+  if (typeof d.win !== "boolean") throw new HttpsError("invalid-argument", "win");
+  if (!str(d.map, 60000) || !str(d.cmds, 400000) || !str(d.bal, 20000)) throw new HttpsError("invalid-argument", "taille");
+  let cmds;
+  try {
+    cmds = JSON.parse(d.cmds);
+    JSON.parse(d.map);
+    JSON.parse(d.bal);
+  } catch {
+    throw new HttpsError("invalid-argument", "json");
+  }
+  if (!Array.isArray(cmds) || cmds.length > 6000) throw new HttpsError("invalid-argument", "cmds");
+
+  const dayRef = db.collection("soloUsage").doc(new Date().toISOString().slice(0, 10));
+  const day = await dayRef.get();
+  if (day.exists && (Number(day.data().matches) || 0) >= SOLO_DAILY_CAP) throw new HttpsError("resource-exhausted", "quota");
+  await dayRef.set({ matches: FieldValue.increment(1) }, { merge: true });
+
+  const uid = request.auth && request.auth.token.firebase.sign_in_provider !== "anonymous" ? request.auth.uid : "";
+  await db.collection("soloMatches").add({
+    version: d.version,
+    difficulty: d.difficulty,
+    seed: d.seed,
+    ticks: Math.round(d.ticks),
+    time: Math.round(d.time),
+    win: d.win,
+    share: d.share,
+    orders: cmds.length,
+    map: d.map,
+    cmds: d.cmds,
+    bal: d.bal,
+    uid,
+    createdAt: FieldValue.serverTimestamp(),
+  });
+  return { ok: true };
+});

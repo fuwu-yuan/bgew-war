@@ -12,12 +12,14 @@ import {
   TILE,
   VIEW_W,
   enemyOf,
+  GAME_VERSION,
 } from "../globals";
 import { clamp, pick, rand, sha256, TAU } from "../utils";
 import { seedSim, srand } from "../sim-rng";
 import { BASE_GENOME, BattleView, Commander, GENE_BOUNDS, Genome, sanitizeGenome, SPEND } from "../commander";
 import { BAL, buildCost, BuildKind, upgradeCost, UpgradeKind, UpgradeStat, UpLevels, UPGRADE_KINDS } from "../balance";
-import { TileMap } from "../entities/tilemap";
+import { TileMap, type MapInitData } from "../entities/tilemap";
+import type { RecordedCmd, SoloRecord } from "../solo-record";
 import { Bullet, Soldier, Tank, Unit } from "../entities/units";
 import { Building, BUILDING_CODE, BuildingType, turretMaxHp } from "../entities/buildings";
 import { Helicopter } from "../entities/helicopter";
@@ -28,7 +30,7 @@ import { RemoteWorld } from "../entities/remote";
 import { CmdMsg, EndMsg, FrameMsg, GameMsg, gameData, InitMsg, IpMsg, MultiData, SnapMsg, VoidMsg } from "../network";
 import { track, trackScreen } from "../analytics";
 import { toggleMute } from "../sound";
-import { currentUser, displayName } from "../firebase";
+import { currentUser, displayName, recordSoloMatch } from "../firebase";
 import { AI_TUNING, AiTuning, CLAUDE_DIFFICULTY, DIFFICULTIES, Difficulty, genomeFor } from "../ai";
 import {
   askClaudeAdvice,
@@ -77,6 +79,7 @@ function newMatchId(): string {
   if (c && typeof c.randomUUID === "function") return c.randomUUID();
   return `m-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
 }
+const SOLO_RECORD_MIN = 30; // s — en dessous, la partie n'apprend rien : pas d'envoi
 const BOT_GRACE = 6; // s before the test bot (?bot=1) starts spending
 
 /* Niveau CLAUDE — cadence du général-stratège (le commandant local, lui, joue en continu) */
@@ -168,6 +171,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   /* Airstrikes in flight */
   private strikes: { x: number; y: number; t: number; faction: Faction }[] = [];
   private hqLastHp: Record<Faction, number> = { [RED]: 0, [BLUE]: 0 };
+  /** Rechargement de la frappe aérienne (s restantes), par camp — dans la sim (lockstep). */
+  private strikeCd: Record<Faction, number> = { [RED]: 0, [BLUE]: 0 };
   private hqDefenseUsed: Record<Faction, number> = { [RED]: 0, [BLUE]: 0 }; // vagues de défense déjà levées
 
   /* HudState */
@@ -198,6 +203,14 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
   private brainT = 0;
   /** Coupe l'IA rouge (banc d'essai : deux commandants pilotés de l'extérieur). */
   public aiOff = false;
+  /** Enregistrement de la partie solo : graine + carte + tous les ordres exécutés
+   *  (les deux camps). La sim étant déterministe, cela suffit à la rejouer. */
+  private rec: { seed: number; map: MapInitData; cmds: RecordedCmd[] } | null = null;
+  private recPhase: 0 | 1 = 0; // 0 = ordres planifiés du tick, 1 = ordres de l'IA (après l'avance du monde)
+  /** Relecture : ordres de phase 1 à rejouer au même endroit du tick. */
+  private replayAi: Map<number, CmdMsg[]> | null = null;
+  /** Dernière partie solo enregistrée (lue par les outils de test). */
+  public lastRecord: SoloRecord | null = null;
   /* Solo difficulty: every knob is a handicap or smarter play — never free gold. */
   private difficulty: Difficulty = "medium";
   private tun: AiTuning = AI_TUNING.medium;
@@ -292,6 +305,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       get units() {
         return self.units;
       },
+      strikeReady: (f: Faction) => self.strikeCd[f] <= 0,
       get buildings() {
         return self.buildings;
       },
@@ -372,7 +386,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
    * Lifecycle
    * ---------------------------------------------------------------- */
 
-  onEnter(data: { multi?: MultiData; difficulty?: Difficulty }): void {
+  onEnter(data: { multi?: MultiData; difficulty?: Difficulty; replay?: SoloRecord }): void {
     this.role = data?.multi ? (data.multi.role === "guest" ? "guest" : "host") : "solo";
     this.myFaction = this.role === "guest" ? RED : BLUE;
 
@@ -416,7 +430,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.matchSeed = this.role === "host" ? (Math.floor(Math.random() * 0xffffffff) >>> 0) : 0;
     // Seed the sim RNG now for the host/solo (which run the sim). The guest
     // reseeds when it receives the host's seed in `init`.
-    if (this.role !== "guest") seedSim(this.role === "solo" ? (Math.floor(Math.random() * 0xffffffff) >>> 0) : this.matchSeed);
+    const replay = this.role === "solo" ? data?.replay : undefined;
+    const soloSeed = replay ? replay.seed >>> 0 : Math.floor(Math.random() * 0xffffffff) >>> 0;
+    if (this.role !== "guest") seedSim(this.role === "solo" ? soloSeed : this.matchSeed);
 
     trackScreen("game");
     track("game_start", {
@@ -465,6 +481,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     this.outgoing = [];
     this.nextNid = 1;
     this.strikes = [];
+    this.strikeCd = { [RED]: 0, [BLUE]: 0 };
     this.hqLastHp = { [RED]: 0, [BLUE]: 0 };
     this.hqDefenseUsed = { [RED]: 0, [BLUE]: 0 };
     this.inited = this.role !== "guest";
@@ -485,6 +502,26 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
     this.map = new TileMap();
     this.board.addEntity(this.map);
+    // Relecture d'une partie enregistrée : même carte, IA coupée, ordres rejoués
+    // aux mêmes ticks (et à la même phase du tick) que dans la partie d'origine.
+    this.replayAi = null;
+    this.rec = null;
+    if (replay) {
+      this.map.applyInit(replay.map);
+      this.aiOff = true;
+      this.general = null;
+      this.replayAi = new Map();
+      for (const rc of replay.cmds) {
+        const { t, p, ...rest } = rc;
+        const cmd = { type: "cmd", ...rest } as CmdMsg;
+        const bucket = p === 1 ? this.replayAi : this.pendingCmds;
+        const list = bucket.get(t);
+        if (list) list.push(cmd);
+        else bucket.set(t, [cmd]);
+      }
+    } else if (this.role === "solo") {
+      this.rec = { seed: soloSeed, map: this.map.getInitData(), cmds: [] };
+    }
 
     if (this.role === "guest") {
       // Lockstep: the guest builds the SAME initial state from the host's seed
@@ -717,6 +754,10 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
    */
   private executeCommand(cmd: CmdMsg): void {
     if (this.ended) return;
+    if (this.rec) {
+      const { type: _type, ...rest } = cmd;
+      this.rec.cmds.push({ ...rest, t: this.simTick, p: this.recPhase });
+    }
     const f: Faction = cmd.faction === RED ? RED : BLUE;
     // Solo : le cerveau rouge étudie les ordres VISIBLES du joueur (adapt).
     if (this.role === "solo" && f === BLUE) this.observeBlue(cmd);
@@ -730,8 +771,9 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       return;
     }
     if (cmd.cmd === "strike" && typeof cmd.x === "number" && typeof cmd.y === "number") {
-      if (this.gold[f] >= COST.strike) {
+      if (this.gold[f] >= COST.strike && this.strikeCd[f] <= 0) {
         this.gold[f] -= COST.strike;
+        this.strikeCd[f] = BAL.strike.cooldown;
         this.scheduleStrike(clamp(cmd.x, 0, VIEW_W), clamp(cmd.y, 0, MAP_H), f);
       }
       return;
@@ -806,7 +848,7 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
     // on BOTH clients (lockstep). The gold check here is just UX — the real
     // spend happens deterministically at execution (re-checked there).
     if (this.mode === "strike") {
-      if (this.myGold < COST.strike) {
+      if (this.myGold < COST.strike || this.strikeWait > 0) {
         this.board.playSound("error", false, 0.4);
         return;
       }
@@ -1226,17 +1268,21 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
     // 1. Execute orders scheduled for this tick. Each client issues only its
     //    OWN faction, so sorting by faction yields the same sequence on both.
+    this.recPhase = 0;
     const due = this.pendingCmds.get(T);
     if (due) {
       this.pendingCmds.delete(T);
       due.sort((a, b) => a.faction - b.faction);
       for (const c of due) this.executeCommand(c);
     }
+    this.recPhase = 1;
 
     // 2. Advance the world by exactly one tick.
     this.rebuildBuckets();
     super.update(TICK_MS); // every entity + timers, fixed dt
     this.updateStrikes(TICK_DT);
+    if (this.strikeCd[RED] > 0) this.strikeCd[RED] -= TICK_DT;
+    if (this.strikeCd[BLUE] > 0) this.strikeCd[BLUE] -= TICK_DT;
 
     this.incomeT -= TICK_DT;
     if (this.incomeT <= 0) {
@@ -1247,6 +1293,8 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
       this.gold[RED] += BAL.income;
     }
 
+    const replayed = this.replayAi?.get(T);
+    if (replayed) for (const c of replayed) this.executeCommand(c);
     if (this.role === "solo" && this.redCmd && !this.aiOff) {
       this.brainT -= TICK_DT;
       if (this.brainT <= 0) {
@@ -1322,6 +1370,11 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
    * ---------------------------------------------------------------- */
 
   /** La mort subite est-elle en cours ? (HUD) */
+  /** Secondes avant que MA frappe aérienne soit de nouveau disponible (0 = prête). */
+  get strikeWait(): number {
+    return Math.max(0, this.strikeCd[this.myFaction]);
+  }
+
   get suddenDeath(): boolean {
     return !this.ended && this.elapsed >= BAL.suddenDeath.start;
   }
@@ -1780,6 +1833,26 @@ export class PlayStep extends GameStep implements GameAPI, HudState {
 
     if (this.voided) this.board.playSound("error", false, 0.4);
     else this.board.playSound(win ? "victory" : "defeat", false, 0.6);
+
+    // Partie solo terminée : on garde de quoi la rejouer (apprentissage du bot).
+    if (this.rec) {
+      const record: SoloRecord = {
+        version: GAME_VERSION,
+        difficulty: this.difficulty,
+        seed: this.rec.seed,
+        map: this.rec.map,
+        cmds: this.rec.cmds,
+        bal: JSON.stringify(BAL),
+        ticks: this.simTick + 1, // le tick en cours compte
+        time: Math.round(time),
+        win,
+        share: +blueShare.toFixed(3),
+      };
+      this.rec = null;
+      this.lastRecord = record;
+      // ni le banc d'essai (IA coupée) ni le bot de test n'alimentent l'historique
+      if (!this.aiOff && !this.botCmd && time >= SOLO_RECORD_MIN) void recordSoloMatch(record);
+    }
 
     const data = {
       win,

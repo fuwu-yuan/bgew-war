@@ -304,6 +304,34 @@
       };
     },
 
+    /**
+     * Rejoue une partie solo enregistrée (SoloRecord) : même graine, même carte,
+     * même équilibrage, mêmes ordres aux mêmes ticks. Rend le résultat obtenu.
+     */
+    replay(rec) {
+      const w = window.__bgewwar;
+      const play = w.steps.play;
+      const BAL = w.balance;
+      if (!window.__balBase) window.__balBase = JSON.parse(JSON.stringify(BAL));
+      const deep = (dst, src) => {
+        for (const k of Object.keys(src)) {
+          if (src[k] && typeof src[k] === "object" && dst[k] && typeof dst[k] === "object") deep(dst[k], src[k]);
+          else dst[k] = src[k];
+        }
+      };
+      deep(BAL, JSON.parse(rec.bal));
+      w.board.playSound = () => {};
+      w.board.stopSound = () => {};
+      play.update = () => {};
+      play.draw = () => {};
+      w.board.moveToStep("game", { difficulty: rec.difficulty, replay: rec });
+      const max = rec.ticks + 600;
+      let n = 0;
+      for (; n < max && !play.ended; n++) play.simStep();
+      deep(BAL, window.__balBase);
+      return { ended: play.ended, ticks: n, time: Math.round(play.elapsed), win: !!(play.endData && play.endData.win), share: +play.map.share(BLUE).toFixed(3) };
+    },
+
     /** Sans affichage : avance d'au plus `n` ticks ; renvoie le résultat si la partie est finie. */
     run(n) {
       const m = this.m;

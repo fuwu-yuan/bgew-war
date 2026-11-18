@@ -31,6 +31,8 @@ export interface BattleView {
   axis(f: Faction): number;
   buildingAt(i: number): boolean;
   costOf(f: Faction, kind: BuildKind): number;
+  /** La frappe aérienne de ce camp est-elle rechargée ? */
+  strikeReady(f: Faction): boolean;
 }
 
 /** Catégories de dépense, dans l'ordre du génome. */
@@ -454,6 +456,7 @@ export class Commander {
       if (cat === "turretAtk" || cat === "turretDef") return this.count(f, "turret") > 0;
       if (cat === "heliAtk" || cat === "heliDef") return this.spent.heli > 0;
       if (cat === "heli") return myHelis < BAL.heli.max;
+      if (cat === "strike") return v.strikeReady(f);
       return true;
     };
 

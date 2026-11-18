@@ -1,6 +1,7 @@
 import { Entity } from "@fuwu-yuan/bgew";
 import { BLUE, COLORS, COST, Faction, FONT, MAP_H, VIEW_H, VIEW_W } from "../globals";
 import { clamp } from "../utils";
+import { BAL } from "../balance";
 import type { UpgradeKind, UpgradeStat } from "../balance";
 import { drawSprite, SPR } from "../sprites";
 import { drawMuteIcon, isMuted } from "../sound";
@@ -24,6 +25,8 @@ export interface HudState {
   upCost(kind: UpgradeKind, stat: UpgradeStat): number;
   /** Prix actuel d'un bâtiment (il monte avec le nombre possédé). */
   buildCostOf(kind: "barracks" | "factory" | "turret"): number;
+  /** Secondes avant que la frappe aérienne soit rechargée (0 = prête). */
+  strikeWait: number;
   myName: string; // local player's name (left, my unit color)
   enemyName: string; // opponent's name (right, enemy unit color)
   /** Niveau CLAUDE : réplique du général (affichée CLAUDE_SAY_FOR s) + témoin « réfléchit ». */
@@ -282,7 +285,8 @@ export class Hud extends Entity {
       if (b.up) cost = s.upCost(b.up.kind, b.up.stat);
       else if (b.id === "barracks" || b.id === "factory" || b.id === "turret") cost = s.buildCostOf(b.id);
       else if (b.id === "strike" || b.id === "helico") cost = COST[b.id];
-      const afford = cost === 0 || s.myGold >= cost;
+      const wait = b.id === "strike" ? s.strikeWait : 0;
+      const afford = (cost === 0 || s.myGold >= cost) && wait <= 0;
       const selected = !isUpgrade && s.mode === b.id;
       ctx.fillStyle = selected ? "rgba(90, 160, 230, 0.45)" : "rgba(255, 255, 255, 0.07)";
       ctx.strokeStyle = selected
@@ -301,7 +305,14 @@ export class Hud extends Entity {
       ctx.font = `8px ${FONT}`;
       const label = b.up ? `${b.label} ${s.upLevel(b.up.kind, b.up.stat)}` : b.label;
       ctx.fillText(label, b.x + 25, b.y + 16);
-      if (cost && cost > 0) {
+      if (wait > 0) {
+        // frappe en rechargement : compte à rebours + jauge qui se remplit
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = "#ff9a7a";
+        ctx.fillText(`${Math.ceil(wait)} s`, b.x + 25, b.y + 32);
+        ctx.fillStyle = "rgba(255, 154, 122, 0.8)";
+        ctx.fillRect(b.x + 4, b.y + BTN_H - 4, (b.w - 8) * (1 - wait / BAL.strike.cooldown), 2);
+      } else if (cost && cost > 0) {
         ctx.fillStyle = COLORS.gold;
         ctx.font = `8px ${FONT}`;
         ctx.fillText(`${cost} or`, b.x + 25, b.y + 32);
